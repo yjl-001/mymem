@@ -10,6 +10,8 @@ from interactions.tensor_utils import TensorHelper, TensorConfig
 
 @dataclass
 class InteractionConfig:
+    """一次 agent rollout 的长度、采样和输出配置。"""
+
     max_turns: int = 1
     max_start_length: int = 1024   
     max_prompt_length: int = 4096   
@@ -24,10 +26,17 @@ class InteractionConfig:
 
 @dataclass
 class InteractionDataProto:
+    """InteractionManager 内部传递的 batch 容器。
+
+    batch: 放 tensor，例如 input_ids、attention_mask、responses；
+    no_tensor_batch: 放 Python 对象，例如原始 prompt、env 实例、交互历史。
+    """
+
     batch: dict = field(default_factory=dict)
     no_tensor_batch: dict = field(default_factory=dict)
 
 class InteractionManager(ABC):
+    """把 MemGenModel.generate 包装成静态/动态任务都能复用的 agent loop。"""
     
     def __init__(
         self,
@@ -43,6 +52,7 @@ class InteractionManager(ABC):
         self.is_validation = is_validation
         
         assert tokenizer.pad_token_id is not None
+        # TensorHelper 统一处理左/右 padding、截断、attention mask 等张量整理逻辑。
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
             max_prompt_length=config.max_prompt_length,
@@ -50,7 +60,8 @@ class InteractionManager(ABC):
             max_start_length=config.max_start_length
         ))
 
-        # generation configs for agent
+        # generation configs for agent.
+        # weaver_do_sample / trigger_do_sample 是项目自定义字段，MemGenModel.generate 会读取。
         self.generation_config = GenerationConfig(
             max_new_tokens=self.config.max_response_length,
             temperature=self.config.temperature,

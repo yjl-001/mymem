@@ -13,7 +13,7 @@ from memgen.model import MemGenModel
 from memgen.runner import MemGenRunner
 
 def set_seed(random_seed: int, use_gpu: bool):
-
+    """固定 Python / NumPy / PyTorch 的随机源，方便复现实验结果。"""
     random.seed(random_seed)
     os.environ['PYTHONHASHSEED'] = str(random_seed)
     np.random.seed(random_seed)
@@ -28,6 +28,11 @@ def set_seed(random_seed: int, use_gpu: bool):
     print(f"set seed: {random_seed}")
 
 def parse_args():
+    """只解析配置文件路径和 OmegaConf dotlist 覆盖项。
+
+    绝大多数训练/评测参数都留在 YAML 中；命令行只负责选择配置文件，
+    以及用 `--options key value` 的形式覆盖少量实验变量。
+    """
     parser = argparse.ArgumentParser(description="Memory Generator")
 
     parser.add_argument("--cfg-path", required=True, help="path to configuration file.")
@@ -44,7 +49,12 @@ def parse_args():
     return args
 
 def build_working_dir(config: Config) -> str:
-    
+    """根据运行模式、数据集、模型和 latent 配置生成本次实验目录。
+
+    目录名把 prompt/inference 两类 latent 的数量和长度写进去，
+    这样后续看 `.cache/` 时可以直接从路径判断实验条件。
+    """
+
     # parent dir: <train/evaluate>/<dataset_name>/<reasoner_model_name>
     mode = config.run_cfg.mode
     dataset_name = config.dataset_cfg.name
@@ -62,6 +72,7 @@ def build_working_dir(config: Config) -> str:
     return os.path.join(parent_dir, working_dir)
 
 def main():
+    """命令行入口：配置 -> 数据 -> 模型 -> Runner -> train/evaluate。"""
 
     args = parse_args()
     config = Config(args)
@@ -78,6 +89,10 @@ def main():
     config.pretty_print()
 
     # build components
+    # Config.to_dict() 后会被拆成 dataset/model/run 三块：
+    # - data_builder 负责构造 HuggingFace Dataset 和 Env 类
+    # - MemGenModel.from_config 负责加载 reasoner/weaver/trigger 三份底座模型
+    # - Runner 负责把训练器、交互循环和评测 recorder 串起来
     config_dict = config.to_dict()
     data_builder = get_data_builder(config_dict.get("dataset"))
     model = MemGenModel.from_config(config_dict.get("model"))

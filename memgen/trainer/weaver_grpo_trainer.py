@@ -36,6 +36,13 @@ from ..model.modeling_memgen import MemGenModel
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
 class WeaverGRPOTrainer(GRPOTrainer):
+    """训练 Memory Weaver 的 GRPO trainer。
+
+    与 TRL 原版 GRPOTrainer 的主要差异：
+    - rollout 不直接调用 model.generate，而是交给 InteractionManager，以统一静态/动态任务；
+    - policy logprob 来自 MemGenModel.forward，其中 logits 已经处理过 latent 对齐；
+    - loss 只在真实 assistant response token 上计算，不在 prompt、tool info 或 latent 位置上计算。
+    """
 
     def __init__(
         self,
@@ -68,6 +75,7 @@ class WeaverGRPOTrainer(GRPOTrainer):
         
         self.env_class = env_class
         self.env_main_config = env_main_config
+        # generation_manager 持有 actor_rollout_wg；训练时每次 rollout 前会替换成 unwrap 后的模型。
         self.generation_manager = generation_manager
 
         self.generation_manager.config.max_prompt_length
@@ -77,6 +85,7 @@ class WeaverGRPOTrainer(GRPOTrainer):
         # assert self.temperature == generation_manager.config.temperature   
     
     def _build_multiturn_envs(self, inputs: list[dict[str, Union[torch.Tensor, Any]]]) -> tuple[list[list[dict]], list]:
+        """为 DynamicEnv 样本创建初始 messages 和独立 env 实例。"""
         init_messages, envs = [], []
 
         for task_config in inputs:
@@ -99,6 +108,15 @@ class WeaverGRPOTrainer(GRPOTrainer):
         logits_to_keep: int,
         batch_size: int = None
     ) -> torch.Tensor:
+        """重新前向计算 completion token 的 policy logprob。
+
+        MemGenModel.forward 会返回两样关键内容：
+        - logits: 已经去掉 latent 对齐位置、与原始 input_ids 对齐；
+        - supervised_labels: 哪些真实 token 位置应该参与训练。
+
+        返回的 mask 用来过滤掉 completion 中不应学习的位置，例如 tool/info token
+        或 conversation 模板中的 assistant header。
+        """
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         supervise_masks = []   
@@ -106,7 +124,8 @@ class WeaverGRPOTrainer(GRPOTrainer):
             input_ids_batch = input_ids[start : start + batch_size]
             attention_mask_batch = attention_mask[start : start + batch_size]
 
-            # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
+            # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't).
+            # labels 必须传入，因为 MemGenModel 需要用它选择训练期 latent 插入点。
             model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch, "labels": labels}
 
             # Only add logits_to_keep if the model supports it
@@ -130,6 +149,7 @@ class WeaverGRPOTrainer(GRPOTrainer):
             logps = selective_log_softmax(logits, completion_ids)  # compute logprobs
             all_logps.append(logps)
             
+            # 只保留 completion 段，并把 supervised_labels 转成 token-level loss mask。
             labels = labels[:, -logits_to_keep:]
             mask = (labels != -100).long()  
             supervise_masks.append(mask)
@@ -143,11 +163,21 @@ class WeaverGRPOTrainer(GRPOTrainer):
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]  # batch_size * num_generations
     ) -> dict[str, Union[torch.Tensor, Any]]:
+        """执行一批 rollout，并计算 GRPO 需要的 reward/advantage/logprob 缓存。
+
+        这个方法是 GRPO 的“采样阶段”：
+        1. 根据 Env 类型构造 InteractionDataProto；
+        2. unwrap 当前模型执行 agent loop；
+        3. 从生成结果中切出 prompt、completion、attention/info mask；
+        4. 计算 old/reference per-token logprobs；
+        5. 调 reward function，并按 group 归一化得到 advantages。
+        """
 
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
-        # build no-tensor part
+        # build no-tensor part.
+        # 这些字段不会进入模型前向，但 InteractionManager/env 可能需要它们。
         batch_gen_keys = []
         if "prompt" in inputs[0]:  # text-based raw prompt
             batch_gen_keys.append("prompt")
@@ -162,7 +192,8 @@ class WeaverGRPOTrainer(GRPOTrainer):
         for key in batch_gen_keys:  
             gen_batch.no_tensor_batch[key] = [x[key] for x in inputs]
         
-        # Single-turn env
+        # Single-turn env.
+        # StaticEnv 的输入已经是 prompt；这里先套 chat template，再左 padding 成张量。
         if issubclass(self.env_class, StaticEnv):
             prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
             prompt_inputs = self.processing_class(
@@ -176,7 +207,8 @@ class WeaverGRPOTrainer(GRPOTrainer):
 
             gen_batch.batch["input_ids"] = prompts 
             gen_batch.batch["attention_mask"] = prompt_mask
-        # Multi-turn env
+        # Multi-turn env.
+        # DynamicEnv 从 system/user 初始 messages 开始，后续由 agent loop 反复 env.step。
         elif issubclass(self.env_class, DynamicEnv):
             init_prompts, envs = self._build_multiturn_envs(inputs)
             gen_batch.no_tensor_batch["init_prompts"] = init_prompts
@@ -187,7 +219,9 @@ class WeaverGRPOTrainer(GRPOTrainer):
         else:
             raise ValueError("Unsupported environment type")
     
-        # Regular generation path
+        # Regular generation path.
+        # unwrap_model_for_generation 会临时拿到未被 DDP/Accelerate 包裹的模型，
+        # 这样 InteractionManager 可以直接调用 MemGenModel.generate。
         with unwrap_model_for_generation(
             self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
         ) as unwrapped_model:
@@ -200,7 +234,8 @@ class WeaverGRPOTrainer(GRPOTrainer):
                 self.generation_manager.actor_rollout_wg = unwrapped_model  
                 final_gen_batch_output = self.generation_manager.run_agent_loop(gen_batch=gen_batch)
         
-        # parse outputs
+        # parse outputs.
+        # InteractionManager 返回统一字段：prompts、responses、input_ids、attention_mask、info_mask。
         prompts = final_gen_batch_output.batch["prompts"].to(device)  # prompt ids
         completion_ids = final_gen_batch_output.batch["responses"].to(device)  # completion ids
         prompt_completion_ids = final_gen_batch_output.batch["input_ids"].to(device)  # prompt and completion ids
@@ -211,6 +246,7 @@ class WeaverGRPOTrainer(GRPOTrainer):
         assert completion_ids.shape == completion_mask.shape
 
         # Construct labels: Supervise only the agent response portion.
+        # info_mask 会把非 assistant 内容排除掉，保证 reward 优化的是 agent 自己的回答 token。
         prompt_labels = torch.full(prompt_mask.shape, -100, device=device)
         completion_labels = torch.where(completion_mask == 1, completion_ids, -100)
         labels = torch.cat([prompt_labels, completion_labels], dim=1)
@@ -224,6 +260,7 @@ class WeaverGRPOTrainer(GRPOTrainer):
         # Sum along sequence dimension (dim=1) to get completion length per sequence, used for logging
         completion_lengths = completion_mask.sum(1)
 
+        # 后续只需要 completion 段的 logprob，所以 logits_to_keep 等于 completion 长度。
         logits_to_keep = completion_mask.size(1)
 
         # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
@@ -242,7 +279,8 @@ class WeaverGRPOTrainer(GRPOTrainer):
             else:
                 old_per_token_logps, old_supervise_mask = None, None
             
-            # Compute the per-token log probabilities for the reference model
+            # Compute the per-token log probabilities for the reference model.
+            # beta=0 时不需要 KL 项，跳过 reference forward 省显存/时间。
             if self.beta != 0.0:
                 if self.ref_model is not None:
                     ref_per_token_logps, ref_supervise_mask = self._get_per_token_logps(
@@ -256,7 +294,8 @@ class WeaverGRPOTrainer(GRPOTrainer):
             else: 
                 ref_per_token_logps, ref_supervise_mask = None, None
         
-        # Decode the generated completions
+        # Decode the generated completions.
+        # reward function 一般消费文本；completion_ids_list 则给 token-based reward 留入口。
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         completions = completions_text
         
@@ -266,7 +305,8 @@ class WeaverGRPOTrainer(GRPOTrainer):
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
-        # Compute grouped-wise rewards
+        # Compute grouped-wise rewards.
+        # GRPO 把同一 prompt 的 num_generations 个样本视为一组，组内标准化 reward。
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
         is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
@@ -339,6 +379,7 @@ class WeaverGRPOTrainer(GRPOTrainer):
 
 
     def _compute_loss(self, model, inputs):
+        """用采样阶段缓存的 advantage/old logprob 计算 Weaver 的 GRPO loss。"""
         device = self.accelerator.device
 
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
@@ -347,6 +388,7 @@ class WeaverGRPOTrainer(GRPOTrainer):
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
+        # 重新构造 labels，让 MemGenModel.forward 在训练期按同样规则插 latent 并返回 supervised_labels。
         prompt_labels = torch.full(prompt_mask.shape, -100, device=device)
         completion_labels = torch.where(completion_mask == 1, completion_ids, -100)
         labels = torch.cat([prompt_labels, completion_labels], dim=1)
@@ -364,7 +406,8 @@ class WeaverGRPOTrainer(GRPOTrainer):
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             )
 
-        # Compute the loss
+        # Compute the clipped GRPO/PPO-style objective.
+        # advantages 是 sequence-level reward advantage，会广播到每个被监督 token。
         advantages = inputs["advantages"]
         # When using num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps
         # old_per_token_logps == per_token_logps, so we can skip it's computation
@@ -395,6 +438,9 @@ class WeaverGRPOTrainer(GRPOTrainer):
             torch.all(old_supervise_mask <= completion_mask) and
             torch.all(ref_supervise_mask <= completion_mask)
         )
+        # 最终 loss mask 必须同时满足：
+        # - 是 completion token；
+        # - 当前模型、old policy、reference policy 都认为该位置可监督。
         supervised_mask = completion_mask * supervise_mask * old_supervise_mask * ref_supervise_mask  
 
         if self.loss_type == "grpo":

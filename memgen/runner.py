@@ -1,3 +1,4 @@
+import csv
 import os
 import random
 
@@ -33,6 +34,14 @@ from memgen.utils import (
 
 
 class MemGenRunner:
+    """训练和评测的编排层。
+
+    Runner 不实现模型细节，而是负责把以下对象接起来：
+    - data_builder: 构造 train/valid/test 数据集和 Env 类型；
+    - env: 提供 reward/feedback；
+    - interaction_manager: 把模型生成包装成单轮或多轮 agent loop；
+    - trainer: 根据配置选择 Weaver SFT、Weaver GRPO 或 Trigger GRPO。
+    """
 
     def __init__(
         self,
@@ -41,22 +50,28 @@ class MemGenRunner:
         config: dict,
         working_dir: str,
     ):  
-        # parse configs
+        # parse configs.
+        # _parse_configs 会把 run 配置拆成 TRL TrainingArguments 和 InteractionConfig。
         self.config = config
         self.working_dir = working_dir
 
         self._parse_configs(config.get("run"))  
         
-        # parse model
+        # parse model.
+        # processing_class 是 tokenizer，沿用 TRL 命名，后面传给 SFT/GRPO Trainer。
         self.processing_class = model.tokenizer
         self.model = model
 
-        # initialize envs and generation managers
+        # initialize envs and generation managers.
+        # Env 只保存数据集相关的 reward/交互逻辑；静态任务通常一次生成即可，
+        # 动态任务会在 InteractionManager 里多轮调用 env。
         self.dataset_dict = data_builder.get_dataset_dict()
         self.env_cls = data_builder.get_env_cls()
         self.env = self.env_cls(config.get("dataset"))
 
-        # partition datasets
+        # partition datasets.
+        # Weaver 和 Trigger 使用不同训练子集：Trigger 默认只从训练/验证集中采样一部分，
+        # 降低二阶段 GRPO 的成本。
         self.weaver_train_dataset, self.trigger_train_dataset = self._parse_train_dataset(self.dataset_dict["train"])
         self.weaver_valid_dataset, self.trigger_valid_dataset = self._parse_valid_dataset(self.dataset_dict["valid"])
         self.test_dataset = self.dataset_dict["test"]
@@ -66,7 +81,8 @@ class MemGenRunner:
         self.weaver_valid_dataset = self._filter_dataset(self.weaver_valid_dataset)
         self.trigger_valid_dataset = self._filter_dataset(self.trigger_valid_dataset)
         
-        # initialize generation manager
+        # initialize generation manager.
+        # StaticEnv -> SingleTurnInteractionManager；DynamicEnv -> MultiTurnInteractionManager。
         if self.env_cls.ENV_CARD == "STATIC":
             self.inter_cls = SingleTurnInteractionManager
         elif self.env_cls.ENV_CARD == "DYNAMIC":
@@ -79,21 +95,24 @@ class MemGenRunner:
         )
     
     def _parse_train_dataset(self, train_dataset: Dataset) -> tuple[Dataset, Dataset]:
-        # use half size of the datatset to train the trigger
+        # use part of the dataset to train the trigger.
+        # 这里实际取 1/3；Weaver 仍使用完整 train_dataset。
         trigger_trainset_size = min(len(train_dataset) // 3, len(train_dataset))
         rand_indices = random.sample(range(len(train_dataset)), trigger_trainset_size)
         return train_dataset, train_dataset.select(rand_indices)
     
     def _parse_valid_dataset(self, valid_dataset: Dataset) -> tuple[Dataset, Dataset]:
-
+        # 验证集也按同样规则给 Trigger 抽子集，避免二阶段评估成本过高。
         trigger_validset_size = min(len(valid_dataset) // 3, len(valid_dataset))
         rand_indices = random.sample(range(len(valid_dataset)), trigger_validset_size)
         return valid_dataset, valid_dataset.select(rand_indices)
 
     def _filter_dataset(self, dataset: Dataset) -> Dataset:
+        """过滤 prompt 过长样本，避免进入 trainer 后才因为长度超限失败。"""
         tokenizer = self.processing_class
 
-        # Determine max length based on training mode
+        # Determine max length based on training mode.
+        # SFT 用 max_length；GRPO 用 max_prompt_length，因为 completion 由 rollout 生成。
         max_len = 1024
         if self.train_weaver and self.train_weaver_method == "sft":
             max_len = self.weaver_sft_training_args.max_length
@@ -104,7 +123,8 @@ class MemGenRunner:
         else:
             raise ValueError("Wrong training mode.")
 
-        # Function to filter out samples exceeding max length
+        # Function to filter out samples exceeding max length.
+        # Static 数据通常有 prompt 字段；Dynamic/多轮数据通常有 messages 字段。
         def filter_func(sample):
             if "prompt" in sample and sample["prompt"] is not None:
                 prompt = tokenizer.apply_chat_template(sample["prompt"], tokenize=True)
@@ -121,6 +141,7 @@ class MemGenRunner:
     
     # ===== train weaver =====
     def _create_weaver_trainer(self):
+        """根据 train_weaver_method 创建 Weaver 的 SFT 或 GRPO trainer。"""
 
         # SFT Trainer
         if self.train_weaver_method == "sft":
@@ -135,8 +156,12 @@ class MemGenRunner:
         
         # GRPO Trainer
         elif self.train_weaver_method == 'grpo':
+            # GRPO 阶段的评估由外部 evaluate 路径完成，这里关闭 TRL 内置 eval。
             self.weaver_grpo_training_args.do_eval = False
             self.weaver_grpo_training_args.eval_strategy = 'no'
+            # Weaver GRPO 训练时：
+            # - weaver_do_sample=True，让 latent/response 产生可探索的 rollout；
+            # - trigger_do_sample=False，固定触发策略，避免同时优化两个模块。
             self.generation_manager.generation_config.weaver_do_sample = True
             self.generation_manager.generation_config.trigger_do_sample = False
             self.generation_manager.generation_config.temperature = self.weaver_grpo_training_args.temperature
@@ -152,6 +177,7 @@ class MemGenRunner:
                 eval_dataset=self.weaver_valid_dataset,
                 processing_class=self.processing_class,
                 # --- add env into trainer ---
+                # Trainer 需要 env 和 generation_manager 来执行 rollout 并计算 reward。
                 env_class=self.env_cls,
                 env_main_config=self.config.get("dataset"),
                 generation_manager=self.generation_manager,
@@ -163,11 +189,13 @@ class MemGenRunner:
     
     # ===== train trigger =====
     def _create_trigger_trainer(self):
+        """创建 Trigger 的 GRPO trainer。Trigger 当前只支持 GRPO。"""
         
         if self.train_trigger_method == "grpo":
             self.trigger_grpo_training_args.do_eval = False
             self.trigger_grpo_training_args.eval_strategy = 'no'
 
+            # Trigger GRPO 训练时固定 Weaver 的生成采样，只让 Trigger 决策探索。
             self.generation_manager.generation_config.trigger_do_sample = True
             self.generation_manager.generation_config.weaver_do_sample = False
             self.generation_manager.generation_config.temperature = self.weaver_grpo_training_args.temperature
@@ -188,13 +216,16 @@ class MemGenRunner:
     
     # ===== train weaver/trigger =====
     def train(self):
+        """按配置执行单阶段训练：要么训练 Weaver，要么训练 Trigger。"""
 
         if self.train_weaver:
             trainer = self._create_weaver_trainer()
+            # 训练 Weaver 时冻结 Trigger；projection 层会随 Weaver 一起打开/冻结。
             self.model.fix_component('trigger')
             
         if self.train_trigger:
             trainer = self._create_trigger_trainer()
+            # 训练 Trigger 时冻结 Weaver，避免 reward 信号同时改动两套策略。
             self.model.fix_component('weaver')
 
         log_trainable_params(self.model)
@@ -222,6 +253,7 @@ class MemGenRunner:
 
     # ===== evaluate =====
     def evaluate(self):
+        """根据 Env 类型选择静态或动态评测流程。"""
         self.model = self.model.to(torch.bfloat16)
 
         evaluate_func_mapping = {
@@ -235,6 +267,7 @@ class MemGenRunner:
         return evaluate_func()
     
     def _static_evaluate(self):
+        """静态任务评测：prompt -> completion -> reward。"""
 
         accelerator = Accelerator()
 
@@ -251,7 +284,12 @@ class MemGenRunner:
             recorder = None
 
         batch_size = self.interaction_config.batch_size
+        csv_path = os.path.join(self.interaction_config.output_dir, "augmentation_positions.csv")
+        all_aug_rows = []
+        global_sample_offset = 0
 
+        # Accelerator 只切分 dataloader；真实 generation 在 unwrap_model_for_generation 中执行，
+        # 这样可以拿到未被 DDP 包裹的模型对象。
         test_dataloader = accelerator.prepare(DataLoader(
             dataset=self.test_dataset,
             batch_size=batch_size,
@@ -276,12 +314,16 @@ class MemGenRunner:
                 )
                 prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
                 gen_batch = InteractionDataProto()
+                # InteractionManager 统一消费 InteractionDataProto：
+                # tensor_batch 放 input_ids/attention_mask，no_tensor_batch 放原始 prompt/env。
                 gen_batch.batch["input_ids"] = prompt_ids.to(accelerator.device)
                 gen_batch.batch["attention_mask"] = prompt_mask.to(accelerator.device)
                 gen_batch.no_tensor_batch["initial_prompts"] = prompts
 
                 self.generation_manager.actor_rollout_wg = unwrapped_model
                 gen_output = self.generation_manager.run_agent_loop(gen_batch)
+                augmentation_pos = gen_output.batch.get("augmentation_pos")
+                aug_pos_cpu = augmentation_pos.cpu() if augmentation_pos is not None else None
 
                 completion_ids = gen_output.batch["responses"]
                 completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -289,13 +331,33 @@ class MemGenRunner:
             # only main rank can write the json
             local_completions = completions
             local_batches = test_batch
+            local_aug_pos = aug_pos_cpu
 
             all_completions = gather_objects(local_completions)
             all_batches = gather_objects(local_batches)
+            all_aug_pos_list = gather_objects(local_aug_pos) if local_aug_pos is not None else []
 
             if accelerator.is_main_process:
                 for comps, batch in zip(all_completions, all_batches):
                     recorder.record_batch(comps, batch)
+
+                for rank_aug_pos in all_aug_pos_list:
+                    if rank_aug_pos is not None:
+                        for b in range(rank_aug_pos.size(0)):
+                            gen_len = rank_aug_pos.size(1)
+                            for i in range(gen_len):
+                                if rank_aug_pos[b, i].item() == 1:
+                                    aug_type = "prompt" if i == 0 else "inference"
+                                    relative_pos = i / max(gen_len, 1)
+                                    all_aug_rows.append({
+                                        "sample_idx": global_sample_offset + b,
+                                        "aug_type": aug_type,
+                                        "step_in_generation": i,
+                                        "total_generated_len": gen_len,
+                                        "relative_position": round(relative_pos, 4),
+                                    })
+                    if rank_aug_pos is not None:
+                        global_sample_offset += rank_aug_pos.size(0)
 
         accelerator.wait_for_everyone()
 
@@ -303,9 +365,17 @@ class MemGenRunner:
             recorder.finalize()
             writer.close()
 
+            if all_aug_rows:
+                with open(csv_path, "w", newline="") as f:
+                    csv_writer = csv.DictWriter(f, fieldnames=["sample_idx", "aug_type", "step_in_generation", "total_generated_len", "relative_position"])
+                    csv_writer.writeheader()
+                    csv_writer.writerows(all_aug_rows)
+
     def _dynamic_evaluate(self):
+        """动态任务评测：每条样本先创建 Env，再由 agent loop 多轮交互。"""
         
         def _set_batch_envs(batch: list) -> tuple[list[str], list[str], list]:  # batch set envs
+            # 每个样本需要独立 env 实例保存检索/反馈状态。
             system_prompts, init_user_prompts, envs = [], [], []
             for task_config in batch:
                 env = self.env_cls(self.config.get("dataset"))
@@ -320,6 +390,8 @@ class MemGenRunner:
         def _build_data_proto(
             system_prompts: list[str], init_user_prompts: list[str], envs: list
         ) -> InteractionDataProto:
+            # Dynamic interaction 的初始输入是 messages，而不是已经 tokenize 的 tensor。
+            # 后续 tokenization/截断由 InteractionManager 根据 InteractionConfig 处理。
             messages = []
             for system_prmopt, init_user_prompt in zip(system_prompts, init_user_prompts):
                 system_message = {"role": "system", "content": system_prmopt}
@@ -358,7 +430,8 @@ class MemGenRunner:
         model_wrapped = accelerator.prepare_model(model=self.model, evaluation_mode=True)
         model_wrapped.eval()
         
-        # batch generate
+        # batch generate.
+        # Dynamic 任务的 reward 通常来自 env.feedback()，而不是一次性答案匹配。
         for step, test_batch in tqdm(enumerate(test_dataloader), desc="Evaluation"):
             with unwrap_model_for_generation(
                 model_wrapped, accelerator
@@ -392,6 +465,15 @@ class MemGenRunner:
             writer.close()
     
     def _parse_configs(self, configs):
+        """把 run YAML 转成 Runner 内部状态。
+
+        这一层会同时构造三套 TrainingArguments：
+        - weaver_sft_training_args
+        - weaver_grpo_training_args
+        - trigger_grpo_training_args
+
+        即使某一套本轮不用，也会先建出来，方便后续代码根据训练模式统一取字段。
+        """
         
         self.train_weaver = configs.get("train_weaver", True)
         self.train_trigger = configs.get("train_trigger", False)
@@ -420,6 +502,7 @@ class MemGenRunner:
         self.trigger_grpo_training_args = GRPOConfig(**trigger_grpo_config)
 
         # --- update training args ---
+        # output/log 目录由 main.py 生成的 working_dir 统一管理，覆盖 YAML 里的默认路径。
         updated_args = {
             "output_dir": os.path.join(self.working_dir, "model"),
             "logging_dir": os.path.join(self.working_dir, "run"),
@@ -431,6 +514,7 @@ class MemGenRunner:
             setattr(self.trigger_grpo_training_args, k, v)
 
         # --- parse interaction args ---
+        # InteractionConfig 控制 rollout 时的截断长度、采样温度、batch_size 和输出目录。
         interaction_configs = configs.get("interaction", {})
         self.interaction_config = InteractionConfig(
             max_turns=interaction_configs.get("max_turns", 30),

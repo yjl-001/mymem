@@ -30,6 +30,17 @@ from memgen.model.modeling_memgen import MemGenModel
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
 class TriggerGRPOTrainer(GRPOTrainer):
+    """训练 Memory Trigger 的 GRPO trainer。
+
+    Trigger 的 action 不是“下一个文本 token”，而是 generation 中每个候选位置的
+    augmentation decision：
+    - -100: 非候选位置，不参与 loss；
+    - 0: 候选位置但不插 latent；
+    - 1: 候选位置且插 latent。
+
+    因此这个 trainer 的 logprob/loss 都围绕 augmentation_mask 计算。
+    """
+
     def __init__(
         self,
         model: MemGenModel,
@@ -62,6 +73,7 @@ class TriggerGRPOTrainer(GRPOTrainer):
         )
 
         # If PEFT configuration is not provided, create a reference model based on the initial model.
+        # Trigger 训练只需要 reference trigger，而不是完整 MemGenModel。
         ref_model = create_reference_model(model.trigger)
         self.ref_model = self.accelerator.prepare_model(ref_model, evaluation_mode=True)
         self.tensor_fn = TensorHelper(TensorConfig(
@@ -70,6 +82,8 @@ class TriggerGRPOTrainer(GRPOTrainer):
             max_obs_length=None,
             max_start_length=None
         ))
+        self.generation_config.trigger_do_sample = True
+        self.generation_config.weaver_do_sample = False
     
     def _set_signature_columns_if_needed(self):
         # NOTE - If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -85,11 +99,18 @@ class TriggerGRPOTrainer(GRPOTrainer):
         attention_mask: torch.LongTensor, 
         augmentation_mask: torch.LongTensor
     ) -> torch.Tensor:
+        """计算 trigger 对 augmentation action 的 logprob。
+
+        augmentation_mask 的时间轴对应 completion token：
+        - prompt_len - 1 位置的 trigger logits 决定第一个 completion token 前是否插 prompt latent；
+        - 后续 logits[t] 决定生成 completion[t+1] 前是否插 inference latent。
+        """
         prompt_len = attention_mask.size(1) - augmentation_mask.size(1)
         
         assert input_ids.shape == attention_mask.shape
         position_ids = generate_position_ids(attention_mask)
-        augmentation_logits = model.trigger(
+        trigger = model.trigger if hasattr(model, "trigger") else model
+        augmentation_logits = trigger(
             input_ids=input_ids, 
             attention_mask=attention_mask,
             position_ids=position_ids
@@ -97,6 +118,8 @@ class TriggerGRPOTrainer(GRPOTrainer):
         clipped_logits = augmentation_logits[:, prompt_len - 1 : -1]
         assert clipped_logits.shape[:-1] == augmentation_mask.shape
         
+        # selective_log_softmax 需要合法类别 id；先把 -100 临时替换成 0，
+        # 算完再把这些非候选位置的 logprob 置 0，并在 loss mask 中排除。
         temp_mask = augmentation_mask.clone()
         augmentation_valid_mask = (temp_mask == -100).clone()
         
@@ -109,6 +132,12 @@ class TriggerGRPOTrainer(GRPOTrainer):
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
+        """采样一批 trigger action，并按最终回答 reward 计算 advantage。
+
+        与 WeaverGRPOTrainer 不同，这里会调用 MemGenModel.generate(...,
+        return_augmentation_mask=True)，把 trigger 在生成中做出的 0/1 决策记录下来。
+        后续 loss 只优化这些决策的 logprob。
+        """
         
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
@@ -116,7 +145,8 @@ class TriggerGRPOTrainer(GRPOTrainer):
         prompts = [x["prompt"] for x in inputs]
         invalid_augmentation_id = -100
 
-        # modified: pop those keys for generation
+        # modified: pop those keys for generation.
+        # no_tensor_batch 里的字段供环境/交互逻辑使用，不直接进 trigger 前向。
         batch_gen_keys = []
         if "prompt" in inputs[0]:  # text-based raw prompt
             batch_gen_keys.append("prompt")
@@ -147,7 +177,8 @@ class TriggerGRPOTrainer(GRPOTrainer):
         gen_batch.batch["input_ids"] = prompt_ids.to(device) 
         gen_batch.batch["attention_mask"] = prompt_mask.to(device)
 
-        # Regular generation path
+        # Regular generation path.
+        # return_augmentation_mask=True 是 Trigger GRPO 的关键：它把 rollout 中的 action 轨迹带回。
         with unwrap_model_for_generation(
             self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
         ) as unwrapped_model:
@@ -161,13 +192,15 @@ class TriggerGRPOTrainer(GRPOTrainer):
                 prompt_completion_ids, augmentation_mask = unwrapped_model.generate(
                     prompt_ids, prompt_mask, generation_config=self.generation_config, return_augmentation_mask=True
                 )
-                # Compute prompt length and extract completion ids
+                # Compute prompt length and extract completion ids.
+                # augmentation_mask 与 completion_ids 对齐，而不是与完整 prompt_completion_ids 对齐。
                 prompt_length = prompt_ids.size(1)
                 prompt_ids = prompt_completion_ids[:, :prompt_length]
                 completion_ids = prompt_completion_ids[:, prompt_length:]
                 assert completion_ids.shape == augmentation_mask.shape
             
-            # Mask everything after the first EOS token
+            # Mask everything after the first EOS token.
+            # EOS 后的 completion/action 都不应该影响 reward 或 trigger loss。
             is_eos = completion_ids == self.processing_class.eos_token_id
             eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
             eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
@@ -179,6 +212,7 @@ class TriggerGRPOTrainer(GRPOTrainer):
                 torch.full_like(completion_ids, self.processing_class.eos_token_id) 
             )
             
+            # augmentation_mask 中 -100 表示非候选；completion_mask 再去掉 EOS 后的无效区域。
             augmentation_valid_mask = completion_mask * (augmentation_mask != invalid_augmentation_id)
             augmentation_mask = torch.where(
                 augmentation_valid_mask.bool(),         
@@ -192,7 +226,8 @@ class TriggerGRPOTrainer(GRPOTrainer):
             truncated_completions = ~is_eos.any(dim=1)
             completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
         
-        # Concatenate prompt_mask with completion_mask for logit computation
+        # Concatenate prompt_mask with completion_mask for logit computation.
+        # trigger 前向需要完整 prompt+completion 前缀，才能复现 rollout 时的决策条件。
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P + C)
         
         with torch.no_grad():
@@ -206,7 +241,8 @@ class TriggerGRPOTrainer(GRPOTrainer):
             else:
                 old_per_token_logps = None
             
-            # Compute the per-token log probabilities for the reference model
+            # Compute the per-token log probabilities for the reference model.
+            # beta=0 时不加 KL，reference trigger 可以跳过。
             if self.beta != 0.0:
                 if self.ref_model is not None:
                     ref_per_token_logps = self._get_per_token_logps(
@@ -220,7 +256,8 @@ class TriggerGRPOTrainer(GRPOTrainer):
             else: 
                 ref_per_token_logps = None
         
-        # Decode the generated completions
+        # Decode the generated completions.
+        # reward 仍然基于最终文本回答；trigger 的 credit assignment 通过同一个 sequence advantage 完成。
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         completions = completions_text
 
@@ -237,7 +274,8 @@ class TriggerGRPOTrainer(GRPOTrainer):
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
-        # Compute grouped-wise rewards
+        # Compute grouped-wise rewards.
+        # 同一 prompt 的多个 trigger 轨迹组内比较，得到相对 advantage。
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
         is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
@@ -316,6 +354,7 @@ class TriggerGRPOTrainer(GRPOTrainer):
         }
 
     def _compute_loss(self, model, inputs):
+        """用 augmentation_mask 上的 action logprob 计算 Trigger GRPO loss。"""
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -353,6 +392,7 @@ class TriggerGRPOTrainer(GRPOTrainer):
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
         
+        # 只有真正经过 trigger 决策的候选点参与 loss；非候选位置保持 -100。
         augmentation_valid_mask = (augmentation_mask != -100)
         if self.loss_type == "grpo":
             loss = ((per_token_loss * augmentation_valid_mask).sum(-1) / augmentation_valid_mask.sum(-1).clamp(min=1.0)).mean()

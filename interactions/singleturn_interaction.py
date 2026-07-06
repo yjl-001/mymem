@@ -97,19 +97,28 @@ class SingleTurnInteractionManager(InteractionManager):
         }  
 
         # model generation
-        gen_output = self.actor_rollout_wg.generate(
+        gen_output, augmentation_pos = self.actor_rollout_wg.generate(
             rollings_active["input_ids"], 
             rollings_active["attention_mask"], 
             generation_config=self.generation_config,
+            return_augmentation_mask=True,
         )
         responses_ids = gen_output[:, rollings_active["input_ids"].size(1):]
+        im_start_ids = self.tokenizer.encode("<|im_start|>", add_special_tokens=False)
+        responses_ids = self.tensor_fn.erase_from_first_token_sequence(
+            responses_ids,
+            im_start_ids,
+            self.tokenizer.eos_token_id,
+        )
         responses_ids = self.tensor_fn.erase_after_first_eos(responses_ids, self.tokenizer.eos_token_id)
         
         # update right side
         original_right_side = self._update_right_side(original_right_side, responses_ids, next_obs_ids=None)
         
         # construct final output
-        return self._compose_final_output(original_left_side, original_right_side)
+        final_output = self._compose_final_output(original_left_side, original_right_side)
+        final_output.batch["augmentation_pos"] = augmentation_pos
+        return final_output
     
     def _compose_final_output(
         self, left_side: Dict,
@@ -141,4 +150,3 @@ class SingleTurnInteractionManager(InteractionManager):
         final_output = InteractionDataProto(batch=final_output_batch)
 
         return final_output
-        

@@ -49,8 +49,9 @@ class KodCodeBuilder(BaseBuilder):
 
     @classmethod
     def _sft_preprocess(cls, example: Dict):
-        
-        format_template = r"Write an efficient and correct Python function to solve the following problem."
+        function_name = example["test_info"].strip()
+
+        format_template = r"Write an efficient and correct Python function to solve the following problem, do not generate any function usage."
         prompt_template = "Question: {prompt}\n"
 
         question = example["question"].strip()

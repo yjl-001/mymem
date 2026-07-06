@@ -1,0 +1,1111 @@
+                                                       IndexMem: Learned KV-Cache Eviction with Latent Memory
+                                                                  for Long-Context LLM Inference
+
+
+                                                    Xintong Yang * 1 Hao Gu * 1 Binxing Xu 2 Lujun Li 1 Bei Liu 1 Jiacheng Liu 1 Qiyuan Zhu 1
+                                                                                    Sirui Han † 1 Yike Guo † 1
+
+
+                                                                  Abstract                                      phisticated applications such as complex reasoning over
+                                                                                                                mathematical (Veeraboina, 2023) and coding problems (Jain
+arXiv:2605.25475v1 [cs.CL] 25 May 2026
+
+
+
+
+                                               Large Language Models (LLMs) are increasingly
+                                               expected to operate over long contexts, yet stan-                et al., 2024), as well as agentic workflows like making
+                                               dard softmax attention incurs a KV cache that                    slides (Manus, 2024) which demands large scale multimodal
+                                               grows linearly with sequence length, quickly be-                 input processing (Team et al., 2025; Georgiou, 2025). Lead-
+                                               coming the bottleneck for long context inference.                ing models like Gemini3 (Pichai et al., 2025) now support
+                                               A practical remedy is to evict less important KV                 context windows of up to 1-million tokens, a scale read-
+                                               entries; however, existing eviction policies are                 ily encountered when ingesting video streams or extensive
+                                               largely heuristic and struggle to capture the rich,              codebases.
+                                               input-dependent distribution of token importance.                However, autoregressive generation poses a critical resource
+                                               In this work, we introduce a learnable indexer                   bottleneck for long context inference. To avoid the quadratic
+                                               that predicts KV importance, enabling more ac-                   complexity of recomputing attention at each decoding step,
+                                               curate retention of critical tokens. Meanwhile,                  modern inference engines leverage Key-Value (KV) caching
+                                               naively evicting tokens permanently discards their               to preserve intermediate states of previously processed to-
+                                               information, leading to irreversible forgetting and              kens. While this strategy substantially reduces computa-
+                                               degraded retrieval over long ranges. To address                  tional overhead, it displaces the bottleneck from computa-
+                                               this, we propose a lightweight latent memory                     tion to memory: the KV cache footprint scales linearly with
+                                               module that compresses evicted tokens into a                     both sequence length and batch size. For instance, main-
+                                               compact, online-updated state and provides resid-                taining a KV cache for a 1-million-token context in a 70-
+                                               ual readouts to compensate for the attention con-                billion parameter model consumes approximately 320 GB
+                                               tributions lost through KV eviction. Collectively,               of GPU memory (Grattafiori et al., 2024), far exceeding the
+                                               our method enables accurate long-context infer-                  capacity of most commodity accelerators. This ”memory
+                                               ence under a bounded KV budget, delivering con-                  wall” constrains not only the maximum deployable context
+                                               sistent improvements on RULER (4K/16K) across                    length but also exacerbates decoding latency, as massive KV
+                                               Qwen, Mistral, and Llama models (up to 25 points                 data movement saturates memory bandwidth. Recent ad-
+                                               under aggressive eviction), markedly more sta-                   vances in KV cache compression, such as quantization (Liu
+                                               ble Needle-in-a-Haystack retrieval, and superior                 et al., 2024; Hooper et al., 2024) and low-rank approxima-
+                                               LongBench scores and compression curves com-                     tion (Chang et al., 2025), primarily reduce the per-token
+                                               pared to existing eviction policies.                             memory footprint. However, they do not address the cache’s
+                                                                                                                inherent linear growth with context length and quadratic
+                                                                                                                complexity of attention, and thus remain insufficient for
+                                         1. Introduction                                                        truly long-context inference. We therefore focus on KV
+                                         Large Language Models (LLMs) have exhibited remark-                    eviction, which directly bounds memory by retaining only
+                                         able prowess in long context understanding, powering so-               the most valuable tokens.
+                                           *
+                                             Equal contribution. † Corresponding authors. Contact               KV eviction faces two key challenges. First, it requires
+                                         emails: Xintong Yang <youngzncu1010@gmail.com>, Hao Gu                 accurately predicting which tokens will remain important
+                                         <marcusguhao@gmail.com>. 1 The Hong Kong University of                 for future decoding. Most existing strategies are training
+                                         Science and Technology 2 Zhejiang University. Correspondence to:       free, relying on hand crafted proxy scores derived from
+                                         Sirui Han <siruihan@ust.hk>, Yike Guo <yikeguo@ust.hk>.                simple static statistics or strong modeling assumptions, an
+                                         Proceedings of the 43 rd International Conference on Machine           approach that often fails to capture the richer, context de-
+                                         Learning, Seoul, South Korea. PMLR 306, 2026. Copyright 2026           pendent patterns governing future token usage. For exam-
+                                         by the author(s).
+
+                                                                                                            1
+                               IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+ple, SnapKV (Li et al., 2024) estimates importance from            where Oattn ∈ RT ×dmodel denotes the output matrix, A ∈
+a local attention window, which can bias retention toward          RT ×T is the attention matrix, and M ask is a causal mask
+nearby tokens; KeyDiff (Park et al., 2025) uses inter-key          with upper-triangular entries set to −∞ to prevent future
+dissimilarity as a proxy for informativeness; and Expected         token access.
+Attention (Devoto et al., 2025) scores keys using “average”
+queries computed from corpus-level query statistics, an as-        KV Caching. During autoregressive decoding, recomput-
+sumption that may not adapt to the specific context and            ing keys and values for all prior tokens x1 , . . . , xT when
+query distribution encountered at inference time. Second,          processing a new token xT +1 is computationally inefficient.
+existing methods permanently discard evicted tokens, which         KV caching circumvents this redundancy by maintaining a
+cannot be retrieved if they become relevant later, incurring       cache C = {(kj , vj )}Tj=1 of previously computed features.
+irreversible information loss. To address these challenges,        For the new token, only its query, key, and value vectors
+we propose a learnable indexer that more accurately esti-          (qT +1 , kT +1 , vT +1 ) are generated. The attention output for
+mates token importance, coupled with a dedicated memory            xT +1 is derived by aggregating the values from the updated
+module that preserves information from evicted tokens for          cache using attention weights computed against the query:
+later retrieval.
+                                                                                      T +1       q       ⊤
+                                                                                                    T +1 K1:T +1
+                                                                                      X                          
+To summarize, our contributions are as follows:                             oattn
+                                                                             T +1 =       softmax     √              vj
+                                                                                      j=1
+                                                                                                        dmodel     j
+
+ 1. We propose a learnable indexer that more accurately
+    predicts the importance of KV tokens and enables adap-         where the Softmax is normalized over the causal context
+    tive KV eviction.                                              j ∈ {1, . . . , T + 1}. This formulation highlights that the
+                                                                   output is a weighted sum of cached values. While KV
+ 2. To mitigate irreversible forgetting caused by perma-           caching substantially reduces decoding latency, the linear
+    nently discarding evicted tokens, we introduce a mem-          growth of C with context length makes it the dominant
+    ory module that compresses evicted tokens into a fixed-        memory consumer during long-context inference.
+    size, compact latent memory, which is updated online
+    during inference.                                              2.2. Formulation of KV cache Eviction Methods
+ 3. We conduct comprehensive experiments demonstrating             We can formulate most KV cache eviction methods in a
+    that our method consistently improves long context             unified scoring-and-selection framework. Given the cached
+    performance, achieving strong gains on RULER across            keys and values K, V ∈ RB×Hkv ×L×dhead , an eviction pol-
+    Qwen/Mistral/Llama (up to +25 points), more robust             icy first assigns an importance score to each cached token
+    NIAH retrieval, and better LongBench score.                    position:
+                                                                                      S = f (·) ∈ RB×Hkv ×L ,
+2. Background                                                      where Sb,h,t measures the importance of token t for head
+2.1. Attention and KV Caching                                      h in sample b. The policy then keeps the top-L′ tokens
+                                                                   and compacts the cache by gathering along the sequence
+The Transformer architecture (Vaswani et al., 2017) serves         dimension:
+as the foundational component of modern LLMs. It
+processes an input sequence X = (x1 , x2 , . . . , xT ) ∈               I = TopK(S, L′ ), [K ′ , V ′ ] = Gather(K, V, I).
+RT ×dmodel through stacked Transformer blocks. Each block
+f (·) sequentially applies causal self-attention and a feed-       Here I denotes the indices of retained tokens and Gather(·)
+forward network (FFN) to produce the output sequence               selects entries along the token dimension.
+X ′ = (x′1 , x′2 , . . . , x′T ) ∈ RT ×dmodel :                    Different methods mainly differ in the definition of the
+          X ′ = f (X) = FFN(Attention(X)).              (1)        score function f (·). SnapKV uses attention from the most
+                                                                   recent window of queries to score past keys. Concretely,
+Causal self-attention. Given hidden states X, self-                it defines the per-key importance as the average attention
+attention projects each token into query, key, and value           mass assigned to key position t by the last w queries:
+vectors using projection matrices Wq , Wk , Wv :                                        L−1
+                                                                                                      QK ⊤
+                                                                                                          
+                                                                                      1 X
+        Q = XWq ,      K = XWk ,      V = XWv .         (2)                   St =          softmax    √
+                                                                                      w                  d i,t
+                                                                                        i=L−w
+The attention output is then computed as:
+                                                                   Knorm: scores tokens by key magnitude, typically
+                         QK ⊤
+                                        
+  Oattn = Softmax √              + M ask V = AV,        (3)                                  St = ∥Kt ∥2 ,
+                          dmodel
+
+                                                               2
+                                        IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+           Attention
+            Stream
+                                          Indexer                score                                             Evicted           𝒐𝒂𝒕𝒕𝒏
+                                                                                                                  Attention
+
+                                                           select                        save
+                                                           TopK                         tokens
+
+
+
+
+                    full sequence
+                                                                            evict                 online update
+                                           Memory
+                                                                           tokens                latent memory
+                                           Residual
+                                                                                                                  Memory
+                                                                                                      M,b         Module
+                                                                                                                                             𝒈 𝒒 $ 𝒎(𝒒)
+
+
+
+
+Figure 1. The overall pipeline of IndexMem is as follows: in the main attention stream, we use the learnable indexer to accurately select
+which KV tokens to save and evict the rest. The evicted tokens are then used to update a latent memory online, and the memory readout
+is added as a residual to compensate the main attention stream for the information lost due to eviction.
+
+
+      query           hidden state               query                 evict KV         for KV retention. Given hidden states X ∈ RL×dmodel and
+                                                                                        (pre-RoPE) query states Q ∈ RH×L×dhead , the indexer out-
+       U!            U"             G     g(·)                  Linear#                 puts a dense query-to-key score matrix
+      Norm          Norm        scale
+                                                         Linear! (𝑞)     M, b                               A = Indexer(X, Q) ∈ RL×L ,
+       q               k            α
+                                                                                        where As,t measures how important the key token at posi-
+                                         g(q)                     m(q)                  tion t is to the query at position s.
+              Act
+               z
+                                                                                        Architecture. We first construct QK-Norm (Henry et al.,
+                                                                          slow
+                           A
+                                        Memory                           weights        2020) features for stable training. Let Hindex and dindex
+    Indexer           max (·)
+                                        Module                             fast
+                                                                         weights
+                                                                                        denote the number of indexer heads and the per-head di-
+                                                                                        mension, respectively, where typically Hindex ≪ H and
+                       score                                                            dindex ≪ dhead to reduce computation. We obtain indexer
+Figure 2. Architectures of the Indexer and the Memory module.                           queries q by down-projecting the multi-head query at posi-
+Left: the Indexer adopts an MQA-style design with norm on                               tion s:
+both multi head q and single head cached k (k are continuously                                     qs = Uq flatten(Qs ) ∈ RHindex dindex ,
+cached during decoding); it computes token scores via gated q, k
+similarity, followed by max aggregation. Right: the Memory                              and reshape Qs as per-head features Qs,h ∈ Rdindex . Keys k
+module produces a residual readout m(q) from a fixed-size latent                        are derived from hidden states: kt = Uk Xt ∈ Rdindex . Fol-
+state. Evicted tokens update the fast weights (M, b) online, while                      lowing an MQA-style (Shazeer, 2019) design, the indexer
+g(·) and Linearθ (·) are slow weights learned during training.
+                                                                                        uses a single shared key k for all head. Then, we apply RM-
+                                                                                        SNorm to obtain QK-Norm features: q = Norm(q), k =
+so tokens with smaller key norms are considered less im-                                Norm(k).
+portant and are evicted first. We can plug in other eviction                            We add a learnable gate to modulate the contribution of in-
+rules (e.g., TOVA (Oren et al., 2024), KeyDiff, Expected                                dexer heads and improve expressiveness. For each position
+Attention) by specifying their corresponding score function                             s, we compute a head-gating vector
+S = f (·) under this same framework.
+                                                                                                                      GXs
+                                                                                                            αs = √                 ∈ RHindex .
+                                                                                                                     Hindex dindex
+3. Methods
+                                                                                        Given a query position s and a key position t, let qs ∈
+3.1. Learnable Indexer for Token Importance                                             RHindex ×dindex be the query features and kt ∈ Rdindex the shared
+The core challenge in KV eviction is accurately estimating                              key feature. We compute the per-head similarities as z and
+token importance through a proxy. Existing methods are                                  aggregate them with the gate:
+limited by heuristic designs and a tendency to overempha-                                    zs,t = act (qs , kt ) ,          As,t = αs⊤ zs,t + M asks,t ,
+size local tokens. Motivated by the lightning indexer in
+DeepSeek Sparse Attention (Liu et al., 2025), we introduce                              where M asks,t is the causal mask. The resulting score ma-
+a lightweight, learnable indexer to assess token importance                             trix A serves as a learnable proxy for token importance. We
+
+                                                                                    3
+                                 IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+reduce scores over query set Q to obtain per-token impor-              tokens is enough. However, for holistic long-context rea-
+tance for KV retention:                                                soning (e.g., QA and summarization), useful information
+                                                                       can be spread across many seemingly low saliency tokens.
+                        impt = max As,t
+                               s∈Q                                     Aggressive eviction therefore introduces an irreversible in-
+We define the query set Q used for importance aggregation              formation loss that accumulates over time.
+as follows: during prefill, the indexer uses all queries in            Existing approaches to mitigate forgetting in KV cache
+the prompt; during decoding, it aggregates over the queries            eviction have explored reconstruction based methods like
+generated within each compression interval.                            KVReviver (Yuan et al., 2025a), which rebuild KV from
+This indexer design offers several advantages. During de-              compact sketches, yet suffer from error amplification during
+coding, it reuses the growing k cache to predict token im-             softmax. Offloading alternatives (e.g., NOSA (Huang et al.,
+portance. Unlike methods such as Expected Attention and                2025), InfLLM (Xiao et al., 2024)) preserve tokens in CPU
+SnapKV that typically materialize all KV pairs then evict,             memory, yet they introduce throughput bottlenecks due to
+our indexer enables pre-eviction: before prefill, it uses score        the high latency of CPU-GPU data transfers.
+to predict which KV entries should be retained, so the sub-            To address these problems, we compact evicted tokens into
+sequent prefill computes and caches only the selected KV               a fixed-size latent memory. Our memory design consists
+states. The overall architecture is illustrated in Figure 2.           of two components: how to write evicted information into
+                                                                       memory, and how to read it back to compensate attention.
+Training. Our proposed MQA-style indexer is a
+lightweight attention-like module that predicts the back-              Why not memory-as-tokens. A straightforward approach
+bone attention scores. During training, we freeze the back-            is to write evicted KV into a small set of latent KV tokens
+bone LLM and optimize only the learnable indexer. Given                (“memory-as-tokens”) and let standard softmax attention
+a sequence of length L, the indexer outputs a score map                read both retained tokens and latent memory. In practice,
+A ∈ RL×L , where A(q, k) are logits over keys for each                 token placement is tricky: putting latent tokens at the prefix
+query q. We distill it to match the backbone’s attention be-           often turns them into attention sinks, that attract large atten-
+havior by aligning pooled per-key importance distributions             tion mass. While placing them later makes them unable to
+derived from the teacher and the indexer.√Concretely, we use           access for early queries. A simple fix is a special attention
+the teacher attention logits T = QK ⊤ / dmodel and apply a             mask that makes latent tokens globally visible to all queries.
+max aggregation over queries: a key is deemed important if             More fundamentally, this formulation can be brittle: the
+it is highly scored by any query. We then minimize                     latent tokens may collapse to a general “mean” summary,
+                                                       
+ DKL softmax max T (q, ·)
+                               
+                                  softmax max A(q, ·) .                and softmax can amplify small mismatch.
+                    q                           q
+
+To stabilize optimization, we exclude sink tokens (Xiao                Readout as residual compensation. Instead of injecting
+et al., 2023) from the KL loss by masking out a fixed set of           latent memory as additional KV tokens inside softmax, we
+sink positions on the key axis, since their consistently large         treat memory as an explicit compensation residual for the
+attention weights can dominate gradients.                              information removed by eviction. Concretely, we augment
+                                                                       the original attention output with a gated memory readout:
+Naively materializing the full teacher score matrix (T ) is pro-
+hibitively memory-intensive, as it requires storing O(L2 ) en-                         o = oattn + g(q) · m(q),                    (4)
+tries. Instead, we compute the pooled vectors maxq T (q, ·)
+and maxq A(q, ·) in a streaming (FlashAttention-style) man-            where oattn is computed only over the retained KV cache.
+ner: we iterate over queries in chunks and stream over keys,           The memory readout m(q) summarizes useful signals from
+updating an O(L) running-max vector over keys, never                   evicted tokens conditioned on the current query q. The gate
+instantiating the full L × L matrix. Finally, we apply a               g(q) ∈ [0, 1] controls whether and how much the model
+numerically-stable softmax on the key axis and compute                 should rely on the latent memory for current query, enabling
+the KL exactly for the pooled distributions while preventing           a safe fallback that g(q) = 0.
+materializing the full attention map.
+                                                                       Slow and fast weights in the memory module. We use
+                                                                       one latent memory module per layer, shared across all at-
+3.2. Latent Memory for Evicted Tokens
+                                                                       tention heads. The module consists of (i) slow weights θ,
+Most KV cache compression methods rely on an evict                     updated by gradients during training, and (ii) fast weights,
+or keep decision: once a token is evicted, its KV states               updated online at inference time by simple update rules. Us-
+are permanently discarded. This design is often suffi-                 ing slow weights alone often collapses to a dataset-specific
+cient for retrieval style benchmarks (e.g., needle-in-a-               mean compensation for evicted attention. The fast weights
+haystack/RULER), where preserving a small set of evidence              maintain a fixed-size state matrix M ∈ Rdmem ×dmodel and
+
+                                                                   4
+                                  IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+a stabilizer vector b ∈ Rdmem , where dmem is the memory-             immediately compute token importance, perform one-shot
+state dimension. Given a query q ∈ Rdmodel , we compute a             compression, and write evicted KV pairs into the latent
+projection Linearθ (q) ∈ Rdmem and read from memory as                memory. Concretely, we compress the prefill KV cache to a
+                                                                      fixed fraction (1 − r)L (i.e., evict an r portion of tokens).
+                             Linearθ (q)⊤ M                           During decoding, we further apply periodic compression
+              m(q) =                             ,          (5)
+                           Linearθ (q)⊙2 ⊤ b + ϵ                      every τ = 128 generated tokens to prevent the cache from
+                                                                      growing. At each compression, we score tokens using all
+where Linearθ (q)⊙2 = Linearθ (q) ⊙ Linearθ (q) and ϵ is a            queries observed since the previous compression and retain
+small constant.                                                       the most important entries under a fixed KV budget Bmax
+                                                                      (implementation-wise, Bmax can be set to (1 − r)L plus the
+Online write as fast-weight updates. The memory state                 most recent local window).
+(M, b) is updated online per evict step. Given the evicted
+set E with key-value pairs {(ki , vi )}i∈E , we apply an outer-
+                                                                      Training Setup
+product accumulation with decay:
+                                                                      Indexer and memory hyperparameters. The indexer uses
+                                                                      Hindex = H/4 heads, where H is the number of attention
+                             X
+            M ← λM + η            Linearθ (ki ) vi⊤ ,      (6)
+                                i∈E
+                                                                      heads in the backbone LLM. Its down-projection dimension
+                     X                                                is set to dindex = dhead /8 (with dhead the per-head hidden
+       b ← λb + η          Linearθ (ki ) ⊙ Linearθ (ki ),   (7)       dimension), and G is implemented as a lightweight per-
+                     i∈E
+                                                                      head gating module. For the memory module, we set the
+where λ ∈ (0, 1] is a decay factor and η > 0 is the write             latent dimension to dmem = d/8, where dmodel = H · dhead
+strength.                                                             denotes the model hidden size.
+                                                                      Training protocol. We freeze the backbone LLM and adopt
+Slow-weight training. We train the slow-weight compo-                 a two-stage training scheme. (i) We first train the indexer
+nents (the projection Linearθ (·) and gate g(·)) by gradient          alone, so that it learns to estimate token importance and
+to make the memory readout match the missing residual                 make reliable evict decisions. (ii) We then jointly train the
+introduced by eviction. Concretely, we minimize an MSE                indexer and the memory module, where the latent mem-
+objective                                                             ory is optimized using the evicted-attention output as the
+                                                     2                learning signal, encouraging it to compensate for informa-
+          Lmem =       o − oattn − g(q) · m(q)       2
+                                                       ,    (8)       tion lost due to eviction. We conduct SFT on LongAl-
+                                                                      paca (Chen et al., 2024) with a chunk-wise KL objective,
+where o is the full attention output and oattn is the output
+                                                                      and use DDP (without context parallelism) for training. We
+computed from the compressed KV cache.
+                                                                      use a warmup-stable-decay (WSD) learning-rate schedule
+                                                                      with 100 warmup steps to 1×10−3 , followed by 2000 stable
+4. Experiment                                                         steps and 2000 decay steps to 7.5 × 10−6 .
+Models and Evaluation Setup. We conduct experiments
+on three representative LLM backbones: Qwen3-8B (Yang                 Baselines. We compare our method (IndexMem) with
+et al., 2025), Mistral-7B-v0.3 (Jiang et al., 2023), and Llama-       representative KV-cache eviction baselines, all imple-
+3.1-8B-Instruct (Grattafiori et al., 2024). Following com-            mented and evaluated under the same framework for a
+mon practice, we define the compression ratio r ∈ [0, 1]              fair comparison. Specifically, we include ExpectedAtten-
+such that each method evicts an r fraction of cached KV               tion (attention-statistics-based importance), KeyDiff (key-
+entries and retains the top (1 − r) fraction according to its         difference saliency), TOVA (Token Omission Via Attention;
+token-importance scores. To avoid degenerate behaviors                retrieval-oriented eviction), and two widely used heuristic
+caused by sink tokens, we additionally keep the first four to-        compressors, SnapKV and PyramidKV.
+kens in the cache for all methods. We implement IndexMem
+and all baselines within the same evaluation pipeline us-             RULER results. We evaluate long-context capability on
+ing the KVPRESS (NVIDIA Corporation, 2025) GitHub                     the RULER suite (Hsieh et al., 2024) under both RULER-
+repository, ensuring consistent eviction protocols and fair           4K and RULER-16K settings. In our implementation,
+comparisons across methods. Unless otherwise specified,               each subtask is scored by string match. We report the
+all experiments are run on a single NVIDIA H800 GPU.                  overall RULER score as an unweighted average over all sub-
+                                                                      tasks in the evaluation set. Table 1 shows that IndexMem
+Inference schedule and cache budget. Our evaluation                   is consistently the most robust method under KV eviction.
+primarily targets the long-prefill, short-decode regime. After        Under mild compression (r ≤ 0.25), IndexMem nearly
+finishing the prefill pass over a prompt of length L, we              matches the full-cache baseline across all backbones, in-
+
+                                                                  5
+                                        IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+                                                      Ruler 4k                                              Ruler 16k
+Model        Method
+                                 0%       10%      25%      50%      75%         90%      0%      10%     25%      50%     75%      90%
+             IndexMem (ours)     95.3      93.8    90.3      78.9     72.9       46.2    92.9     91.6    86.8     80.0    72.2     56.0
+             KeyDiff             95.3      93.8    89.4      78.6     64.4       37.9    92.9     88.9    82.9     74.5    66.9     53.1
+Qwen3-8B     TOVA                95.3      89.0    82.5      77.6     62.4       24.7    92.9     88.3    81.7     76.2    68.7     52.4
+             SnapKV              95.3      92.6    84.0      55.7     33.1       19.2    92.9     90.1    81.5     62.8    41.7     26.8
+             PyramidKV           95.3      91.4    75.1      40.8     29.7       19.5    92.9     89.2    76.1     47.8    32.6     22.0
+             IndexMem (ours)     92.1      88.6    85.0      82.8     68.8       41.5    86.1     81.0    75.9     68.5    66.0     52.9
+             ExpectedAttention   92.1      77.1    66.3      44.8     28.1       13.2    86.1     69.5    59.3     41.0    26.2     15.4
+Mistral-7B   TOVA                92.1      83.1    78.4      75.5     62.0       29.2    86.1     77.7    73.8     70.1    61.0     47.7
+             SnapKV              92.1      71.5    57.6      41.3     31.9       19.8    86.1     62.3    49.5     36.5    27.1     21.3
+             PyramidKV           92.1      70.8    57.1      38.6     29.6       19.9    86.1     53.4    45.0     33.2    22.9     18.0
+            IndexMem (ours)      95.3      95.6    95.6      93.3     78.3       55.2    93.4     93.5    92.9     88.7    74.3     56.0
+            ExpectedAttention    95.3      95.7    95.3      92.2     75.9       30.6    93.4     93.4    92.8     86.0    66.4     25.5
+Llama3.1-8B TOVA                 95.3      93.2    87.3      76.2     63.3       37.5    93.4     90.9    86.1     77.9    68.4     59.2
+            SnapKV               95.3      95.5    88.8      81.8     63.2       43.4    93.4     89.4    82.0     68.0    43.1     25.6
+            PyramidKV            95.3      84.5    79.4      65.8     43.6       23.1    93.4     85.2    77.5     62.5    39.6     24.1
+                                           Table 1. Ruler results under different compression ratios.
+
+
+
+
+        Figure 3. Needle-in-a-Haystack (NIAH) heatmaps of Llama-3.1-8B-Instruct under KV eviction at 50% compression ratio.
+
+
+dicating that the learned indexer can precisely remove a
+substantial fraction of unnecessary tokens with minimal ac-
+curacy loss. As eviction becomes aggressive (r ≥ 0.5), the
+gap widens: heuristic methods (e.g., SnapKV/PyramidKV)
+degrade rapidly, while IndexMem degrades more grace-
+fully and preserves substantially higher scores, especially
+at extreme budgets (r = 0.75–0.9). This effect is most pro-
+nounced in longer contexts (RULER-16K), demonstrating
+the effectiveness of our learning-based indexer.
+
+
+NIAH results. To visualize retrieval robustness across
+context lengths and needle positions, we additionally run the
+Needle-in-a-Haystack (NIAH) stress test (Kamradt, 2023).
+Figure 3 visualizes retrieval robustness under aggressive KV
+eviction. Overall, IndexMem exhibits the most stable behav-                    Figure 4. Scores on LongBench for Llama-3.1-8B-Instruct.
+ior across the full sweep of context lengths (1K–12.5K) and
+needle depths (15%–95%), indicating that it can reliably
+                                                                             but exhibits rare catastrophic misses (isolated red cells).
+recover the needle regardless of where it appears. In con-
+                                                                             Adding the latent memory substantially reduces these fail-
+trast, heuristic compression baselines (e.g., PyramidKV and
+                                                                             ures, supporting our hypothesis that the memory residual
+SnapKV) show clear position-dependent failure modes: they
+                                                                             compensates for information irreversibly lost due to eviction
+perform reasonably when the needle lies in more favorable
+                                                                             and improves worst-case retrieval robustness.
+regions, but degrade sharply for harder placements, consis-
+tent with a strong recency bias and coarse token-selection
+granularity. Finally, comparing Indexer only vs. IndexMem,                   LongBench results. We further evaluate long-context un-
+the learned indexer already achieves high retrieval quality                  derstanding on LongBench (Bai et al., 2024) under KV-
+
+                                                                       6
+                                IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+
+
+
+                         Figure 5. Ablation of Memory module on Llama-3.1-8B-Instruct of Longbench.
+
+
+                                                                    gradually approach the full-cache baseline. Importantly, In-
+                                                                    dexMem achieves the best accuracy under the same Bmax
+                                                                    across both benchmarks, demonstrating that learned im-
+                                                                    portance estimation is especially beneficial when the KV
+                                                                    cache is heavily constrained. Under moderate budgets
+                                                                    (Bmax ≥ 1536), the gap narrows as all methods retain
+                                                                    enough context to recover most performance, but IndexMem
+                                                                    remains consistently on top, indicating a better accuracy–
+                                                                    memory trade-off throughout.
+Figure 6. Decoding time KV cache compression on Qwen3-8B.
+                                                                    Ablation. We conduct ablations to isolate the effect of
+cache eviction. Figure 4 reports score–compression curves           the latent memory module. First, we compare Indexer only
+on representative longbench tasks. Overall, IndexMem is             (without memory compensate) against IndexMem (Indexer
+the most robust across LongBench tasks, degrading more              + memory residual). Across LongBench tasks, adding mem-
+gracefully as compression increases. It consistently leads on       ory yields consistent gains, with the largest improvements
+hotpotqa and multifieldqa en, while PyramidKV/SnapKV                under aggressive compression (e.g., r ≥ 0.5). In particu-
+drop sharply at r ≥ 0.75. On triviaqa, IndexMem remains             lar, the memory residual substantially reduces catastrophic
+strong even at extreme budgets and can sometimes improve            failures where Indexer only collapses at high compression
+with higher compression. We attribute this to an information-       (e.g., on trec and qasper QA tasks), indicating that storing
+density effect because moderate eviction removes low-value          evicted tokens and reading them back is crucial for mitigat-
+or distracting tokens and sharpens the retained context. This       ing irreversible forgetting introduced by eviction. Second,
+effect is not isolated to triviaqa—the all-task LongBench           we evaluate whether the memory module is tied to our in-
+average in Appendix C.3 also peaks at 50% compression               dexer or can generalize to other eviction policies. To this
+for both IndexMem and PyramidKV before degrading un-                end, we plug the same memory module into SnapKV, form-
+der aggressive eviction. trec is more sensitive at r = 0.90,        ing SnapKV+Memory, where evicted tokens selected by
+where performance may drop due to pruning task-critical             SnapKV are used to update the memory online and the
+conditioning tokens; notably, TOVA collapses under high             memory readout is added as a residual. We observe consis-
+compression. Overall, IndexMem offers a better accuracy–            tent improvements over SnapKV on multiple tasks, showing
+memory trade-off than prior eviction heuristics.                    that the proposed latent memory is largely orthogonal to
+                                                                    the choice of eviction heuristic and can serve as a drop-in
+Decoding Compression. During decoding, we compress                  component to recover information lost by KV eviction.
+every τ = 128 generated tokens. At each compression
+step, we enforce a maximum KV budget Bmax . Figure 6                Parameter and Efficiency Analysis. We introduce only
+reports results on AIME25 and Math500 by sweeping                   a small number of additional parameters. On Llama-3.1-
+Bmax ∈ {512, 1024, 1536, 2048}. As expected, larger bud-            8B-Instruct, the indexer adds 19.92M parameters, while
+gets consistently improve performance for all methods and           the latent memory module is lightweight, contributing only
+
+                                                                7
+                                 IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+                                                                     value tensors (KIVI (Liu et al., 2024), ZipCache (He et al.,
+                                                                     2024)). In contrast, token reduction directly bounds KV
+                                                                     memory by retaining only a subset of tokens via eviction
+                                                                     or selection policies. Most existing eviction strategies are
+                                                                     training-free and rely on heuristics or simple statistics. H2O
+                                                                     retains “heavy hitter” tokens with large accumulated atten-
+                                                                     tion contributions, balancing them with recency to stabilize
+                                                                     decoding (Zhang et al., 2023). SnapKV leverages a short
+                                                                     observation window near the end of the prompt to infer per-
+    Figure 7. Efficiency analysis of Llama-3.1-8B-Instruct.          head salient KV positions, which can introduce locality bias
+                                                                     when long-range dependencies dominate (Li et al., 2024).
+0.52M parameters. We measure efficiency under a long-                To avoid explicit attention-score materialization, KeyDiff
+context setting with 32K prefill and 1K decoding. Figure 7           selects tokens based on key similarity/diversity as a proxy
+reports (i) average decoding time and (ii) cache memory              for importance (Park et al., 2025), while Expected Attention
+usage as a function of the compression ratio. As shown               estimates KV importance by modeling how future query
+in the left panel, the indexer-only variant is consistently          distributions would attend to past keys (Devoto et al., 2025).
+faster than the full-cache baseline, and decoding time de-           More recently, a line of work seeks better alignment with
+creases as eviction becomes more aggressive. Adding the              true decoding-time queries, e.g., generating pseudo looka-
+memory module incurs a test-time update overhead, but still          head queries to improve eviction consistency (Wang et al.,
+remains competitive and close to the baseline in latency             2025).
+across all compression ratios. The right panel shows that
+cache memory decreases monotonically with higher com-
+pression, dropping from 7.68 GB at r = 0 to 4.08 GB at               Memory. A common approach to extend an LLM’s ef-
+r = 0.9. Here, cache memory accounts for the KV cache,               fective context is to introduce external memory via agentic
+the indexer key cache, and the latent memory state.                  retrieval (Hu et al., 2025) or RAG-style (Qian et al., 2025)
+                                                                     pipelines, which store past information in a separate datas-
+5. Related Work                                                      tore and retrieve relevant chunks at inference time. While
+                                                                     effective, these methods typically rely on an additional re-
+Sparse Attention. A large body of work improves long-                triever, incur extra system complexity, and can be sensitive
+context efficiency by sparsifying attention computation, ei-         to retrieval errors or latency. Another line of work integrates
+ther by imposing structured patterns or by dynamically re-           memory inside the model through test-time adaptation or
+stricting which key-value (KV) blocks are accessed. Re-              fast-weight mechanisms. For example, Titans (Behrouz
+cent system- and kernel-oriented approaches aim to reduce            et al., 2024) maintain an online-updated memory state to
+memory movement and attention FLOPs without necessar-                accumulate information beyond the attention window, and
+ily changing the model weights. Quest introduces query-              Product Key Memory (PKM) (Lample et al., 2019) and its
+aware KV page selection, estimating page criticality from            fast-weight variants (e.g., FwPKM) (Zhao & Jones, 2026)
+lightweight metadata and loading only top-ranked pages dur-          provide large-capacity associative memories with learned
+ing attention computation (Tang et al., 2024). MInference            addressing. More recently, test-time training methods such
+accelerates the prefilling stage via dynamic sparse atten-           as TTT-E2E (Tandon et al., 2025) update a compact set of
+tion, exploiting recurring sparse patterns (e.g., A-shape /          parameters or internal states online to absorb long-range
+vertical-slash / block-sparse) with head-wise offline pattern        information during generation.
+assignment and efficient GPU kernels (Jiang et al., 2024).
+MoBA applies a mixture-of-experts style routing to block at-
+tention, enabling a smooth trade-off between full and sparse         6. Conclusion & Limitation
+attention for long contexts (Lu et al., 2025). NSA designs           We present IndexMem, a learnable KV-cache eviction frame-
+natively trainable sparse attention mechanisms aligned with          work for long-context LLM inference. Our method intro-
+modern hardware, emphasizing both training viability and             duces a learnable indexer to more accurately predict KV-
+inference efficiency (Yuan et al., 2025b).                           token importance. To mitigate the irreversible forgetting
+                                                                     caused by discarding evicted tokens, we further propose an
+KV Cache Compression. KV cache compression meth-                     online-updated latent memory module whose residual read-
+ods broadly fall into two categories that are often orthogonal       out compensates the main attention stream. Together, these
+and composable. Representation compression reduces the               components demonstrate the promise of learnable architec-
+per-token footprint of KV states, e.g., low-bit quantization         tures for efficient attention and offer a favorable accuracy–
+schemes tailored to the distributional properties of key/-           memory trade-off across long-context benchmarks.
+
+                                                                 8
+                                IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+Impact Statement                                                       large language models. In The International Conference
+                                                                       on Learning Representations (ICLR), 2024.
+This paper presents work whose goal is to improve the effi-
+ciency of long-context large language model inference. By            Devoto, A., Jeblick, M., and Jégou, S. Expected attention:
+reducing the memory footprint of the KV cache, IndexMem                Kv cache compression by estimating attention from future
+may help lower the hardware cost of serving long-context               queries distribution. arXiv preprint arXiv:2510.00636,
+models and make such systems more accessible under lim-                2025.
+ited computational resources. This can also potentially re-
+duce the energy and infrastructure requirements associated           Feng, Y., Lv, J., Cao, Y., Xie, X., and Zhou, S. K. Ada-
+with long-context inference.                                           kv: Optimizing kv cache eviction by adaptive budget
+                                                                       allocation for efficient llm inference. Advances in Neu-
+At the same time, improving inference efficiency may also              ral Information Processing Systems, 38:113152–113188,
+make large language models easier to deploy at scale, in-              2026.
+cluding in settings where model outputs could be unreli-
+able, biased, or misused. In addition, KV-cache eviction             Georgiou, G. P. Capabilities of gpt-5 across critical do-
+and memory compression may affect which parts of the                   mains: Is it the next breakthrough? arXiv preprint
+input are preserved, so care should be taken when applying             arXiv:2508.19259, 2025.
+such methods in high-stakes domains where missing a small
+                                                                     Grattafiori, A., Dubey, A., Jauhri, A., Pandey, A., Kadian,
+but important detail could lead to harmful decisions. Our
+                                                                       A., Al-Dahle, A., Letman, A., Mathur, A., Schelten, A.,
+method is intended as a general efficiency technique rather
+                                                                       Vaughan, A., et al. The llama 3 herd of models. arXiv
+than a solution to these broader safety and reliability chal-
+                                                                       preprint arXiv:2407.21783, 2024.
+lenges. We encourage practitioners to evaluate compressed
+long-context systems carefully under their target use cases          Gu, H., Li, L., Wang, H., Wang, L., Wang, Z., Liu, B.,
+before deployment.                                                     Liu, J., Zhu, Q., Han, S., and Guo, Y. Btc-llm: Efficient
+                                                                       sub-1-bit llm quantization via learnable transformation
+References                                                             and binary codebook. arXiv preprint arXiv:2506.12040,
+                                                                       2025a.
+Bai, Y., Lv, X., Zhang, J., Lyu, H., Tang, J., Huang, Z.,
+  Du, Z., Liu, X., Zeng, A., Hou, L., et al. Longbench: A            Gu, H., Li, W., Li, L., Zhu, Q., Lee, M., Sun, S., Xue, W.,
+  bilingual, multitask benchmark for long context under-               and Guo, Y. Delta decompression for moe-based llms
+  standing. In Proceedings of the 62nd annual meeting of               compression. arXiv preprint arXiv:2502.17298, 2025b.
+  the association for computational linguistics (volume 1:
+  Long papers), pp. 3119–3137, 2024.                                 Gu, H., Wang, H., Liu, J., Li, L., Zhu, Q., Liu, B., Xu,
+                                                                       B., Wang, L., Yang, X., Lin, S., et al. Qarl: Rollout-
+Bai, Y., Dong, Q., Jiang, T., Lv, X., Du, Z., Zeng, A., Tang,          aligned quantization-aware rl for fast and stable train-
+  J., and Li, J. Indexcache: Accelerating sparse attention via         ing under training–inference mismatch. arXiv preprint
+  cross-layer index reuse. arXiv preprint arXiv:2603.12201,            arXiv:2604.07853, 2026.
+  2026.
+                                                                     He, Y. et al. Zipcache: Accurate and efficient kv cache quan-
+Behrouz, A., Zhong, P., and Mirrokni, V. Titans: Learning to           tization with salient token identification. arXiv preprint
+  memorize at test time. arXiv preprint arXiv:2501.00663,              arXiv:2405.14256, 2024.
+  2024.                                                              Henry, A., Dachapally, P. R., Pawar, S. S., and Chen, Y.
+                                                                       Query-key normalization for transformers. In Findings of
+Chang, C.-C., Lin, C.-Y., Akhauri, Y., Lin, W.-C., Wu, K.-C.,          the Association for Computational Linguistics: EMNLP
+  Ceze, L., and Abdelfattah, M. S. xkv: Cross-layer svd for            2020, pp. 4246–4253, 2020.
+  kv-cache compression. arXiv preprint arXiv:2503.18893,
+  2025.                                                              Hooper, C., Kim, S., Mohammadzadeh, H., Mahoney,
+                                                                       M. W., Shao, Y. S., Keutzer, K., and Gholami, A.
+Chen, T., Cheng, P., Zhu, Q., Wang, J., Liu, B., Gu, H., Shen,         Kvquant: Towards 10 million context length llm infer-
+  R., Hou, X., Han, S., and Liu, J. Adaptive spatial and               ence with kv cache quantization. Advances in Neural
+  temporal redundancy optimization for efficient reasoning            Information Processing Systems, 37:1270–1303, 2024.
+  in large language models. In The 64th Annual Meeting of
+  the Association for Computational Linguistics, 2026.               Hsieh, C.-P., Sun, S., Kriman, S., Acharya, S., Rekesh, D.,
+                                                                       Jia, F., Zhang, Y., and Ginsburg, B. Ruler: What’s the
+Chen, Y., Qian, S., Tang, H., Lai, X., Liu, Z., Han, S., and           real context size of your long-context language models?
+  Jia, J. Longlora: Efficient fine-tuning of long-context              arXiv preprint arXiv:2404.06654, 2024.
+
+                                                                 9
+                                 IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+Hu, Y., Liu, S., Yue, Y., Zhang, G., Liu, B., Zhu, F., Lin, J.,        Liu, A., Mei, A., Lin, B., Xue, B., Wang, B., Xu, B., Wu,
+  Guo, H., Dou, S., Xi, Z., et al. Memory in the age of ai               B., Zhang, B., Lin, C., Dong, C., et al. Deepseek-v3.
+  agents. arXiv preprint arXiv:2512.13564, 2025.                         2: Pushing the frontier of open large language models.
+                                                                         arXiv preprint arXiv:2512.02556, 2025.
+Huang, Y., Yuan, B., Han, X., Xiao, C., and Liu, Z. Locret:
+  Enhancing eviction in long-context llm inference with                Liu, Z., Yuan, J., Jin, H., Zhong, S., Xu, Z., Braverman,
+  trained retaining heads on consumer-grade devices. arXiv               V., Chen, B., and Hu, X. Kivi: A tuning-free asym-
+  preprint arXiv:2410.01805, 2024.                                       metric 2bit quantization for kv cache. arXiv preprint
+                                                                         arXiv:2402.02750, 2024.
+Huang, Y., Xiao, C., Han, X., and Liu, Z. Nosa: Na-
+  tive and offloadable sparse attention. arXiv preprint                Lu, E. et al. Moba: Mixture of block attention for long-
+  arXiv:2510.13602, 2025.                                                context llms. arXiv preprint arXiv:2502.13189, 2025.
+Jain, N., Han, K., Gu, A., Li, W.-D., Yan, F., Zhang, T.,              Manus.        Can manus create slides?, 2024.
+  Wang, S., Solar-Lezama, A., Sen, K., and Stoica, I.                   URL           https://manus.im/zh-cn/blog/
+   Livecodebench: Holistic and contamination free eval-                 can-manus-create-slides.       Accessed: Jan-
+   uation of large language models for code. arXiv preprint             uary 21, 2026.
+   arXiv:2403.07974, 2024.
+                                                                       NVIDIA Corporation. kvpress: Kv cache compression
+Jiang, A. Q., Sablayrolles, A., Mensch, A., Bamford, C.,
+                                                                        library for long-context llms, 2025. URL https://
+   Chaplot, D. S., de las Casas, D., Bressand, F., Lengyel,
+                                                                        github.com/NVIDIA/kvpress. Accessed: 2026-
+   G., Lample, G., Saulnier, L., Lavaud, L. R., Lachaux, M.-
+                                                                        01-26.
+   A., Stock, P., Scao, T. L., Lavril, T., Wang, T., Lacroix,
+   T., and Sayed, W. E. Mistral 7b. arxiv, 2023.                       Oren, M., Hassid, M., Yarden, N., Adi, Y., and Schwartz,
+                                                                         R. Transformers are multi-state rnns. arXiv preprint
+Jiang, H., Li, Y., Zhang, C., Wu, Q., Luo, X., Ahn, S.,
+                                                                         arXiv:2401.06104, 2024.
+   Han, Z., Abdi, A. H., Li, D., Lin, C.-Y., Yang, Y., and
+   Qiu, L. Minference 1.0: Accelerating pre-filling for long-
+                                                                       Park, J., Jones, D., Morse, M. J., Goel, R., Lee, M., and
+   context llms via dynamic sparse attention. arXiv preprint
+                                                                         Lott, C. Keydiff: Key similarity-based kv cache eviction
+   arXiv:2407.02490, 2024.
+                                                                         for long-context llm inference in resource-constrained
+Kamradt, G. Needle in a haystack - pressure test-                        environments. arXiv preprint arXiv:2504.15364, 2025.
+  ing llms. https://github.com/gkamradt/
+                                                                       Pichai, S., Hassabis, D., Kavukcuoglu, K., et al.
+  LLMTest_NeedleInAHaystack, 2023.
+                                                                         A new era of intelligence with gemini 3.
+Lample, G., Sablayrolles, A., Ranzato, M., Denoyer, L.,                  Google Blog, November 2025.       URL https:
+  and Jégou, H. Large memory layers with product keys.                  //blog.google/products-and-platforms/
+  Advances in Neural Information Processing Systems, 32,                 products/gemini/gemini-3/. Published Nov
+  2019.                                                                  18, 2025.
+
+Li, L., Zhu, Q., Wang, J., Qin, X., Li, W., Gu, H., Han, S.,           Qian, H., Liu, Z., Zhang, P., Mao, K., Lian, D., Dou, Z., and
+  and Guo, Y. Sub-moe: Efficient mixture-of-expert llms                  Huang, T. Memorag: Boosting long context processing
+  compression via subspace expert merging. In Proceed-                   with global memory-enhanced retrieval augmentation. In
+  ings of the AAAI Conference on Artificial Intelligence,                Proceedings of the ACM on Web Conference 2025, pp.
+  volume 40, pp. 22994–23002, 2026.                                      2366–2377, 2025.
+
+Li, W., Li, L., Gu, H., Huang, Y.-L., Lee, M. G., Sun, S.,             Shazeer, N. Fast transformer decoding: One write-head is
+  Xue, W., and Guo, Y. Moe-svd: Structured mixture-of-                   all you need. arXiv preprint arXiv:1911.02150, 2019.
+  experts llms compression via singular value decomposi-
+  tion. In International Conference on Machine Learning,               Tandon, A., Dalal, K., Li, X., Koceja, D., Rød, M.,
+  pp. 35209–35230. PMLR, 2025.                                           Buchanan, S., Wang, X., Leskovec, J., Koyejo, S.,
+                                                                         Hashimoto, T., et al. End-to-end test-time training for
+Li, Y., Huang, Y., Yang, B., Venkitesh, B., Locatelli, A., Ye,           long context. arXiv preprint arXiv:2512.23675, 2025.
+   H., Cai, T., Lewis, P., and Chen, D. Snapkv: Llm knows
+  what you are looking for before generation. Advances                 Tang, J., Zhao, Y., Zhu, K., Xiao, G., Kasikci, B., and Han,
+   in Neural Information Processing Systems, 37:22947–                   S. Quest: Query-aware sparsity for efficient long-context
+   22970, 2024.                                                          llm inference. arXiv preprint arXiv:2406.10774, 2024.
+
+                                                                  10
+                                IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+Team, K., Bai, Y., Bao, Y., Chen, G., Chen, J., Chen,                 Zhao, T. and Jones, L. Fast-weight product key memory.
+  N., Chen, R., Chen, Y., Chen, Y., Chen, Y., et al.                    arXiv preprint arXiv:2601.00671, 2026.
+  Kimi k2: Open agentic intelligence. arXiv preprint
+  arXiv:2507.20534, 2025.                                             Zhu, Q., Li, D., Li, L., Qin, X., Li, W., Gu, H., Xu, H., Han,
+                                                                        S., and Guo, Y. Outlier matters: Efficient long-to-short
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,             reasoning via outlier-guided model merging. In Proceed-
+  L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. At-                  ings of the AAAI Conference on Artificial Intelligence,
+  tention is all you need. Advances in neural information               volume 40, pp. 35213–35221, 2026.
+  processing systems, 30, 2017.
+
+Veeraboina, H.    Aime problem set 1983-
+  2024, 2023.   URL https://www.kaggle.
+  com/datasets/hemishveeraboina/
+  aime-problem-set-1983-2024.
+
+Wang, J., Chen, T., Cheng, P., Hou, X., and Liu, J. Adar-
+ eason: Progressive training of multi-lora adapters for
+ budget-adaptive language reasoning models. In Proceed-
+ ings of the AAAI Conference on Artificial Intelligence,
+ volume 40, pp. 26242–26250, 2026.
+
+Wang, Y., Ji, S., Liu, Y., Xu, Y., Xu, Y., Zhu, Q., and
+ Che, W. Lookahead q-cache: Achieving more consis-
+ tent kv cache eviction via pseudo query. arXiv preprint
+ arXiv:2505.20334, 2025.
+
+Xiao, C., Zhang, P., Han, X., Xiao, G., Lin, Y., Zhang, Z.,
+  Liu, Z., and Sun, M. Infllm: Training-free long-context
+  extrapolation for llms with an efficient context memory.
+  Advances in Neural Information Processing Systems, 37:
+  119638–119661, 2024.
+
+Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Ef-
+  ficient streaming language models with attention sinks.
+  arXiv preprint arXiv:2309.17453, 2023.
+
+Xu, B., Gu, H., Li, L., Wang, H., Liu, B., Liu, J., Zhu, Q.,
+ Yang, X., Li, C., Han, S., et al. Bit-by-bit: Progressive qat
+  strategy with outlier channel splitting for stable low-bit
+  llms. arXiv preprint arXiv:2604.07888, 2026.
+
+Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng, B.,
+  Yu, B., Gao, C., Huang, C., Lv, C., et al. Qwen3 technical
+  report. arXiv preprint arXiv:2505.09388, 2025.
+
+Yuan, A., Wang, Z., Miao, R., Wang, D., Tian, Y., Wang,
+  Z., Peng, Y., Wu, Y., Yi, B., Liu, X., et al. Kvreviver:
+  Reversible kv cache compression with sketch-based token
+  reconstruction. arXiv preprint arXiv:2512.17917, 2025a.
+
+Yuan, J. et al. Native sparse attention: Hardware-aligned
+  and natively trainable sparse attention. arXiv preprint
+  arXiv:2502.11089, 2025b.
+
+Zhang, Z., Sheng, Y., Zhou, T., et al. H2 o: Heavy-hitter
+  oracle for efficient generative inference of large language
+  models. arXiv preprint arXiv:2306.14048, 2023.
+
+                                                                 11
+                                IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+A. Limitations and Future Work.
+Long chain-of-thought (CoT) reasoning has become a standard capability of modern language models. However, longer
+CoT also leads to substantially larger KV-cache memory consumption, which can become the dominant memory bottleneck
+during long-context inference. As a result, the focus of memory-efficient LLM research is gradually expanding from
+reducing model weights through parameter compression (Gu et al., 2025b; Li et al., 2025; 2026) and quantization (Xu et al.,
+2026; Gu et al., 2025a; 2026) toward reducing the KV-cache footprint. Although recent works have explored reducing
+reasoning length or adaptively controlling CoT generation (Chen et al., 2026; Wang et al., 2026; Zhu et al., 2026), our work
+focuses on a complementary direction: improving KV-cache efficiency while preserving the model’s ability to reason over
+long contexts.
+While effective, our design space remains far from fully explored. First, the training objectives and supervision signals
+used to learn token importance and memory updates may not be optimal. Alternative objectives could further improve
+robustness, particularly under extreme compression ratios where retaining a small number of critical tokens becomes
+especially challenging. Second, our training is conducted under limited token budgets and relatively modest-scale settings,
+and we have not yet fully evaluated large-scale training regimes or broader model families. Finally, our current method
+is trained as an add-on module while keeping the backbone model frozen. An important future direction is to endow
+backbone models with native eviction-and-memory capabilities through continual training, allowing efficient attention,
+eviction decisions, and memory writing/reading to be learned jointly in an end-to-end manner.
+
+B. Cross-layer Score Redundancy and Index Reuse
+B.1. Motivation: Cross-layer Redundancy
+Layer-level token scores can be noisy, and token scoring quality can vary substantially across layers, meaning that some
+layers produce score distributions that are weakly discriminative, close to uniform, and therefore make top-K selection
+unstable and sensitive to small perturbations. This motivates aggregating multiple layer-wise score signals to reduce variance.
+A complementary observation is that important token sets are often partially shared across nearby layers. Although different
+layers may assign different score magnitudes, the resulting top-K retained indices tend to have non-trivial overlap, especially
+among neighboring layers. This suggests that repeatedly computing an entirely independent token-importance signal for
+every layer may be unnecessary. Instead, one can exploit cross-layer redundancy either by soft score aggregation, which
+combines score vectors across layers, or by hard index reuse, which reuses selected indices or indexer scores within a short
+group of layers. In this appendix, we first use running mean as a diagnostic score-aggregation study, and then connect this
+observation to an IndexCache-style (Bai et al., 2026) score reuse strategy.
+
+B.2. Running Mean as Cross-layer Score Aggregation
+Baseline: single-layer token scoring. Given a chosen layer, together with an implicit head aggregation rule, the compressor
+keeps the K tokens with the largest scores in the layer-level vector sℓ ∈ RT , with ties broken deterministically. We refer to
+this as the single-source scoring baseline.
+
+Running Mean aggregation. Let sℓ ∈ RT denote a layer-level score vector, aggregated across heads within a layer by a
+fixed rule. The running mean computes an averaged score signal across layers:
+                                                        m
+                                                     1 X
+                                       s̄(naive)
+                                         m       =       sℓ ,        m = 1, . . . , Nlayer ,
+                                                     m
+                                                       ℓ=1
+                                                                                                    (naive)
+where Nlayer denotes the number of transformer layers in the backbone. In practice, we use s̄Nlayer to perform top-K
+selection. Intuitively, averaging reduces variance when some layers provide noisy estimates, and it is especially meaningful
+when important token sets are partially shared across nearby layers.
+
+Why naive averaging can fail on spiky-dependency tasks. Averaging is not always beneficial. When a task requires
+preserving a small set of highly critical tokens, a few layers may produce sharply peaked and accurate score distributions,
+while others remain diffuse. Naively averaging mixes diffuse, low-quality signals into the peaked signal, reducing the relative
+margin between truly important tokens and the rest. This degradation is most visible when some layers have not yet formed
+a confident preference over tokens.
+
+                                                                12
+                                    IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+Key diagnostic: entropy of the score-induced distribution. We use entropy as a proxy for how confident or selective a
+layer/head is. High entropy indicates a near-uniform distribution, i.e., weak discrimination, whereas low entropy indicates a
+more concentrated distribution, i.e., strong preference over a subset of tokens. Given a probability distribution p ∈ ∆T −1 ,
+we use normalized entropy
+                                                               T
+                                                         1 X
+                                             H(p) = −             pt log(pt + ϵ),
+                                                       log T t=1
+so that H(p) ∈ [0, 1].
+
+From scores to a probability distribution. Let s ∈ RT denote the token scores for a fixed layer/head. To compute
+entropy, we map s to p ∈ ∆T −1 .
+
+Softmax;
+                                                     exp(st /τ )
+                                              pt = PT                     (t = 1, . . . , T ),
+                                                    j=1 exp(sj /τ )
+softmax with temperature τ > 0. We implement the standard stabilization exp(st /τ − maxj sj /τ ), which leaves p
+unchanged while improving numerical stability.1
+                                                                           P
+L1 normalization with conditional min-shift; negonly. When using pt = s̃t / j s̃j , we must ensure non-negativity.
+We apply a conditional min-shift:
+                                  (
+                                   st − minj sj , if minj sj < 0,           s̃t
+                           s̃t =                                  pt = PT             .
+                                   st ,           otherwise,              j=1 s̃j + ϵ
+
+This “only-if-negative” shift preserves the score geometry when s is already non-negative, whereas an unconditional shift
+would alter p even when not required.
+
+Entropy-gated Running Mean: skipping high-entropy sources. We now describe the main refinement. High entropy
+typically means the scorer has not formed a reliable preference over tokens yet, i.e., the score distribution is too flat to be
+predictive. Averaging such high-entropy scores into the running mean can contaminate the aggregated signal, making it less
+discriminative. Hence, we skip layers/heads whose entropy is above a threshold.
+Let Hℓ be the normalized entropy computed from layer ℓ, or from a chosen head statistic. Given a threshold γ ∈ [0, 1],
+define an inclusion indicator
+                                                αℓ = I [Hℓ ≤ γ] .
+Then the entropy-gated mean is
+                                                            PNlayer
+                                                                     αℓ sℓ
+                                            s̄(skip-high) = PNℓ=1
+                                                               layer
+                                                                           ,
+                                                             ℓ=1 αℓ + δ
+where δ > 0 avoids division by zero when all layers are skipped. This is a variance-reduction strategy with a quality
+filter: we average only among layers that appear selective, i.e., low entropy, and avoid layers whose scores are likely
+under-confident.
+
+Additional variants. We additionally considered: (i) skip-high vs. skip-low, which filters under-confident vs. highly
+selective sources, and (ii) entropy computed with softmax vs. negonly, which changes how scores are normalized
+into probabilities. Their results are included in Table 2.
+
+Experimental summary. We evaluate Expected Attention (EA) and running-mean variants on RULER. We report the
+overall average score, computed as the mean over tasks, under compression ratios CR ∈ {0.25, 0.50, 0.75, 0.90}. Table 2
+shows that entropy-gated running mean with skip-high, computed via softmax, consistently improves over the naive
+layer-mean running mean, and is often competitive with or better than EA across moderate compression ratios. Interestingly,
+the best-performing variant can change at very high compression, CR = 0.90, suggesting a different failure mode when the
+retained context becomes extremely sparse. Overall, these results support the view that cross-layer score signals contain
+reusable information.
+   1
+       Softmax stabilization by subtracting the maximum is a standard numerical technique.
+
+                                                                   13
+                                  IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+Table 2. Overall average score, computed as the mean over tasks, for Expected Attention (EA) and running-mean variants under different
+compression ratios (CR). Higher is better.
+
+                Method                                                   CR=0.25     CR=0.50     CR=0.75     CR=0.90
+                EA (expected attention)                                      89.19      76.53       54.53       27.78
+                Layer-mean RM (layer mean)                                   81.43      74.00       51.98       31.93
+                RM + entropy skip-high (ent skip high)                       89.71      79.08       57.76       32.93
+                RM + entropy skip-low (ent skip low)                         82.32      73.38       54.07       33.13
+                RM + peak gate (peak gate)                                   82.44      74.94       54.66       32.36
+                RM + peak gate, keep-high (peak gate keephigh)               83.27      74.84       52.79       31.02
+
+
+
+
+Table 3. RULER results on Mistral-7B with IndexCache-style score reuse. Columns indicate context length and compression ratio. Higher
+is better. IndexMem here uses the updated training recipe of Section 4 together with IndexCache-style score reuse.
+
+              Method                             4K-25%      4K-50%     4K-90%       16K-25%     16K-50%      16K-90%
+              IndexMem + IndexCache (ours)           92.4        90.0       76.1         82.5         79.3         66.8
+              AdaKV                                  72.8        56.7       22.8         68.6         52.1         23.8
+              SnapKV                                 57.6        41.3       19.8         49.5         36.5         21.3
+              TOVA                                   78.4        75.5       29.2         73.8         70.1         47.7
+
+
+
+
+B.3. From Running Mean to IndexCache
+Running mean exploits cross-layer redundancy by averaging score values. However, when the top-K token sets are already
+similar across neighboring layers, a simpler implementation is to reuse the score or index decision itself. This leads to an
+IndexCache-style strategy: instead of recomputing indexer scores independently for every layer, we compute the indexer
+scores once within a short group of neighboring layers and reuse the resulting scores or selected indices for the remaining
+layers in the group. In our implementation, we reuse indexer scores across every four consecutive layers.
+This reuse strategy does not change the core token-selection objective of IndexMem. It only amortizes the overhead of score
+computation by exploiting the empirical redundancy of important token sets across nearby layers. Thus, running mean can
+be viewed as a soft aggregation diagnostic, while IndexCache-style reuse is a lightweight practical realization of the same
+cross-layer redundancy.
+Table 3 reports RULER results on Mistral-7B with the IndexCache-style variant. These numbers are obtained with the
+updated training recipe described in Section 4 (WSD learning-rate schedule) combined with IndexCache-style score reuse,
+and therefore should not be directly compared to the Mistral-7B IndexMem entries in Table 1, which use a constant
+learning-rate schedule without IndexCache-style score reuse. The variant maintains strong accuracy under both 4K and
+16K RULER settings, and compares favorably against AdaKV (Feng et al., 2026), SnapKV, and TOVA under matched
+compression ratios.
+
+B.4. Takeaway and Scope
+The running-mean study is intended as an analysis of cross-layer score aggregation, rather than as the final IndexMem
+inference algorithm. Its main role is to show that layer-wise token-importance signals can contain reusable information:
+aggregating selective layers can stabilize token selection, while high-entropy layers may introduce noise. IndexCache-style
+reuse exploits the same property in a simpler and more practical way by reusing indexer scores or selected indices across
+nearby layers.
+This observation also has limitations. Entropy is only a proxy for score reliability: low entropy does not guarantee
+correctness, and high entropy does not necessarily imply uselessness. The threshold γ can be task- and model-dependent,
+and skipping too many layers may reduce the benefit of aggregation. Therefore, we treat running mean as a diagnostic
+aggregation study, while using IndexCache-style reuse as a lightweight practical variant for reducing indexer overhead
+without changing the core token-selection objective.
+
+                                                                 14
+                                 IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+                          Table 4. Taxonomy of baselines considered in the main paper and this appendix.
+
+          Category                     Examples                        Compression axis          Role in this paper
+          Learnable token eviction / Locret, AdaKV                     Sequence / token       Additional learned base-
+          retention                                                                           lines
+          Representation-level KV xKV                                  Per-token KV represen- Complementary com-
+          compression                                                  tation                 parison
+          Heuristic token eviction   SnapKV, PyramidKV, TOVA,          Sequence / token       Main reference base-
+                                     EA                                                       lines
+          Ours                         IndexMem                        Token eviction + latent Proposed method
+                                                                       memory
+
+
+Table 5. Per-task LongBench scores at 75% compression for IndexMem, xKV, and Locret. Avg. (shown) is the mean over the seven
+reported tasks and is not comparable to the all-task average in Table 6.
+
+ Method              wikiqa hotpotqa triviaqa passage retrieval en multifieldqa en multi news multifieldqa zh Avg. (shown)
+ IndexMem (ours)      50.97    68.67    91.00                 40.00            59.80        25.40             56.58      56.06
+ xKV                  46.21    55.81    90.00                  1.00            32.61        25.04             46.13      42.40
+ Locret               10.10    13.20    59.55                 85.07            16.94        19.13             16.51      31.50
+
+
+
+C. More Results
+We provide additional experimental results that complement the main paper. These include a taxonomy of the additional
+baselines we compare against, per-task LongBench results at high compression with learnable and representation-level
+baselines, and aggregate LongBench results across compression ratios.
+
+C.1. Additional Baselines and Comparison Axes
+The baselines used in the main paper and in this appendix fall into three groups along different compression axes. Table 4
+summarizes this taxonomy and clarifies the role each baseline plays in our evaluation. In particular, low-rank / representation-
+level methods such as xKV operate on a different compression axis from token eviction and are therefore complementary,
+rather than directly competing, with our approach.
+
+C.2. Per-task LongBench Results at 75% Compression
+We further compare IndexMem against a representation-level baseline (xKV) and a learnable retention baseline
+(Locret (Huang et al., 2024)) on seven representative LongBench tasks at 75% compression. Table 5 reports per-task
+scores; the last column reports the average over the seven reported tasks and should not be confused with the all-task
+LongBench average in Appendix C.3.
+We highlight four observations. First, xKV reduces the per-token representation cost and is methodologically complementary
+to token selection; the comparison shows that IndexMem can match or exceed it on most information-dense tasks while
+operating on a different compression axis. Second, Locret is a learnable retention baseline that targets a similar problem
+to ours but tends to be brittle on multi-evidence reasoning tasks at high compression. Third, IndexMem is consistently
+stronger on information-dense QA and multi-evidence tasks, including wikiqa, hotpotqa, triviaqa, multifieldqa en, and
+multifieldqa zh. Finally, Locret is noticeably stronger on passage retrieval en, suggesting that retrieval-style tasks with
+a single localized answer span may favor different retention mechanisms; we therefore do not interpret these numbers as
+uniform dominance across all task types.
+
+C.3. Average LongBench Results across Compression Ratios
+The main paper reports score–compression curves on a representative subset of LongBench tasks (Figure 4). This aggregate
+view shows that the advantage of IndexMem is not limited to the representative tasks visualized in the main paper.
+IndexMem achieves the strongest average score at every reported compression ratio. Combined with the task-level curves in
+the main paper, this confirms that the advantage of IndexMem is not confined to a small set of selected LongBench tasks.
+
+                                                               15
+                                IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+                  Table 6. Average LongBench score (over all tasks) across compression ratios. Higher is better.
+
+                                 Method                 10%      25%           50%   75%     90%
+                                 IndexMem (ours)       53.48    53.18      55.26     42.18   36.51
+                                 Expected Attention    43.78    43.88      42.09     36.33   28.60
+                                 PyramidKV             43.63    41.57      42.35     39.17   29.68
+                                 SnapKV                43.55    43.37      41.44     39.22   29.40
+                                 TOVA                  43.81    43.08      42.10     39.05   32.56
+
+
+D. Notation
+We summarize the key dimensions and tensor shapes used throughout the paper. Let T denote the sequence length (or L
+when focusing on the cached context), and B denote the batch size. The Transformer hidden size is dmodel , and the number
+of attention heads is H. The per-head dimension is
+
+                                                                    dmodel
+                                                       dhead =             .                                           (9)
+                                                                     H
+For grouped-query / multi-query attention, we denote the number of key/value heads by Hkv (with Hkv ≤ H); thus cached
+keys/values have shape
+                                                K, V ∈ RB×Hkv ×L×dhead .                                          (10)
+In the main text, token hidden states are denoted by X ∈ RL×dmodel , while (pre-RoPE) query states used by the indexer are
+denoted by
+                                                     Q ∈ RH×L×dhead .                                                 (11)
+The indexer employs Hindex lightweight heads with per-head feature dimension dindex (typically Hindex ≪ H and dindex ≪
+dhead ), and outputs a dense query-to-key score matrix
+
+                                                A = Indexer(X, Q) ∈ RL×L .                                           (12)
+
+Our latent memory module operates in the model space and maintains a fixed-size fast-weight state
+
+                                              M ∈ Rdmem ×dmodel ,        b ∈ Rdmem ,                                 (13)
+
+where dmem is the memory-state dimension. Given a query vector q ∈ Rdmodel , the memory feature map ϕ(q) √
+                                                                                                         = Linearθ (q) ∈
+Rdmem is used for reading/writing the memory. Unless stated otherwise, all attention softmax scalings use dmodel .
+
+E. PyTorch like pseudo code.
+
+
+
+
+                                                               16
+                           IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+
+
+
+Algorithm PyTorch-like Indexer and Memory module
+# Inputs:
+# X: [L, d_model] hidden states
+# Q: [H, L, d_head] pre-RoPE query states
+# Mask: [L, L] causal mask (added to logits)
+# Q_set: query indices for aggregation (prefill: all; decode: window)
+# cache: k_cache grows during decoding
+def indexer(X, Q, Mask=None, Q_set=None, use_cache=False):
+   # down-project multi-head queries and normalize
+   q = U q(flatten(Q, dims=(0,1))) # [L, H_index *d_index]
+   q = q.view(L, H_index, d_index)
+   q = norm(q) # QK-Norm
+
+   # shared key for all heads (MQA-style)
+   k = U k(X) # [L, d_index]
+   k = norm(k)
+
+   # optional cache reuse in decoding
+   if use_cache:
+      k_cache = cat(k_cache, k, dim=0)
+      K = k_cache
+   else:
+      K = k
+
+   # head gate from hidden state
+   alpha = G(X) / sqrt(H_index *d_index) # [L, H_index]
+
+   # gated similarity + causal mask
+   z = act(einsum("lhd,td->lth", q, K)) # [L, L, H_index]
+   A = sum h(alpha[:, h] *z[:, :, h]) # [L, L]
+   if Mask is not None:
+      A = A + Mask
+
+   # per-token importance via max aggregation
+   if Q_set is None: Q_set = range(L)
+   imp = max(A[Q_set, :], dim=0) # [L]
+   return A, imp
+
+# Latent memory (shared across heads)
+# State: M [d_mem, d_model], b [d_mem]
+def mem read(q):
+   phi_q = Linear theta(q) # [d_mem]
+   denom = (phi_q**2 @ b) + eps
+   return (phi_q.T @ M) / denom # [d_model]
+
+def mem write(evicted_k, evicted_v):
+   # evicted_v is summed across heads per token
+   phi_k = Linear theta(evicted_k) # [N, d_mem]
+   M = lambda *M + eta *sum(outer(phi_k[i], evicted_v[i]) for i in range(N))
+   b = lambda *b + eta *sum(phi_k[i]**2 for i in range(N))
+
+# Residual compensation
+o = attn(q, KV_kept) + g(q) *mem read(q)
+
+
+
+
+                                                    17
+                             IndexMem: Learned KV-Cache Eviction with Latent Memory
+
+Algorithm Streaming KL Distillation Loss for Indexer Training
+# Inputs:
+# Q_t, K_t: teacher query/key states, [L, d_head]
+# X: hidden states used by the indexer, [L, d_model]
+# sink_mask: bool mask on key axis, True for sink tokens, [L]
+# Q_set: query indices used for aggregation
+# Output:
+# loss: KL(softmax(max_q T) || softmax(max_q A))
+
+def streaming_indexer_kl_loss(
+   Q_t, K_t, X, indexer, sink_mask=None,
+   Q_set=None, q_blk=128, k_blk=4096, causal=True,
+):
+   L, device = K_t.shape[0], K_t.device
+   scale = 1.0 / sqrt(Q_t.shape[-1])
+
+   if Q_set is None: Q_set = arange(L, device=device)
+
+   teacher_imp = full((L,), -inf, device=device, dtype=float32)
+   student_imp = full((L,), -inf, device=device, dtype=float32)
+
+   for qb in range(0, len(Q_set), q_blk):
+      q_ids = Q_set[qb : qb + q_blk] # [Bq]
+
+       q_t = Q_t[q_ids].float() # [Bq, d_head]
+
+       q_i = indexer.query_features(X, q_ids) # indexer-specific shape
+
+       for kb in range(0, L, k_blk):
+          k_ids = arange(kb, min(kb + k_blk, L), device=device)
+
+           k_t = K_t[k_ids].float() # [Bk, d_head]
+
+           T_block = matmul(q_t, k_t.T) *scale # [Bq, Bk]
+
+           A_block = indexer.score_block(X=X, q_ids=q_ids, k_ids=k_ids, q_feat=q_i) # [Bq,
+               Bk]
+
+           if causal:
+              invalid = k_ids[None, :] > q_ids[:, None]
+              T_block = T_block.masked_fill(invalid, -inf)
+              A_block = A_block.masked_fill(invalid, -inf)
+
+           teacher_blk = T_block.max(dim=0).values # [Bk]
+           student_blk = A_block.max(dim=0).values # [Bk]
+
+           teacher_imp[k_ids] = maximum(teacher_imp[k_ids], teacher_blk)
+           student_imp[k_ids] = maximum(student_imp[k_ids], student_blk)
+
+   valid = ones((L,), dtype=bool, device=device)
+   if sink_mask is not None:
+      valid = valid & (˜sink_mask)
+
+   teacher_imp = teacher_imp[valid]
+   student_imp = student_imp[valid]
+
+   teacher_logp = log_softmax(teacher_imp, dim=-1)
+   student_logp = log_softmax(student_imp, dim=-1)
+
+   teacher_prob = teacher_logp.exp()
+   loss = kl_div(input=student_logp, target=teacher_prob, reduction="sum")
+
+   return loss
+
+
+
+                                                        18
+

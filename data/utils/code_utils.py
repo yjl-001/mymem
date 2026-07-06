@@ -19,6 +19,7 @@ def extract_python_code(text_string: str) -> List[str]:
         imports = re.findall(r"^(?:from\s+\S+\s+import\s+\S+|import\s+\S+.*)$", block, re.MULTILINE)
 
         funcs = re.findall(r"(def\s+\w+\(.*?:[\s\S]*?)(?=^def\s|\Z)", block.strip(), re.MULTILINE)
+        funcs = [_trim_to_function(f) for f in funcs]
 
         if imports:
             import_block = "\n".join(imports)
@@ -30,6 +31,24 @@ def extract_python_code(text_string: str) -> List[str]:
         results.extend(funcs)
 
     return results
+
+
+def _trim_to_function(code: str) -> str:
+    lines = code.split('\n')
+    if not lines:
+        return code
+    def_indent = len(lines[0]) - len(lines[0].lstrip())
+    last_body = 0
+    for i in range(1, len(lines)):
+        stripped = lines[i].lstrip()
+        if not stripped:
+            continue
+        indent = len(lines[i]) - len(stripped)
+        if indent > def_indent:
+            last_body = i
+        else:
+            break
+    return '\n'.join(lines[:last_body + 1])
 
 def rename_function(function: str, function_name: str) -> str:
     """
@@ -117,7 +136,7 @@ class PyExecutor:
         except Exception:
             return False
         
-    def check_code_report(self, completions: list[str], tests: list[str], timeout: int = 5) -> tuple[list[str], list[float]]:
+    def check_code_report(self, completions: list[str], tests: list[str], test_info: list, timeout: int = 5) -> tuple[list[str], list[float]]:
         def extract_failed_tests(text: str) -> str:
             match = re.search(r"Tests failed:\s*(.*)", text, re.DOTALL)
             return match.group(1).strip() if match else ""
@@ -129,13 +148,14 @@ class PyExecutor:
         reports = []
         avg_scores = [] 
 
-        for completion, test_code_str in zip(completions, tests):
+        for completion, test_code_str, tf in zip(completions, tests, test_info):
             func_blocks = extract_python_code(completion.strip())
             collected_answer = '\n'.join(func_blocks)
 
-            correct_function_name = extract_correct_function_name(test_code_str)
-            if correct_function_name != "":
-                collected_answer = rename_function(collected_answer, correct_function_name)
+            # correct_function_name = extract_correct_function_name(test_code_str)
+            # if correct_function_name != "":
+            #     collected_answer = rename_function(collected_answer, correct_function_name)
+            collected_answer = rename_function(collected_answer, tf[0]["function_name"])
 
             test_block = extract_python_code(test_code_str.strip())
             test_list = [test_block[0] + "\n\n" + block for block in test_block[1:]]
@@ -165,5 +185,72 @@ class PyExecutor:
             reports.append("\n".join(report_lines))
 
         return reports, avg_scores
+
+
+if __name__ == "__main__":
+    # ========== case 1: 两个函数中间夹了游离 assert ==========
+    text1 = '''\
+import math
+
+def add(a, b):
+    """Return sum."""
+    return a + b
+
+assert add(1, 2) == 3
+
+def multiply(a, b):
+    return a * b
+'''
+    funcs1 = extract_python_code(text1)
+    print("=== case 1: 函数间夹 assert ===")
+    for i, f in enumerate(funcs1):
+        print(f"--- func {i} ---\n{f}\n")
+
+    # ========== case 2: 多 return 语句 ==========
+    text2 = '''\
+def grade(score):
+    if score >= 90:
+        return "A"
+    elif score >= 80:
+        return "B"
+    else:
+        return "C"
+'''
+    funcs2 = extract_python_code(text2)
+    print("=== case 2: 多 return ===")
+    for i, f in enumerate(funcs2):
+        print(f"--- func {i} ---\n{f}\n")
+
+    # ========== case 3: 纯 import 无函数 ==========
+    text3 = "import math\nimport os\n"
+    funcs3 = extract_python_code(text3)
+    print("=== case 3: 纯 import ===")
+    for i, f in enumerate(funcs3):
+        print(f"--- func {i} ---\n{f}\n")
+
+    # ========== case 4: 代码块中包含 markdown 标记 ==========
+    text4 = '''\
+```python
+def foo(x):
+    return x + 1
+```
+'''
+    funcs4 = extract_python_code(text4)
+    print("=== case 4: markdown 包裹 ===")
+    for i, f in enumerate(funcs4):
+        print(f"--- func {i} ---\n{f}\n")
+
+    # ========== case 5: 函数后跟注释和空行 ==========
+    text5 = '''\
+def bar(x):
+    y = x * 2
+    return y
+
+# this is a comment
+'''
+    funcs5 = extract_python_code(text5)
+    print("=== case 5: 函数后跟注释 ===")
+    for i, f in enumerate(funcs5):
+        print(f"--- func {i} ---\n{f}\n")
 
         

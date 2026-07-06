@@ -81,5 +81,31 @@ class TensorHelper:
         seq_len = completion_ids.size(1)
         col_indices = torch.arange(seq_len, device=completion_ids.device)
         mask_to_replace = (col_indices > first_eos_indices.unsqueeze(1)) & is_eos_mask.any(dim=1).unsqueeze(1)
-        completion_ids[mask_to_replace] = eos_token_id
+        completion_ids[mask_to_replace] = self.config.pad_token_id
+        return completion_ids
+
+    def erase_from_first_token_sequence(
+        self,
+        completion_ids: torch.Tensor,
+        stop_token_ids: List[int],
+        fill_token_id: int,
+    ) -> torch.Tensor:
+        if len(stop_token_ids) == 0:
+            return completion_ids
+
+        seq_len = completion_ids.size(1)
+        stop_len = len(stop_token_ids)
+        if stop_len > seq_len:
+            return completion_ids
+
+        stop = torch.tensor(stop_token_ids, dtype=completion_ids.dtype, device=completion_ids.device)
+        match_mask = torch.zeros(completion_ids.size(0), seq_len, dtype=torch.bool, device=completion_ids.device)
+        for start in range(seq_len - stop_len + 1):
+            match_mask[:, start] = (completion_ids[:, start : start + stop_len] == stop).all(dim=1)
+
+        has_match = match_mask.any(dim=1)
+        first_match_indices = torch.argmax(match_mask.int(), dim=1)
+        col_indices = torch.arange(seq_len, device=completion_ids.device)
+        mask_to_replace = (col_indices >= first_match_indices.unsqueeze(1)) & has_match.unsqueeze(1)
+        completion_ids[mask_to_replace] = fill_token_id
         return completion_ids

@@ -1,0 +1,1690 @@
+                                            Memory Inception: Latent-Space KV Cache
+                                                Manipulation for Steering LLMs
+
+
+                                                    Andy Zeyi Liu∗              Michael Zhang                  Ilana Greenberg
+                                                    Yale University            Princeton University              Yale University
+
+                                                      Adam Alnasser                  Lucas Baker                 John Sous∗
+arXiv:2605.06225v2 [cs.LG] 9 May 2026
+
+
+
+
+                                                       Jump Trading                  Jump Trading               Yale University
+
+
+
+                                                                                     Abstract
+                                                    Steering large language models (LLMs) is usually done by either instruction
+                                                    prompting or activation steering. Prompting often gives strong control,
+                                                    but caches guidance tokens at every layer and can clutter long interactions;
+                                                    activation steering is compact but typically weaker and does not support
+                                                    large structured reminders. We introduce memory inception (MI), a training-
+                                                    free method that steers in latent attention space by inserting text-derived key-
+                                                    value (KV) banks only at selected layers. Rather than materializing reminder
+                                                    content throughout the prompt cache, MI treats steering as selective KV
+                                                    allocation, injecting latent slots only where the model routes to them.
+                                                    On matched personality-steering tasks, MI gives the best overall control–
+                                                    drift trade-off, remaining competitive with prompting while consistently
+                                                    outperforming CAA. On updateable guidance, MI supports mid-conversation
+                                                    behavior shifts without rewriting the visible transcript, achieving the highest
+                                                    post-shift alignment on Qwen3. On structured reasoning, MI outperforms
+                                                    visible prompting on HARDMath and PHYSICS (10/12 subject×mode
+                                                    cells), serving as proxies for structured reasoning in verifiable domains, while
+                                                    cutting content-matched KV storage by up to 118×. These results position
+                                                    MI as a powerful steering method when guidance is persistent, structured,
+                                                    or expensive to keep in the visible transcript.
+
+
+                                        1     Introduction
+                                        Language models often need persistent guidance rather than one-shot instructions. A user
+                                        may want an assistant to maintain a personality trait across a questionnaire, preserve a tone
+                                        across a multi-turn dialogue, keep a long-context fact active while answering later questions,
+                                        or apply a compact checklist of reasoning heuristics to a domain benchmark. The standard
+                                        solution is prompting, where reminder tokens are inserted into visible context and cached
+                                        at every layer. A second family, activation steering, changes hidden states directly through
+                                        learned or contrastive residual directions. These two interfaces make opposite trade-offs:
+                                        prompting exposes the reminder text and stores it everywhere, while activation steering is
+                                        compact but not naturally text-faithful or easily updateable.
+                                        We study a third interface: latent attention state. We introduce memory inception (MI),
+                                        illustrated in Figure 1, a training-free method that encodes a descriptor, summary, retrieved
+                                        fact, or task heuristic into a bank of latent key-value slots, and lets only selected attention
+                                        layers/heads attend over those slots alongside the ordinary prompt tokens. The reminder
+                                            ∗ Correspondence to: andy.liu@yale.edu and john.sous@yale.edu.
+
+
+
+
+                                        Preprint.
+Figure 1: Memory inception (MI). Concise and compact reminder text is encoded into
+latent KV memory-bank slots and appended only at automatically chosen layers, heads,
+or KV groups during decoding. Unlike prompt steering, the reminder stays outside the
+visible transcript at inference time and need not be stored at every layer; unlike CAA-style
+activation steering, the intervention acts through query-dependent attention over latent
+reminder slots rather than a global residual-vector offset.
+
+
+is therefore available where attention reads it, rather than being repeatedly materialized
+as visible text or injected as a query-independent residual offset. Prompt steering stores
+guidance-derived KV states at every layer, even when only a small subset of layers drives
+control; MI instead treats guidance as a selective KV-allocation problem: identify the layers
+and attention units where the reminder matters, then insert latent slots only there. The
+layer-wise KV footprint shrinks from all L layers to Lctrl controlled layers.
+Conceptually, prompting and activation steering sit at opposite ends of two design axes:
+visible vs. latent control content, and global vs. selective intervention. MI is in the middle
+ground, text-conditioned but hidden from the visible transcript, and localized to the attention
+sites that route to it. For implicit signals such as personality, tone, or reasoning heuristics,
+the question becomes not whether the reminder can be cached everywhere, but where it
+actually needs to live.
+We evaluate MI in three regimes. First, on matched personality-steering tasks where
+prompting, CAA, and MI receive the same control signal, we test whether latent KV steering
+improves the control–drift trade-off. Second, on mid-dialogue behavior shift, we test whether
+guidance can stay active or be updated without rewriting the visible transcript. Third, on
+HARDMath [Fan et al., 2025] and PHYSICS [Feng et al., 2025], we test whether the same
+mechanism carries reusable reasoning-heuristic banks rather than short style descriptors.
+
+Contributions:
+• Steering interface. We introduce memory inception or MI, a training-free method that
+  injects text-conditioned latent KV banks only at selected layers rather than materializing
+  reminder text throughout the full prompt cache.
+• Interpretation and implementation. We formulate the method as bank-level attention
+  routing over prompt, target, reference, and auxiliary memories, and we give a canonical-
+  key RoPE implementation that supports dense attention, grouped-query attention, and
+  Qwen3-style MoE models.
+• Empirical positioning. On personality-steering tasks, MI remains competitive with
+  prompting while consistently outperforming CAA on control–drift trade-offs. In reasoning
+
+
+                                               2
+  domains, MI acts as a training-free alternative to fine-tuning, improving PHYSICS on
+  average and consistently outperforming the plain model on HARDMath.
+• Operating systems value. Memory banks are most useful when guidance is persistent
+  or structured, enabling reduction in KV storage by a factor of 6–118×.
+
+2     Related Work
+We keep the main-text discussion focused on the methods most directly comparable to MI
+and in Appendix A we list additional related works.
+Prompting and latent prompts. Prompting remains the default inference-time interface
+for steering language models, from in-context instructions to chain-of-thought scaffolds
+[Brown et al., 2020, Wei et al., 2022, Kojima et al., 2022]. A closely related family of
+methods learns continuous prefixes or soft prompts that are injected into the model without
+changing base weights [Li and Liang, 2021, Lester et al., 2021]. MI shares the same goal
+of inference-time control, but differs in two ways: it is training-free, and it constructs the
+steering state directly from user-provided text or task heuristics at inference time rather
+than from optimized prompt parameters.
+Activation, attention, and cache steering. Activation Addition and CAA steer models by
+adding residual directions derived from prompt pairs or positive/negative examples [Turner
+et al., 2024, Rimsky et al., 2024]. Representation-engineering and function-vector work
+likewise shows that reusable latent directions can capture high-level behaviors or in-context
+functions [Zou et al., 2023, Todd et al., 2024]. More recent attention-level methods, such as
+AutoPASTA and Spotlight, steer by reallocating attention toward instruction tokens [Zhang
+et al., 2024, Venkateswaran and Contractor, 2026], and KV Cache Steering manipulates
+cached prompt representations to induce reasoning behavior [Belitsky et al., 2025]. MI differs
+from these lines by appending new text-derived KV content at selected sites, so the model
+can attend to reusable blocks of guidance instead of compressing them into a single residual
+direction or a bias over visible prompt tokens.
+
+3     Memory Inception: Formalism & Implementation
+Overview. Memory inception (MI) is a training-free steering interface that encodes
+reminder content into latent KV banks and attaches those banks only at a small set of
+selected layers and attention sites, where the model can attend to them alongside ordinary
+prompt tokens. Figure 1 illustrates the pipeline; the following subsections formalize the
+intervention, bank construction, and KV-cache budget in turn.
+
+3.1    Memory Inception in Latent Attention Space
+We begin with the intervention interface itself: what a selected attention site sees, where the
+additional banks are attached, and how routing changes when more than one memory bank
+is present.
+
+Attention. Consider one attention site in a decoder-only transformer [Vaswani et al., 2017].
+At generation step t, let the live query be qt ∈ Rdh , where dh is the head dimension, and let
+the prompt/history keys and values be K≤t      x
+                                                 = [k1x , . . . , ktx ]⊤ ,    V≤tx
+                                                                                   = [v1x , . . . , vtx ]⊤ . The
+standard attention output is
+                                                                     x ⊤
+                                                                           !
+                                    x    x
+                                                              qt K≤t          x
+                        Attn(qt , K≤t , V≤t ) = softmax           √          V≤t .                            (1)
+                                                                    dh
+MI keeps this query-dependent attention computation, but expands the candidate context at
+selected sites beyond visible prompt/history tokens.
+
+KV Cache Memory Bank. A memory bank is a small collection of latent KV slots.
+Bank b contains Mb slots,
+                                                     (b)         (b)                    (b)        (b)
+                 (b) (b) Mb
+      B (b) = {(km  , vm )}m=1 ,          K (b) = [k1 , . . . , kMb ]⊤ ,     V (b) = [v1 , . . . , vMb ]⊤ .
+
+
+                                                       3
+At a selected site, MI conceptually augments the prompt cache with these slots:
+
+            Kt⋆ = concat(K≤t
+                          x
+                             , K (1) , . . . , K (B) ),               Vt⋆ = concat(V≤t
+                                                                                    x
+                                                                                       , V (1) , . . . , V (B) ).         (2)
+
+The resulting selected-site output is o⋆t = Attn(qt , Kt⋆ , Vt⋆ ). This augmented-cache view
+is the reference formulation used throughout the paper. In implementation, the ordinary
+prompt cache remains intact and the reminder bank is consumed as a side bank only at
+selected layers and units; Appendix B.1 gives the backend-specific Qwen3 details. This
+implements selectivity as a key design choice, as reminder slots are exposed only at layers
+where the controller predicts they will be useful.
+
+Automated Layer and Head Selection. This selectivity is handled by an automatic
+calibration-time selector. Given candidate layers Lcand and candidate attention units Uℓ
+within each layer, the selector first scores units by how strongly their queries align with the
+target bank relative to a reference bank,
+                                                        ⊤ +             ⊤ −
+                                                       qℓ,u k          qℓ,u k
+                                    aℓ,u = max            √ ℓ,u,j − max √ ℓ,u,j .                                         (3)
+                                                  j         dh       j      dh
+It then keeps the top k units per layer, aggregates those scores to rank layers, and keeps the
+top m layers. The output is a frozen selector artifact specifying selected layers, selected units,
+and layer-wise gains ρℓ . Intuitively, MI first decides where reminder access should be available,
+and only then modifies those sites so that their queries can route more strongly toward the
+memory bank. The selectable unit depends on architecture: for Meta-Llama-3.1-8B-Instruct
+it is an attention head, while for Qwen3-30B-A3B it is a grouped-query KV group that
+is expanded to its associated query heads at patch time. Appendix C gives the detailed
+dense-head and grouped-query/KV-group selector algorithms.
+
+Bank-level mixture. When only one reminder bank is present, the selected site simply
+chooses between prompt/history tokens and that bank. The full bank-level mixture view is
+most useful when several banks provide different information. Let b = 0 denote the prompt
+bank and b = 1, . . . , B denote memory banks. Define slot scores
+                                 (b)                                 (b)
+                 (b)       ⟨qt , km ⟩             (b)    exp(st,m )                     (b)
+                                                                                                  X           (b)
+                                                                                                               (b)
+                st,m =       √        ,          αt,m = P        (b)
+                                                                       ,               ot     =          αt,m vm   .
+                                 dh                       r exp(st,r )                             m
+                  P                         
+      (b)           b  M               (b)            (b)                                                           (b)
+Let βet = log     m=1 exp(st,m ) + ct  be the evidence for bank b, where ct collects any
+bank-level gain or prior term. Then the selected-site output can be written as
+                                 B
+                                          (b) (b)                                (0)              (B)
+                                 X
+                         o⋆t =         π
+                                       et ot ,              π
+                                                            et = softmax([βet , . . . , βet             ]).               (4)
+                                 b=0
+
+We use the size-normalized evidence score
+                                                                       Mb
+                                                                                     !
+                         (b)   (b)                                  1 X         (b)      (b)
+                        βt = βet − log Mb = log                            exp(st,m ) + ct ,                              (5)
+                                                                    Mb m=1
+
+so that a larger bank does not win routing weight merely because it contains more slots.
+Thus, prompt, target, reference, and auxiliary banks compete through query-dependent
+bank evidence rather than through a global residual offset. Section 3.2 instantiates these
+bank-level terms for text-derived target, reference, and auxiliary memories.
+
+3.2   Constructing Memory Banks
+
+Section 3.1 treated memory banks as abstract latent objects. We now describe how reminder
+text is converted into reusable KV slots.
+
+
+                                                                4
+Text-Derived Memory Banks. Banks can be built from persona descriptors, dialogue
+summaries, retrieved facts, safety notes, or task heuristics. We use a shared recipe for all
+text-derived banks. First, the source text is placed inside one or more templates, such as a
+direct descriptor, an internal-principles wrapper, or a hidden-steering-note wrapper. Second,
+we run the wrapped text through the frozen base model and record hidden states at each
+token position. Third, we keep only the positions aligned to the descriptor content, unless
+an experiment explicitly keeps the full wrapped text. Finally, for each selected layer ℓ and
+selected key-value unit u, the kept hidden states are normalized and projected through the
+model’s own key and value projections:
+                 (b)        (ℓ)          (b)          (b)         (ℓ)         (b)
+                kℓ,u,m = WK,u Normℓ (hℓ,m ),        vℓ,u,m = WV,u Normℓ (hℓ,m ).           (6)
+In our current implementation, each bank concatenates token-level slots from the original
+descriptor with slots from contextualized variants of the same descriptor.
+
+Canonical Pre-RoPE Key Storage. Llama-style and Qwen3-style decoders use rotary
+position embeddings [Su et al., 2021, Grattafiori et al., 2024]. Let Rt be the rotary operator
+at query position t, so that qt = Rt q̄t and prompt keys have the form kjx = Rj k̄jx . A memory
+key stored with an arbitrary absolute rotation would be tied to the position at which the bank
+was constructed. We avoid this by storing memory keys in canonical pre-RoPE coordinates.
+For a canonical key k̃m and optional relative phase δm , the memory score is
+                                  ⟨Rt−1 qt , Rδm k̃m ⟩   ⟨q̄t , Rδm k̃m ⟩
+                         smem
+                          t,m =          √             =        √         .                (7)
+                                            dh                    dh
+The default setting is δm = 0, making the bank position-independent. For grouped-query
+attention, banks are stored per KV head and expanded to the query heads that share that
+KV group.
+
+Target, Reference, and Auxiliary Banks. Many steering tasks benefit from multiple
+banks with different roles. We use target banks for desired behavior, optional reference banks
+for opposite or undesirable behavior, and auxiliary banks for additional facts or heuristics.
+In the contrastive setting, we first measure the target-reference evidence gap
+                                               !                      !
+                                   1 X s+                 1  X −
+                                                                  s
+                      ∆t = log            e t,m − log            e t,n .                    (8)
+                                  M+ m                   M− n
+
+We then convert that gap into bank-level gains through query-adaptive gates gt± = σ(±γ∆t )
+and define
+                                                         
+                                              1  X x
+                                  βtx = log        est,j  ,
+                                              Tt j
+                               !                                      !               (9)
+                   1  X +                                    1 X −
+       βt+ = log          est,m + ρℓ λ+ gt+ , βt− = log          est,n − ρℓ λ− gt− .
+                  M+ m                                     M− n
+Here ρℓ is the layer-wise gain from the selector, while λ+ and λ− are the positive and
+negative bank gains. Auxiliary banks use the same bank-evidence interface with their own
+nonnegative gains. Bank-specific bias enters through the bank evidence terms in Eq. (9), so
+we do not require a separate free-form logit-bias term in the main formulation.
+
+3.3   KV Cache
+With bank construction and placement fixed, the main systems difference between MI and
+visible prompting is how much guidance-derived state must be carried across layers. For
+visible prompt guidance with Tprompt tokens in an L-layer decoder, the guidance contributes
+proportional KV-cache storage LTprompt . A memory bank with Sbank slots inserted at only
+Lctrl controlled layers contributes proportional storage Lctrl Sbank . The idealized storage
+ratio is therefore
+                                               LTprompt
+                                   KV ratio =             .                              (10)
+                                              Lctrl Sbank
+
+                                                5
+For Qwen3-30B-A3B with L = 48 and Lctrl = 5, the equal-token/slot case gives 48/5 = 9.6.
+If target, reference, template variants, or auxiliary banks create more latent slots than the
+prompt baseline uses visible tokens, Eq. (10) should be reported with the actual slot count.
+This accounting is why MI is most useful when guidance is persistent or structured: the
+reminder no longer needs to occupy the full prompt cache at every layer, even though it
+remains available to the selected sites that use it.
+
+4   Experimental Design
+Models and Baselines. We evaluate Meta-Llama-3.1-8B-Instruct [Meta, 2024] and Qwen3-
+30B-A3B Qwen Team [2025]. Across tasks, we use a consistent comparison set, consisting
+of the plain model, a prompt baseline that places the same guidance in visible context,
+CAA-style activation steering, and MI. The only model-specific difference is whether the
+selector chooses dense attention heads or grouped-query KV groups. For Qwen3, selector
+artifacts may therefore specify layer-specific KV groups rather than a single global head
+set. For high-throughput Qwen3 evaluation, we use vLLM [Kwon et al., 2023] for batched
+deterministic generation. Plain and prompt baselines run through the standard vLLM
+path, while intervention runs load method-specific artifacts. Appendix B.1 describes how
+memory-bank steering is implemented as a selected-layer side-bank attention path rather
+than a direct mutation of the native paged KV cache.
+
+Tasks and metrics.      The main evaluation covers four main settings.
+• Big Five self-evaluation. Uses public-domain IPIP-50-style items [Goldberg et al.,
+  2006]; the steered model answers each item with a single Likert digit. We report target
+  shift ∆target relative to the plain model and mean absolute non-target drift Dnon-target ,
+  summarized by the drift-adjusted score DAS = ∆target − Dnon-target .
+• Big Five generation. Steers the same traits in open-ended text; GPT-4o-mini judges
+  target/non-target-trait presence and coherence. The main score is the generation-adjusted
+  score GAS = ∆target − Dnon-target , where ∆target is the target-score shift relative to the
+  plain model; contrastive margin and coherence are auxiliary diagnostics (Appendix F.2).
+• Dialogue shift. Tests whether the controller can update behavior mid-conversation under
+  a fixed visible-context budget. The benchmark contains 204 branching cases (34 scenario
+  roots × {8, 16, 24} turns × 2 branches) spanning support, operational, skill-building, and
+  planning scenarios. We report post-shift alignment starget − sold and judged quality; full
+  construction details are in Appendix D.
+• HARDMath and PHYSICS. We use these two benchmarks as proxies for structured
+  reasoning in verifiable domains, covering applied mathematics [Fan et al., 2025] and
+  university-level physics [Feng et al., 2025]. Task heuristics are attached as memory
+  banks; we report normalized benchmark scores under the task-specific grading pipelines
+  (Appendices D.4 and D.5).
+
+Memory-bank construction by task. Each benchmark family uses a specific bank-
+construction recipe before held-out evaluation. For Big Five tasks, the bank is a target-trait
+descriptor with an optional opposite-trait reference; questionnaire items and generation
+prompts are excluded. For dialogue tasks, the bank encodes the requested target style with
+an optional old-style reference; future turns remain unseen. For PHYSICS and HARDMath,
+we prompt GPT-5.5-thinking to distill reasoning heuristics from 5 construction examples per
+subject or category, then strip all problem text, answers, equations, and numerical constants,
+leaving only natural-language process guidance. Construction examples are excluded from
+the evaluation set in both cases, so the bank acts as a process prior rather than retrieval
+over test answers. Appendix E gives representative examples.
+
+5   Main Results
+Table 1 and Figure 2 summarize our empirical results. MI delivers its strongest results where
+guidance is persistent, structured, or budget-constrained — winning decisively on PHYSICS,
+achieving the highest post-shift alignment on Qwen3 dialogue shift, and storing the same
+
+
+                                              6
+Table 1: Main results. MI is competitive with prompting, often stronger than CAA, and
+extends naturally to structured reasoning with the least KV memory burden. Steering
+rows report DAS or GAS, dialogue rows report post-shift alignment / judged quality, and
+reasoning rows report benchmark score or win count. Method columns are block-specific; for
+structured reasoning we compare against Plain and Prompt because CAA does not provide
+a comparable interface for long heuristic banks. Detailed breakdowns are moved to the
+appendix.
+ Task                                          Model            Setting                        Metric                               Method
+ Steering                                                                                                            Prompt          CAA          Ours
+ Big Five self-eval  Llama3.1-8B                                –                              DAS                     0.645        0.185        0.775
+                     Qwen3-30B-A3B                              –                              DAS                     0.355        0.115         0.270
+ Big Five generation Llama3.1-8B                                –                              GAS                    -0.524        -0.874       -0.602
+                     Qwen3-30B-A3B                              –                              GAS                     0.260        -0.926       0.440
+ Updateable guidance                                                                                                Prompt-init      CAA          Ours
+ Dialogue shift                                Qwen3-30B-A3B    Overall                        Align. / Quality     0.438 / 8.54 0.526 / 8.44 0.816 / 7.75
+                                               Qwen3-30B-A3B    24 turns                       Align. / Quality     0.344 / 8.54 0.497 / 8.37 0.651 / 7.80
+                                               Llama3.1-8B      Overall                        Align. / Quality     1.178 / 7.58 1.554 / 7.34 1.516 / 7.00
+                                               Llama3.1-8B      24 turns                       Align. / Quality     0.964 / 7.76 1.380 / 7.43 1.344 / 7.03
+ Structured reasoning                                                                                                  Plain        Prompt        Ours
+ PHYSICS                                       Qwen3-30B-A3B    no-CoT avg.                    Score (%)               67.5          69.6         70.8
+                                               Qwen3-30B-A3B    CoT avg.                       Score (%)               80.3          81.2         82.9
+                                               Qwen3-30B-A3B    Overall avg.                   Score (%)               73.9          75.4         76.9
+                                               Qwen3-30B-A3B    Win count (12 cells)           Win count                1             1            10
+ HARDMath                                      Qwen3-30B-A3B    CoT overall                    Score (%)               60.8          67.3         63.8
+
+                                                                           Prompt               Memory Inception
+
+                                    A Steering Tasks                         B Updateable Guidance                                C Structured Reasoning
+                                                                                                                                               60-118x
+ KV memory (MiB, log scale)
+
+
+
+
+                              100                                                                                                    63-74x
+
+
+                               30     18-23x
+                                               11-14x                            6.4x                      12-19x
+                                                        7.5x
+                                                                                                 8.0x                 8-10x
+                               10                               11-14x
+
+
+                                3
+
+                                1
+
+                                      Quest.   Quest.    Gen.       Gen.       Long ctx.       Long ctx.   Shift      Shift        HARDMath    PHYSICS
+                                      Llama    Qwen     Llama       Qwen        Llama           Qwen       Llama      Qwen           Qwen       Qwen
+
+
+
+
+Figure 2: KV-cache footprint of steering content. Gray bars show the visible prompt
+actually used; orange bars show the budget-equivalent latent footprint of MI inferred from the
+full content-matched accounting. Savings badges report the corresponding content-to-bank
+compression ratio. The y-axis is log-scaled KV memory in MiB.
+
+
+steering content at a fraction of the KV cost of visible prompting. Prompting retains an
+edge only in short raw-control settings where exact reminder wording can be cheaply placed
+in visible context.
+
+Competitive Steering and Updateable Guidance. Personality steering offers the most
+direct comparison: all three methods receive the same control signal and differ only in where
+it is injected. MI stays competitive with prompting while consistently outperforming CAA,
+achieving the strongest DAS on Llama self-evaluation, more than doubling CAA on Qwen3
+(0.270 vs. 0.115), and improving over CAA on both backbones in generation while remaining
+close to prompting; MI is most favorable when raw target movement would otherwise induce
+large collateral drift (Appendices F.1 and F.2). This advantage sharpens once the visible
+prompt budget is fixed after initialization: on Qwen3 dialogue shift, post-shift alignment
+rises from 0.438 (prompt-init) and 0.526 (CAA) to 0.816 overall, and from 0.344 to 0.651 at
+24 turns. On Llama, CAA leads on raw alignment but MI remains close (1.516 vs. 1.554
+
+
+                                                                                           7
+Figure 3: Qwen3 layer-selection ablation. Panels A and B report GAS for an easier trait
+(agreeableness) and a harder trait (neuroticism) as the number of selected layers increases.
+Panel C shows the corresponding budget-equivalent KV footprint relative to prompting.
+
+
+
+
+Figure 4: Qwen3 long-context persistence under opposite-style prefills. Left: average
+persistence across all six target traits. Right: the harder dismissive+anxious average.
+The full Qwen3 trait×prefill breakdown is in Appendix Table 12, and the corresponding
+Llama breakdown is in Appendix Table 13.
+
+
+overall; 1.344 vs. 1.380 at 24 turns), marking a clear Qwen3 win for latent memory updates
+and a tighter Llama controllability–quality trade-off.
+
+Structured Reasoning from Block Guidance. Structured reasoning is where MI’s
+interface matters most. A subject heuristic, global planner, and completion checklist form a
+reusable block of guidance natural to inject as visible text or as a latent bank, but not as a
+single residual direction; the reasoning rows of Table 1 therefore compare Plain, Prompt, and
+MI. On PHYSICS, MI is the clearest positive case: it wins 10 of the 12 subject×mode cells
+and the best overall average (76.9% vs. 75.4% for prompting, 73.9% for plain). HARDMath
+is more mixed: visible prompting leads overall at 67.3%, but MI still improves over plain
+(63.8% vs. 60.8%) and wins or ties plain in seven of the eight categories (Table 18). Together,
+these results show MI can carry reusable blocks of reasoning guidance, while prompt-faithful
+benchmarks can still favor visible prompting when exact heuristic wording matters.
+
+KV-Cache Savings. Figure 2 reports the systems result that motivates MI beyond steering
+quality. MI reduces the KV footprint by 6.4× in the long-context Llama case, 60–118×
+on PHYSICS, and 63–74× on HARDMath. The gain grows with guidance length: short
+persona descriptors benefit primarily from selected-layer placement, while long heuristic
+banks benefit from both selected-layer placement and prompt-to-slot compression. We report
+KV-equivalent storage rather than allocator-level memory traces, but the trend supports
+MI’s central systems argument: as steering content grows longer and more reusable, latent
+storage becomes substantially cheaper than repeatedly materializing it in visible prompt
+space.
+
+6    Analysis and Ablations
+Setup and scope. In this section we present two ablation analyses on Qwen3-30B-A3B.
+The first is a layer-selection ablation (Figure 3): varying the number of selected layers
+
+
+                                              8
+while holding bank content fixed, isolating how much latent coverage MI needs for traits of
+different difficulty. The second is a long-context persistence study (Figure 4): prepending
+a long opposite-style prefill before the visible interaction, testing how well each method’s
+steering signal survives competing context.
+
+Layer Ablation. Figure 3 varies the number of selected layers while holding bank content
+fixed. We test two traits that bracket the difficulty range: agreeableness, which aligns
+with Qwen3’s instruction-tuned default disposition and requires only a small nudge, and
+neuroticism, which runs counter to it and is substantially harder to steer. Accordingly,
+for agreeableness a single layer already moves the trait upward and scores stabilize by ten
+layers; for neuroticism, fewer than ten layers leave the score negative, and meaningful control
+requires attaching the bank to a broader slice of the network. The resource panel (Panel
+C) shows that even the widest selected-layer settings remain below the prompt baseline in
+budget-equivalent KV footprint: MI requires broader coverage for harder traits, but never
+requires prompt-style per-layer residency to achieve useful control.
+
+Long-Context Persistence. Figure 4 prepends a long opposite-style prefill before the
+visible interaction and measures how well each method’s steering signal survives. On the
+overall six-trait average (left panel), all methods degrade as the prefill grows, but MI decays
+least; on the harder dismissive and anxious traits (right panel), the separation is more
+pronounced: prompt performance drops sharply while MI preserves stronger target behavior
+throughout. The pattern follows directly from MI’s design: visible prompting must compete
+with the salience of the newly processed context, whereas latent banks reside at selected
+attention sites and are insensitive to earlier competing context. CAA is more stable than
+prompting but MI remains strongest on the hard-trait slice. Appendix D gives the evaluation
+setup, and Appendix Tables 12 and 13 give the full trait-by-prefill results.
+
+General Capability Check. We also perform general capability check on GSM8K and
+MMLU after steering towards various persona. Appendix F.7 confirms that MI produces no
+meaningful capability degradation relative to the plain model, and less degradation than
+visible prompting across trait-benchmark pairs where drops occur.
+
+7   Conclusion
+We introduced memory inception (MI), a training-free method that steers LLMs by appending
+text-derived KV banks to selected attention layers, occupying the middle ground between
+visible prompting and activation steering. MI improves the control–drift trade-off over CAA
+while remaining competitive with prompting, supports mid-conversation behavior updates
+on Qwen3 without rewriting the visible transcript, and carries reusable heuristic blocks on
+PHYSICS and HARDMath. Across all settings, it reduces content-matched KV storage by
+6–118× relative to visible prompting, making it most attractive when guidance is persistent,
+structured, or expensive to keep in context.
+
+Limitations. Three aspects bound the current results. First, each task family uses a
+different judge and scoring protocol: personality tasks use LLM-scored Likert shifts while
+reasoning tasks use rubric-based partial credit, making cross-task comparisons indirect
+and precluding a single unified aggregate score. Second, bank quality is task-dependent:
+slots that are noisy, overspecific, or too broad may fail in new settings, and the selector
+requires task-specific calibration examples, so MI is not a zero-design interface. Third, results
+are partly backbone-dependent: Qwen3 shows the clearest persistent-guidance gains while
+Llama exhibits a sharper controllability–quality trade-off, and our cache analysis measures
+KV-storage footprint rather than realized latency or allocator-level VRAM. Finally, the
+same latent-steering mechanism that enables persistent hidden guidance could be misused
+for covert behavior shaping or hidden policy injection; we therefore view disclosure and
+auditability of steering artifacts as necessary safeguards for any real deployment.
+
+Responsible release. Since latent steering can hide persistent behavioral guidance, we
+release only anonymous research code, evaluation scripts, and benchmark assets, not a
+
+
+                                               9
+deployment-ready steering service or a curated bank of covert persuasion or hidden-policy
+artifacts. For any real deployment, latent steering should be disclosed to operators, steering-
+bank artifacts should be access-controlled and audit-logged, and sensitive banks should
+require human review before use. We view these constraints as minimum safeguards against
+covert behavior shaping and hidden policy injection.
+
+Acknowledgements
+This research was supported in part by the Yale Office of the Provost. Experiments were
+carried out on the Yale Bouchet Cluster and Runpod. A. Alnasser and L. Baker were
+supported by Jump Trading.
+
+References
+Max Belitsky, Dawid J. Kopiczko, Michael Dorkenwald, M. Jehanzeb Mirza, James R. Glass,
+ Cees G. M. Snoek, and Yuki M. Asano. KV cache steering for controlling frozen LLMs,
+ 2025. URL https://arxiv.org/abs/2507.08799.
+
+Sebastian Borgeaud, Arthur Mensch, Jordan Hoffmann, Trevor Cai, Eliza Rutherford, Katie
+  Millican, George B. M. van den Driessche, Jean-Baptiste Lespiau, Bogdan Damoc, Aidan
+  Clark, Diego de Las Casas, Aurelia Guy, Jacob Menick, Roman Ring, Tom Hennigan,
+  Saffron Huang, Loren Maggiore, Chris Jones, Albin Cassirer, Andy Brock, Michela
+  Paganini, Geoffrey Irving, Oriol Vinyals, Simon Osindero, Karen Simonyan, Jack Rae,
+  Erich Elsen, and Laurent Sifre. Improving language models by retrieving from trillions of
+  tokens. In Proceedings of the 39th International Conference on Machine Learning, volume
+  162 of Proceedings of Machine Learning Research, pages 2206–2240. PMLR, 2022. URL
+  https://proceedings.mlr.press/v162/borgeaud22a.html.
+
+Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhari-
+  wal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language
+  models are few-shot learners. In Advances in Neural Information Processing Systems, vol-
+  ume 33, pages 1877–1901. Curran Associates, Inc., 2020. URL https://papers.neurips.
+  cc/paper/2020/hash/1457c0d6bfcb4967418bfb8ac142f64a-Abstract.html.
+
+Jingxuan Fan, Sarah Martinson, Erik Y. Wang, Kaylie Hausknecht, Jonah Brenner, Danxian
+  Liu, Nianli Peng, Corey Wang, and Michael P. Brenner. HARDMath: A benchmark
+  dataset for challenging problems in applied mathematics. In International Conference
+  on Learning Representations, 2025. doi: 10.48550/arXiv.2410.09988. URL https://
+  openreview.net/forum?id=nDTvP6tBMd.
+
+Kaiyue Feng, Yilun Zhao, Yixin Liu, Tianyu Yang, Chen Zhao, John Sous, and Arman Cohan.
+ Physics: Benchmarking foundation models on university-level physics problem solving. In
+ Findings of the Association for Computational Linguistics: ACL 2025, pages 11717–11743,
+ Vienna, Austria, 2025. Association for Computational Linguistics. doi: 10.18653/v1/2025.
+ findings-acl.610. URL https://aclanthology.org/2025.findings-acl.610/.
+
+Yuyao Ge, Shenghua Liu, Yiwei Wang, Tianyu Liu, Baolong Bi, Lingrui Mei, Jiayu Yao,
+  Jiafeng Guo, and Xueqi Cheng. Prism-δ: Differential subspace steering for prompt
+  highlighting in large language models, 2026. URL https://arxiv.org/abs/2603.10705.
+
+Lewis R. Goldberg, John A. Johnson, Herbert W. Eber, Robert Hogan, Michael C. Ashton,
+  C. Robert Cloninger, and Harrison G. Gough. The international personality item pool and
+  the future of public-domain personality measures. Journal of Research in Personality, 40
+  (1):84–96, 2006. doi: 10.1016/j.jrp.2005.08.007. URL https://doi.org/10.1016/j.jrp.
+  2005.08.007.
+
+Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian,
+ Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al. The
+  Llama 3 herd of models, 2024. URL https://arxiv.org/abs/2407.21783.
+
+
+                                              10
+Urvashi Khandelwal, Omer Levy, Dan Jurafsky, Luke Zettlemoyer, and Mike Lewis. Gen-
+  eralization through memorization: Nearest neighbor language models. In International
+ Conference on Learning Representations, 2020. URL https://openreview.net/forum?
+  id=HklBjCEKvH.
+Takeshi Kojima, Shixiang Shane Gu, Machel Reid, Yutaka Matsuo, and Yusuke Iwasawa.
+  Large language models are zero-shot reasoners. In Advances in Neural Information
+  Processing Systems, volume 35. Curran Associates, Inc., 2022. URL https://arxiv.org/
+  abs/2205.11916.
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu,
+ Joseph E. Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for
+ large language model serving with PagedAttention. In Proceedings of the 29th ACM
+ Symposium on Operating Systems Principles, pages 611–626. Association for Computing
+ Machinery, 2023. doi: 10.1145/3600006.3613165. URL https://doi.org/10.1145/
+ 3600006.3613165.
+Bruce W. Lee, Inkit Padhi, Karthikeyan Natesan Ramamurthy, Erik Miehling, Pierre
+  Dognin, Manish Nagireddy, and Amit Dhurandhar. Programming refusal with conditional
+  activation steering. In International Conference on Learning Representations, 2025.
+  doi: 10.48550/arXiv.2409.05907. URL https://openreview.net/forum?id=Oi47wc10sm.
+  Spotlight.
+Brian Lester, Rami Al-Rfou, and Noah Constant. The power of scale for parameter-efficient
+  prompt tuning. In Proceedings of the 2021 Conference on Empirical Methods in Natural
+  Language Processing, pages 3045–3059, Online and Punta Cana, Dominican Republic,
+  2021. Association for Computational Linguistics. doi: 10.18653/v1/2021.emnlp-main.243.
+  URL https://aclanthology.org/2021.emnlp-main.243/.
+Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Na-
+  man Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, Sebastian
+  Riedel, and Douwe Kiela. Retrieval-augmented generation for knowledge-intensive NLP
+  tasks. In Advances in Neural Information Processing Systems, volume 33, pages 9459–
+  9474. Curran Associates, Inc., 2020. URL https://papers.nips.cc/paper/2020/hash/
+  6b493230205f780e1bc26945df7481e5-Abstract.html.
+Weixian Waylon Li, Yuchen Niu, Yongxin Yang, Keshuang Li, Tiejun Ma, and Shay B.
+ Cohen. Spectral attention steering for prompt highlighting. In The Fourteenth International
+ Conference on Learning Representations, 2026. doi: 10.48550/arXiv.2603.01281. URL
+ https://openreview.net/forum?id=XfLvGIFmAN.
+Xiang Lisa Li and Percy Liang. Prefix-tuning: Optimizing continuous prompts for generation.
+  In Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics
+  and the 11th International Joint Conference on Natural Language Processing (Volume 1:
+  Long Papers), pages 4582–4597, Online, 2021. Association for Computational Linguistics.
+  doi: 10.18653/v1/2021.acl-long.353. URL https://aclanthology.org/2021.acl-long.
+  353/.
+Meta. Model card for Meta Llama 3.1. Hugging Face model card, 2024. URL https:
+ //huggingface.co/meta-llama/Llama-3.1-8B-Instruct. Accessed: 2026-05-06.
+Qwen Team. Qwen3-30b-a3b model card. Hugging Face model card, 2025. URL https:
+ //huggingface.co/Qwen/Qwen3-30B-A3B. Accessed: 2026-05-06.
+Nina Rimsky, Nick Gabrieli, Julian Schulz, Meg Tong, Evan Hubinger, and Alexander Turner.
+  Steering Llama 2 via contrastive activation addition. In Proceedings of the 62nd Annual
+  Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages
+  15504–15522, Bangkok, Thailand, 2024. Association for Computational Linguistics. doi:
+  10.18653/v1/2024.acl-long.828. URL https://aclanthology.org/2024.acl-long.828/.
+Niklas Stoehr, Kevin Du, Vésteinn Snæbjarnarson, Robert West, Ryan Cotterell, and Aaron
+  Schein. Activation scaling for steering and interpreting language models. In Findings of
+
+
+                                            11
+  the Association for Computational Linguistics: EMNLP 2024, pages 8189–8200, Miami,
+  Florida, USA, 2024. Association for Computational Linguistics. doi: 10.18653/v1/2024.
+  findings-emnlp.479. URL https://aclanthology.org/2024.findings-emnlp.479/.
+Jianlin Su, Yu Lu, Shengfeng Pan, Ahmed Murtadha, Bo Wen, and Yunfeng Liu. RoFormer:
+  Enhanced transformer with rotary position embedding, 2021. URL https://arxiv.org/
+  abs/2104.09864.
+Eric Todd, Millicent L. Li, Arnab Sen Sharma, Aaron Mueller, Byron C. Wallace, and David
+  Bau. Function vectors in large language models. In The Twelfth International Conference on
+  Learning Representations, 2024. URL https://openreview.net/forum?id=AwyxtyMwaG.
+Alexander Matt Turner, Lisa Thiergart, Gavin Leech, David Udell, Juan J. Vazquez, Ulisse
+  Mini, and Monte MacDiarmid. Steering language models with activation engineering, 2024.
+  URL https://arxiv.org/abs/2308.10248.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N.
+  Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in
+ Neural Information Processing Systems, volume 30. Curran Associates, Inc., 2017. URL
+  https://papers.neurips.cc/paper/7181-attention-is-all-you-need.
+Praveen Venkateswaran and Danish Contractor. Spotlight your instructions: Instruction-
+  following with dynamic attention steering. In Proceedings of the 19th Conference of the
+  European Chapter of the Association for Computational Linguistics (Volume 1: Long
+  Papers), pages 3752–3770, Rabat, Morocco, 2026. Association for Computational Lin-
+  guistics. doi: 10.18653/v1/2026.eacl-long.174. URL https://aclanthology.org/2026.
+  eacl-long.174/.
+Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Brian Ichter, Fei Xia, Ed H.
+  Chi, Quoc V. Le, and Denny Zhou. Chain-of-thought prompting elicits reasoning in large
+  language models. In Advances in Neural Information Processing Systems, volume 35.
+  Curran Associates, Inc., 2022. URL https://proceedings.neurips.cc/paper/2022/
+  hash/9d5609613524ecf4f15af0f7b31abca4-Abstract-Conference.html.
+Yuhuai Wu, Markus N. Rabe, DeLesley Hutchins, and Christian Szegedy. Memorizing
+  transformers. In International Conference on Learning Representations, 2022. URL
+  https://openreview.net/forum?id=TrjbxzRcnf-.
+Zhengxuan Wu, Qinan Yu, Aryaman Arora, Christopher D. Manning, and Christopher Potts.
+  Improved representation steering for language models, 2025. URL https://arxiv.org/
+  abs/2505.20809.
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu,
+ Chang Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report, 2025. URL
+ https://arxiv.org/abs/2505.09388.
+Qingru Zhang, Xiaodong Yu, Chandan Singh, Xiaodong Liu, Liyuan Liu, Jianfeng Gao, Tuo
+  Zhao, Dan Roth, and Hao Cheng. Model tells itself where to attend: Faithfulness meets
+  automatic attention steering, 2024. URL https://arxiv.org/abs/2409.10790.
+Andy Zou, Long Phan, Sarah Chen, James Campbell, Phillip Guo, Richard Ren, Alexander
+ Pan, Xuwang Yin, Mantas Mazeika, Ann-Kathrin Dombrowski, Shashwat Goel, Nathaniel
+ Li, Michael J. Byun, Zifan Wang, Alex Mallen, Steven Basart, Sanmi Koyejo, Dawn Song,
+ Matt Fredrikson, J. Zico Kolter, and Dan Hendrycks. Representation engineering: A
+ top-down approach to AI transparency, 2023. URL https://arxiv.org/abs/2310.01405.
+
+
+
+
+                                            12
+Appendix contents
+• Additional related work
+• Models, inference stack, and hardware
+• Automated attention head/layer selection
+• Datasets and evaluation
+• Examples of memory/heuristic banks
+• Results breakdown by task
+• Technical derivations
+
+A    Additional related work
+Beyond the direct prompting and activation-steering baselines in the main text, MI also
+sits near a broader family of inference-time memory mechanisms. Retrieval-augmented
+generation, kNN-LMs, Memorizing Transformers, and RETRO augment the model with
+non-parametric external memory at inference time [Lewis et al., 2020, Khandelwal et al.,
+2020, Wu et al., 2022, Borgeaud et al., 2022]. Those methods primarily target factual recall
+or language-model quality by retrieving passages or neighbors, whereas MI uses compact
+text-derived banks to carry behavior or reasoning heuristics.
+A second neighboring line of work studies latent steering with more selective interventions
+than a single residual-vector addition. Activation Scaling, Improved Representation Steering,
+and conditional activation steering refine how steering directions are normalized, composed,
+and conditionally activated [Stoehr et al., 2024, Wu et al., 2025, Lee et al., 2025]. These
+methods support the general claim that useful control can be achieved without retraining,
+but they still operate through residual-space interventions rather than through reusable
+latent KV content.
+Recent attention-path methods are even closer in spirit. Spotlight dynamically increases
+attention to designated instructions, while SEKA and Prism-∆ steer key representations
+or attention subspaces to highlight visible prompt spans [Venkateswaran and Contractor,
+2026, Li et al., 2026, Ge et al., 2026]. KV Cache Steering intervenes directly in the cache
+to induce controlled behavior in otherwise frozen models [Belitsky et al., 2025]. MI differs
+from these approaches in its interface: instead of reweighting visible prompt tokens alone, it
+stores multi-sentence target, reference, or heuristic guidance as latent side-bank slots that
+can be updated independently of the visible transcript.
+
+B    Models, inference stack, and hardware
+Table 2 summarizes the two backbones used in the experiments, using the public model
+cards and technical reports [Meta, 2024, Grattafiori et al., 2024, Qwen Team, 2025, Yang
+et al., 2025]. We keep the official Qwen3-30B-A3B naming: “A3B” refers to roughly 3.3B
+activated parameters, while the model card separately reports eight activated experts.
+
+ Table 2: Model details. Public model-card facts for the two experimental backbones.
+ Model                  Size and context     Architecture notes                   License
+ Meta-Llama-3.1-8B-     8B parameters; 128k Meta autoregressive Transformer;      Llama 3.1
+ Instruct               context              text-only multilingual instruction   Community
+                                             model; SFT/RLHF tuning; GQA;
+                                             December 2023 knowledge cutoff
+ Qwen3-30B-A3B          30.5B total and 3.3B Qwen Team causal MoE LM;             Apache 2.0
+                        activated            pre/post-trained; 48 layers; 32 Q
+                        parameters; 32,768 heads and 4 KV heads; 128 experts
+                        native context;      and 8 activated experts
+                        131,072 with YaRN
+
+
+                                             13
+Meta-Llama-3.1-8B-Instruct is a text-only multilingual instruction-tuned assistant model with
+grouped-query attention and the Llama 3.1 Community License. Qwen3-30B-A3B is a sparse
+MoE causal language model with thinking and non-thinking generation modes, grouped-query
+attention with four KV heads, and an Apache 2.0 license. These architectural differences
+motivate the separate dense-head and grouped-query/KV-group selector treatments in
+Section 3.
+Across experiments, we ran on whichever GPU was available on the cluster at execution
+time, primarily NVIDIA H100, H200, B200, or RTX Pro 6000 Blackwell GPUs. We treat
+the hardware fleet as execution infrastructure rather than as an experimental factor: within
+each evaluated sweep, backbone, bank, and comparison method are held fixed, while the
+exact GPU model may vary with cluster availability.
+
+
+
+
+Figure 5: Architectural placement of memory-bank attention steering. The same
+intervention concept applies to both dense Llama-style decoders and Qwen3-MoE decoders:
+reminder spans are encoded into latent memory-bank slots, an automatic selector chooses a
+small set of layers and attention sites, and the selected sites attend over those slots during
+decoding. In dense attention the selectable unit is an attention head; in Qwen3 grouped-
+query attention the selectable unit can be a KV group that expands to its associated query
+heads before the downstream MoE block. The diagram is a conceptual cache schematic;
+backend-specific implementations may realize the appended memory as a selected-site side
+bank rather than by directly modifying the native paged KV cache.
+
+
+B.1   vLLM inference implementation
+We use vLLM for high-throughput batched inference in the Qwen3 experiments. Plain and
+prompt baselines require no model change. Post-attention CAA is also comparatively simple:
+it adds a layer-specific vector after the projected attention output and before that output
+rejoins the residual stream.
+Memory-bank steering requires a deeper attention-path integration. Although Eq. (2)
+describes the reference method as appending latent slots to the available keys and values,
+the Qwen3 vLLM implementation should not be read as directly mutating vLLM’s native
+paged KV cache. vLLM continues to manage the ordinary prompt and generated-token
+cache, while the reminder bank is represented as a side KV bank consumed only at selected
+layers and heads or KV groups.
+At a selected Qwen3 layer, the intervention branch obtains the live query states, applies
+the same QK normalization and rotary-position treatment as the base model, and uses
+
+
+                                             14
+Algorithm 1 Automatic layer and head/KV-group selection
+Input: candidate layers Lcand ; candidate units Uℓ for each layer; calibration prompts C; target and
+reference banks; budgets m layers and k units per layer; steering gains and selector scoring rule.
+Output: a frozen selector artifact A specifying selected layers, selected heads or KV groups,
+layer-wise gains ρℓ , and calibration diagnostics.
+ 1. Construct target and reference memory banks from the wrapped reminder spans.
+2. Run the calibration prompts with diagnostic tracing enabled over the candidate layer/unit sites.
+   Record target-reference alignment, target-bank mass, reference-bank mass, prompt-bank mass,
+   and phrase-level bank engagement.
+3. Compute unit scores Uℓ,u from Eq. (11). For each layer, set Ubℓ ← TopKu (Uℓ,u , k).
+4. Compute layer scores Uℓ from Eq. (12) by aggregating the top-unit scores within each layer,
+   and set L
+           b ← TopMℓ (Uℓ , m).
+5. In dense attention, the selected unit u is a query head. In grouped-query attention, u is a KV
+   group expanded to its associated query heads at patch time.
+6. Export A = {L,
+               b {Ubℓ } , {ρℓ }, diagnostics} and freeze it before held-out evaluation.
+                       ℓ∈L
+                         b
+
+
+the pre-RoPE normalized query representation for reminder-bank scoring. The current
+vLLM path treats the already-computed selected-head attention output as the prompt-bank
+output and uses a synthetic single-slot prompt-bank score for bank-level routing. This is an
+approximation to Eq. (4): target and optional reference bank outputs are computed from
+precomputed side-bank keys and values, but the prompt side is not reconstructed from the
+full native paged prompt KV cache. The mixed selected-site output is written back before
+the attention output projection. For Qwen3 grouped-query attention, the selector artifact
+stores KV groups and the patch expands each selected group to the query heads that share
+it.
+
+
+C    Automated attention head/layer selection
+
+The selector is fit automatically on a small calibration split before held-out evaluation. In the
+dense Llama-style questionnaire runs reported here, the calibration pass records attention-
+route diagnostics rather than directly optimizing a task score at every site. The recorded
+statistics include target/reference alignment margins, prompt-bank mass, target-bank mass,
+reference-bank mass, and phrase-level bank engagement. More general selectors could replace
+these diagnostics with task-level target and drift objectives, but the reported results use the
+frozen diagnostic procedure summarized in Algorithm 1.
+
+Stage 1: unit ranking. Let Lcand be the set of candidate layers and Uℓ the selectable
+units in layer ℓ. For the diagnostic selector, each candidate site receives the score
+
+                                 Uℓ,u = aℓ,u + ξ m+        x
+                                                  ℓ,u − χ mℓ,u ,                               (11)
+
+where aℓ,u is the average target-versus-reference alignment margin from Eq. (3), m+     ℓ,u is
+mean target-bank mass, and mxℓ,u is mean prompt-bank mass. In the dense questionnaire
+calibration, the primary ordering is by aℓ,u , with target-bank mass used as a tie-break and
+engagement diagnostic. We keep the top k units per layer.
+
+Stage 2: layer ranking.        Layer scores aggregate the selected unit scores:
+
+                                  Uℓ = AggTopKu∈Uℓ (Uℓ,u ; k),                                 (12)
+
+where AggTopK is either a sum or mean over the layer’s top k unit scores. We keep the
+top m layers by Uℓ . A task-specific selector could instead use a direct utility such as
+target movement minus drift movement, but that is not the frozen objective used for the
+questionnaire artifacts reported here.
+
+
+                                                15
+Selector artifact and evaluation. The selector output is a reusable artifact containing
+the selected layers, selected heads or KV groups per layer, the layer gain schedule ρℓ , bank-
+mass diagnostics, target/reference alignment margins, and the calibration configuration. At
+inference time, no further search is performed: the model loads this artifact, constructs
+banks for the requested reminder, and applies attention steering only at the stored sites. All
+reported test results are then produced on held-out data with the same frozen selector for
+plain, prompt, CAA, and memory-bank comparisons.
+
+D     Datasets and evaluation
+Across all tasks, banks are frozen before held-out evaluation. When a benchmark needs
+construction examples to induce process cards, those construction examples are excluded
+from the scored pool. Representative bank content is collected later in Appendix E.
+Asset and terms summary: Meta-Llama-3.1-8B-Instruct is used under the Llama 3.1 Com-
+munity License, and Qwen3-30B-A3B under Apache 2.0, following their official model cards.
+The IPIP-50 questionnaire items are public-domain. HARDMath, PHYSICS, GSM8K,
+and MMLU are used from their original public benchmark releases and therefore follow
+those original release terms; the anonymous repository linked in the abstract points to the
+exact evaluation assets. GPT-4o-mini and GPT-5.5-thinking are accessed only through the
+OpenAI API under the provider’s service terms and are used only as evaluation judges, not
+redistributed as paper assets.
+
+D.1    Big Five self-evaluation
+The questionnaire benchmark uses IPIP-50 Big Five items [Goldberg et al., 2006]. We steer
+the model toward a target trait, then present the questionnaire one item at a time and
+require a single 1–5 Likert response for each item. Reverse-keyed items are rescored before
+trait aggregation. A representative item from the evaluation pool is “Am the life of the
+party.” The target metric is the change in the steered trait relative to the plain model, and
+non-target drift is the mean absolute change over the other four traits.
+
+D.2    Big Five generation
+The generation benchmark uses the same target traits but measures them on free-form
+responses rather than questionnaire digits. A representative held-out prompt is “Write a
+brief reply to a person feeling uncertain before an interview.” Responses are evaluated by
+an external LLM judge, GPT-4o-mini, which scores target-trait presence, opposite-trait
+pressure, the five Big Five traits, and coherence on a 1–5 scale. From these judgments we
+compute target-trait movement, non-target drift, and contrastive margins.
+
+D.3    Dialogue shift
+We construct the dialogue benchmark as a bank of multi-turn user trajectories rather than
+independent single-turn prompts. The corpus contains 34 scenario roots, each instantiated at
+8, 16, and 24 turns with two branches per length, for 34 × 3 × 2 = 204 cases. The roots cover
+emotionally loaded support cases, operational or crisis cases, skill-building and habit cases,
+and lower-stakes planning or creative cases. The 8-turn version establishes the premise, the
+16-turn version adds a complication, and the 24-turn version adds a later-stage resolution or
+changed priority. The A/B branches share the same root but vary concrete details so that
+success requires tracking the evolving user state.
+The dialogue-shift benchmark is derived from the same case bank to test whether steering
+can change behavior midway through an ongoing conversation. For the primary tier we use
+the 68 eight-turn cases; for the stress tier we use all 204 cases. Each scenario root is assigned
+one of six trait transitions, warm→assertive, assertive→warm, formal→cautious,
+cautious→formal, dismissive→anxious, or anxious→dismissive. We inject a natural
+shift request at turn 5, 9, or 13 for the 8-, 16-, and 24-turn cases, respectively. One
+representative shift turn is: “Please switch gears. Be more anxious, worried, and uncertain
+from here on. I got one lukewarm reply and now I feel silly again. How should I recover?”
+
+
+                                               16
+Table 3: Representative dialogue cases. Examples are shortened user turns; full cases
+are stored as ordered turn lists.
+  Case                  Family         Example turns
+  Career transition     Coaching/
+  coach                 support        t1: “I keep thinking about leaving my current field, but
+                                       I feel embarrassed that I waited so long.” t14: “I
+                                       spent 12 hours on the assignment and they rejected me
+                                       with a generic automated email.”
+  Software outage       Operational/
+  crisis                crisis       The user begins with an urgent service failure, later
+                                     updates the assistant with debugging outcomes,
+                                     stakeholder pressure, and recovery decisions.
+  Study partner         Learning/
+  dialogue              habit        The user asks for help with a study plan, then returns
+                                     with confusion, small wins, and exam-preparation
+                                     constraints that must remain consistent across turns.
+  Friendship drift
+  support               Relationships t1: “My best friend of ten years has been dodging my
+                                      calls.” t24: “Give me a framework for deciding how
+                                      much time and energy I should invest in this renewed,
+                                      but much more distant, relationship.”
+
+
+
+For scoring, we evaluate only post-shift assistant turns with GPT-4o-mini. Let starget be the
+score of the requested new trait and sold the score of the old trait. The primary adaptation
+metric is Align = starget − sold . We also report the mean post-shift turn-quality score Qturn ,
+defined as the average of usefulness, specificity, current-turn relevance, and non-genericness.
+The main comparison keeps the visible prompt and KV budget fixed after initialization;
+prompt replacement is treated only as a higher-cache audit condition.
+
+D.4      HARDMath
+
+HARDMath [Fan et al., 2025] provides the applied-mathematics stress test. Our intended
+evaluation protocol is to sample 60 questions per category when available across the integral,
+Laplace-integral, ODE, polynomial-roots, and nondimensionalization families, then grade
+final boxed answers with partial credit. The current appendix tables retain the benchmark’s
+reported subcategory split and the scored snapshot used in this draft, but the grading
+protocol is the one stated here.
+The original automatic scorer was too brittle for mathematically equivalent expressions, for
+                   1
+example treating 20  and 0.05 as different answers. We therefore regrade with GPT-5.5-
+thinking plus human review. Each answer receives 0, 0.5, or 1 point. Full credit requires a
+correct boxed answer up to mathematical equivalence. Partial credit is assigned when the
+boxed answer is only partly complete but still captures a requested component of the official
+answer, for example when a problem asks for both lower and upper asymptotic behavior and
+the model gives only one asymptote.
+The HARDMath banks are process-only heuristic cards distilled from held-out construction
+examples. Plain receives only the benchmark problem, Prompt receives the same heuristic
+guidance in visible context, and Ours stores the same guidance as latent memory-bank slots.
+
+D.5      PHYSICS
+
+The PHYSICS benchmark tests whether memory banks can carry reusable problem-solving
+heuristics rather than persona reminders. We use the text-only PHYSICS split and evaluate
+up to 100 questions per subject when available across classical mechanics, quantum mechan-
+ics, thermodynamics/statistical mechanics, electromagnetism, atomic physics, and optics.
+Subject-specific heuristic cards are distilled from held-out construction questions and then
+stripped of source question text, answer fragments, numerical constants, and solution-order
+traces before evaluation.
+
+
+                                              17
+We grade answers with a question-specific rubric and run GPT-5.5-thinking three times per
+answer, reporting the average normalized score. The rubric is still partial-credit based: a
+score of 5 means correct, 4 means mostly correct with a minor issue, 3 means substantial
+partial credit, 2 means some correct setup but major errors or incompleteness, 1 means very
+weak progress, and 0 means wrong or unusable. We evaluate both a no-CoT setting and a
+CoT setting, where Qwen3 thinking mode is enabled.
+
+D.6    Long-context persistence
+Long-context persistence uses the same 204 dialogue cases as the shift benchmark, but now
+the stressor is a long opposite-style prefill rather than an explicit behavior change request.
+Before the task dialogue begins, we prefill the visible context with non-task assistant-history
+text written in an opposing trait. The controller is then initialized once and must preserve
+the target style without repeatedly reinserting instructions into the visible transcript.
+GPT-4o-mini scores every assistant turn on six style dimensions and four turn-quality
+dimensions, and it also scores the full conversation on target-style persistence, coherence,
+user-state consistency, non-repetitiveness, and overall quality. Tables 12 and 13 report P/T /Q:
+conversation-level target persistence, mean turn-level target style score, and conversation-level
+overall quality, all on 1–10 scales.
+
+D.7    GSM8K and MMLU
+We use GSM8K and MMLU only as coarse capability checks after steering. The reported
+Qwen3 runs use 200 GSM8K questions and 500 MMLU questions. These benchmarks are
+not used to tune the steering artifacts; they serve only to confirm that persona steering does
+not introduce obvious capability collapse on standard reasoning and knowledge tasks.
+
+
+
+
+                                               18
+E    Examples of memory/heuristic banks
+This section consolidates representative bank content across persona, dialogue, PHYSICS,
+and HARDMath. The examples illustrate the kinds of process reminders stored in the latent
+bank, not additional scored evaluation cases.
+
+Table 4: Representative memory-bank construction recipes. Banks are frozen before
+evaluation. Structured-reasoning construction examples are excluded from the reported test
+pool, and the final cards retain only general process guidance.
+Task family      Source material            Example bank content                Leakage / budget
+                                                                                control
+Big Five self-   Target-trait descriptor, For an assertive bank:             No questionnaire
+evaluation       optional opposite-trait emphasize direct                    item, generation
+and              descriptor, and wrapper recommendations, explicit           prompt, or judged
+generation       variants such as direct trade-offs, concrete next steps,    output is included
+                 descriptor or hidden     and confident prioritization while in the bank text.
+                 steering note.           avoiding avoidant or overly        The same frozen
+                                          deferential phrasing.              descriptor bank is
+                                                                             used across
+                                                                             held-out prompts.
+Long-context     Target style descriptor,   For a dismissive→anxious shift: Future dialogue
+persistence      optional                   target slots encode worried,        turns are never
+and dialogue     old-style/reference        uncertain, risk-sensitive language, used to build the
+shift            descriptor, and, for       while reference slots encode the    bank. Prompt-init
+                 shift settings, the        old dismissive style so routing can baselines keep a
+                 requested new style        suppress old-trait carryover.       fixed visible-context
+                 after the shift.                                               budget; memory
+                                                                                banks update latent
+                                                                                guidance without
+                                                                                adding repeated
+                                                                                prompt tokens.
+PHYSICS          For each subject, 5–10     For quantum mechanics: first       Construction
+                 construction questions     classify whether the problem asks question ids are
+                 and reference solutions    for spectra, time evolution,       excluded from
+                 plus standard subject      measurement statistics,            evaluation. Final
+                 knowledge.                 perturbative response, or          cards remove
+                 GPT-5.5-thinking           asymptotics; choose a              answer fragments,
+                 distills subject-level     representation that simplifies the numeric constants,
+                 process heuristics.        relevant operator; keep            source-specific
+                                            amplitudes, phases, probabilities, formulas, and
+                                            and observables distinct.          solution-order
+                                                                               traces.
+HARDMath         For each category, 5–10 For Laplace-integral problems:      Construction
+                 construction problems identify the transform parameter problems are
+                 and reference solutions and convergence domain, choose excluded from
+                 plus a category label.  differentiation under the integral, evaluation. Final
+                 GPT-5.5-thinking        parameter substitution, or          cards describe
+                 distills category-level known-transform reduction, then method selection
+                 setup and checking      verify by limits or differentiation and answer checks,
+                 heuristics.             before giving the final expression. not solved examples
+                                                                             or category-specific
+                                                                             target answers.
+
+
+
+
+                                                  19
+Table 5: Representative subject-specific heuristic cards in the PHYSICS heuristic-
+completion banks (part I). The memory-bank condition stores cards like these as latent
+KV slots; the prompt baseline exposes the same card text visibly. Each row is a process
+reminder, not a solved example.
+Subject             Trigger and key idea       Action                    Trap and check
+Classical mechanics A mechanics prompt     Decide whether the            Avoid treating every
+                    mixes forces, energy,  task is force balance,        mechanics problem as
+                    impacts, constraints,  constrained motion,           Newton’s second-law
+                    frames, and            impulse/collision,            integration. The
+                    small-parameter        orbital reduction,            selected mode should
+                    language; mechanics    normal-mode analysis,         produce the requested
+                    errors often come from fluid scaling, or             observable with the
+                    solving the wrong mode relativistic kinematics       fewest extra
+                    of problem.            before writing                unknowns.
+                                           equations.
+Electromagnetism    Conductors, dielectrics,   Write the relevant        Avoid solving the
+                    magnetic media,            normal and tangential     differential equation in
+                    interfaces, cavities, or   boundary conditions,      each region but
+                    coaxial geometry           constitutive relations,   forgetting how the
+                    appear; interfaces and     and conductor             regions communicate.
+                    material response often    constraints before        Fields and potentials
+                    determine unknown          solving the bulk field.   should satisfy the
+                    constants and surface                                stated material
+                    sources.                                             behavior and interface
+                                                                         jumps or continuities.
+Quantum             A prompt mixes states,     Decide whether the      Avoid solving the
+mechanics           operators, spectra,        answer concerns         wrong kind of
+                    measurement, and time      allowed states, time    quantum problem
+                    language; separate         evolution,              because similar
+                    spectral, dynamical,       measurement statistics, symbols appear in the
+                    measurement, and           response to a small     prompt. The
+                    approximation              change, or asymptotic mathematical object
+                    questions before           behavior.               in the final answer
+                    computing.                                         should match the
+                                                                       physical question.
+
+
+
+
+                                               20
+Table 6: Representative subject-specific heuristic cards in the PHYSICS heuristic-
+completion banks (part II).
+Subject           Trigger and key idea        Action                     Trap and check
+Atomic physics    Hydrogenic, helium-like, Identify the baseline         Avoid mixing
+                  molecular, fine,          structure, then place        correction mechanisms
+                  hyperfine, Zeeman,        spin, relativistic, field,   without deciding
+                  Stark, or nuclear effects exchange, finite-size,       which is the
+                  appear together; atomic or nuclear corrections         unperturbed problem
+                  reasoning starts from a by relative size.              and which is small.
+                  hierarchy of scales and                                Each splitting or shift
+                  then adds corrections in                               should be attributable
+                  order.                                                 to a named interaction
+                                                                         and ordering
+                                                                         assumption.
+Optics            Lenses, mirrors,            Decide whether           Avoid using geometric
+                  apertures, slits,           wavelength and phase imaging where
+                  gratings, coherence, or     are essential or         diffraction or
+                  diffraction all appear      whether geometric        interference sets the
+                  possible; ray optics        imaging is sufficient    answer, or adding
+                  tracks paths and            for the requested scale. wave machinery to a
+                  images, while wave                                   pure imaging geometry.
+                  optics tracks phase,                                 The chosen model
+                  coherence, and                                       should depend on
+                  aperture-limited                                     wavelength only when
+                  structure.                                           wave effects are
+                                                                       relevant.
+Thermodynamics/   Energy, volume,             Choose                  Avoid using a partition
+statistical       temperature, particle       microcanonical,         function whose natural
+mechanics         number, chemical            canonical,              variables do not match
+                  potential, or reservoir     grand-canonical,        the physical setup.
+                  contact is specified; the   isothermal-isobaric, or Later derivatives
+                  ensemble is fixed by        another potential from should be taken with
+                  what is controlled and      the constraints before respect to the natural
+                  what can fluctuate.         differentiating.        variables of the chosen
+                                                                      potential.
+
+
+
+
+                                              21
+Table 7: Representative HARDMath heuristic cards. The prompt baseline exposes
+the same process cards as visible text, while the memory-bank condition stores them as
+latent slots. These cards are distilled from held-out construction examples but do not contain
+solved examples or answer fragments.
+Category             Trigger and key idea         Action                    Trap and check
+Integral and         The problem contains a       Identify the transform    Do not simplify
+Laplace-integral     parameterized integral,      parameter and             outside the valid
+                     transform-like kernel, or    convergence domain,       domain. Check the
+                     special-function-looking     then choose among         final expression by
+                     expression; success often    substitution,             limits, differentiation
+                     depends on choosing the      differentiation under     with respect to the
+                     right representation         the integral,             parameter, or a
+                     before manipulating the      contour/symmetry          simple numeric
+                     integral.                    reduction, or             substitution.
+                                                  known-transform
+                                                  matching.
+ODE                  The prompt asks for a      Separate homogeneous        Avoid fitting
+                     function satisfying        and particular              constants before
+                     differential constraints, structure, identify          verifying the solution
+                     boundary conditions, or singular points or             form. Substitute the
+                     asymptotic behavior; the conserved quantities,         final solution back
+                     equation type should be and use boundary data          into the differential
+                     classified before solving. only after the general      equation and
+                                                solution family is clear.   boundary conditions.
+Polynomial roots     The prompt asks for          Use Vieta relations,     Avoid extraneous
+                     roots, symmetric             resultants, multiplicity roots introduced by
+                     functions of roots, or       conditions,              squaring or
+                     parameter constraints;       sign/interval arguments, substitution. Check
+                     direct root-finding is       or transformations that multiplicities and
+                     often less stable than       expose symmetry          substitute candidate
+                     structural identities.       before expanding.        roots into the
+                                                                           original polynomial.
+NondimensionalizationThe prompt mixes             List base dimensions,   Avoid adding
+                     physical dimensions,         form independent        quantities with
+                     symbolic groups, or          dimensionless groups,   incompatible units
+                     numeric scale choices;       then decide whether the or overfitting a scale
+                     the target is usually an     task needs symbolic     choice. Verify that
+                     invariant dimensionless      simplification or       every reported group
+                     relation rather than a       numeric evaluation.     is dimensionless and
+                     raw computation.                                     independent.
+
+
+
+
+                                                 22
+F     Results breakdown by task
+F.1   Big Five self-evaluation
+
+For readability, we split the detailed per-trait appendix results by backbone and give each
+metric its own column rather than packing four values into one cell.
+
+Table 8: Big Five questionnaire self-evaluation on Meta-Llama-3.1-8B-Instruct.
+Columns report target-trait score, target shift from the plain model, non-target drift, and
+drift-adjusted score, where DAS = ∆target − Dnon-target . Bold indicates the highest DAS
+among steering methods within each trait.
+              Trait                Method      Score     Shift   Drift     DAS
+              Openness             Plain           3.5     0.0   0.000     0.000
+                                   Prompt          4.1    +0.6   0.350     0.250
+                                   CAA             3.8    +0.3   0.050     0.250
+                                   Ours            4.6    +1.1   0.175    0.925
+              Conscientiousness    Plain           3.9     0.0   0.000     0.000
+                                   Prompt          4.2    +0.3   0.625    -0.325
+                                   CAA             4.3    +0.4   0.025     0.375
+                                   Ours            4.9    +1.1   0.100    1.000
+              Extraversion         Plain           2.8     0.0   0.000     0.000
+                                   Prompt          4.7    +1.9   0.350    1.550
+                                   CAA             2.9    +0.1   0.225    -0.125
+                                   Ours            3.0    +0.2   0.050     0.150
+              Agreeableness        Plain           4.7     0.0   0.000     0.000
+                                   Prompt          4.9    +0.2   0.250    -0.050
+                                   CAA             4.7    +0.0   0.075    -0.075
+                                   Ours            4.9    +0.2   0.125    0.075
+              Neuroticism          Plain           2.0     0.0   0.000     0.000
+                                   Prompt          4.5    +2.5   0.700    1.800
+                                   CAA             2.7    +0.7   0.200     0.500
+                                   Ours            4.3    +2.3   0.575     1.725
+              Average              Plain             –     0.0   0.000     0.000
+                                   Prompt            –   +1.10   0.455     0.645
+                                   CAA               –   +0.30   0.115     0.185
+                                   Ours              –   +0.98   0.205    0.775
+
+
+The per-trait tables clarify that the aggregate Pareto picture in Table 1 is not uniform across
+all traits. Prompting remains strongest for the largest raw movement on extraversion and
+neuroticism, while memory-bank steering is strongest on several drift-adjusted rows, especially
+openness and agreeableness on Qwen3 and openness, conscientiousness, and agreeableness
+on Llama.
+
+F.2   Big Five generation
+
+For readability, we again separate the detailed results by backbone and give each reported
+quantity its own column.
+The generation tables show why the main-text claim is improvement over CAA rather
+than universal dominance over prompting. Memory-bank steering improves over CAA
+on the average Llama and Qwen3 generation metrics, but prompt remains the strongest
+visible-context baseline on several drift-adjusted rows, especially on Qwen3.
+
+F.3   Long-context persistence
+
+Qwen3 shows the clearest positive long-context cases under the budget-matched setup,
+especially on the more difficult low-baseline traits. Llama behaves differently: prompt
+remains the strongest raw persistence mechanism on average, while the latent methods trade
+off persistence against judged quality more sharply.
+
+
+                                              23
+Table 9: Big Five questionnaire self-evaluation on Qwen3-30B-A3B. Columns report
+target-trait score, target shift from the plain model, non-target drift, and drift-adjusted
+score, where DAS = ∆target − Dnon-target . Bold indicates the highest DAS among steering
+methods within each trait.
+              Trait                 Method     Score     Shift    Drift     DAS
+              Openness              Plain          4.1     0.0    0.000     0.000
+                                    Prompt         4.8    +0.7    0.475     0.225
+                                    CAA            4.4    +0.1    0.075     0.025
+                                    Ours           4.6    +0.5    0.100    0.400
+              Conscientiousness     Plain          4.5     0.0    0.000     0.000
+                                    Prompt         4.9    +0.4    0.525    -0.125
+                                    CAA            4.5    +0.1    0.075    0.025
+                                    Ours           4.6    +0.1    0.150    -0.050
+              Extraversion          Plain          3.6     0.0    0.000     0.000
+                                    Prompt         5.0    +1.4    0.500    0.900
+                                    CAA            3.7    +0.1    0.100     0.000
+                                    Ours           3.8    +0.2    0.150     0.050
+              Agreeableness         Plain          4.2     0.0    0.000     0.000
+                                    Prompt         5.0    +0.8    0.500     0.300
+                                    CAA            4.3    +0.3    0.075     0.225
+                                    Ours           4.9    +0.7    0.150    0.550
+              Neuroticism           Plain          2.5     0.0    0.000     0.000
+                                    Prompt         3.6    +1.1    0.625    0.475
+                                    CAA            2.8    +0.4    0.100     0.300
+                                    Ours           3.0    +0.5    0.100     0.400
+              Average               Plain            –     0.0    0.000     0.000
+                                    Prompt           –   +0.88    0.525    0.355
+                                    CAA              –   +0.20    0.085     0.115
+                                    Ours             –   +0.40    0.130     0.270
+
+
+
+F.4   Dialogue shift
+
+For readability, the appendix tables below foreground the two primary post-shift outcomes:
+adaptation alignment Align = starget − sold and judged turn quality Qturn . The raw target-
+style and old-style component scores are omitted from the paper-level tables and remain
+available in the released results.
+The shift tables show the main matched-budget pattern from the paper: Qwen3 provides the
+clearest positive cases for latent behavior updates, especially on difficult transitions such as
+dismissive→anxious, while Llama shows a sharper quality trade-off even when alignment
+improves.
+
+
+F.5   PHYSICS results
+
+The PHYSICS results support the structured-heuristic use case: memory banks are most
+helpful when the benchmark rewards reusable subject-level process reminders rather than
+persona changes. Gains are especially visible in CoT mode, where the latent heuristic cards
+can guide longer reasoning traces without occupying visible prompt budget.
+
+
+F.6   HARDMath results
+
+The HARDMath results are more mixed than PHYSICS, which is consistent with the
+benchmark’s stricter symbolic answer format and the need for exact final expressions. Even
+after regrading for mathematical equivalence and partial credit, prompt remains strongest
+on several categories, while memory banks help most on ODE and tie the prompt baseline
+on one of the integral splits.
+
+
+                                              24
+Table 10: Big Five contrastive generation judged by an LLM judge on Meta-
+Llama-3.1-8B-Instruct. Columns report target-trait score, target-score shift from the
+plain model, non-target drift, contrastive margin, and generation-adjusted score, where
+GAS = ∆target − Dnon-target . Contrastive margin is a separate auxiliary diagnostic.
+          Trait               Method     Score     Shift   Drift   Margin     GAS
+          Openness            Plain       4.54    +0.00    1.11      3.33    -1.110
+                              Prompt      4.79    +0.25    1.04      3.62   -0.790
+                              CAA         4.62    +0.08    1.10      3.29    -1.020
+                              Ours        4.50     -0.04   1.07      3.12    -1.110
+          Conscientiousness   Plain       4.83    +0.00    0.68      3.71    -0.680
+                              Prompt      4.79     -0.04   0.64      3.62    -0.680
+                              CAA         4.92    +0.09    0.66      3.88    -0.570
+                              Ours        4.96    +0.13    0.69      3.92   -0.560
+          Extraversion        Plain       3.50    +0.00    1.18      1.38    -1.180
+                              Prompt      4.33    +0.83    1.25      2.71   -0.420
+                              CAA         3.92    +0.42    1.18      1.83    -0.760
+                              Ours        4.12    +0.62    1.19      2.29    -0.570
+          Agreeableness       Plain       4.83    +0.00    0.96      3.79    -0.960
+                              Prompt      4.92    +0.09    0.55      3.83   -0.460
+                              CAA         4.88    +0.05    1.02      3.83    -0.970
+                              Ours        4.92    +0.09    0.95      3.88    -0.860
+          Neuroticism         Plain       3.62    +0.00    0.99      1.12    -0.990
+                              Prompt      4.29    +0.67    0.94      2.42    -0.270
+                              CAA         3.50     -0.12   0.93      1.00    -1.050
+                              Ours        4.42    +0.80    0.71      2.79    0.090
+          Average             Plain       4.26    +0.00    0.98      2.67    -0.984
+                              Prompt      4.62    +0.36    0.88      3.24   -0.524
+                              CAA         4.37    +0.11    0.98      2.77    -0.874
+                              Ours        4.58    +0.32    0.92      3.20    -0.602
+
+
+F.7   GSM8K and MMLU capability checks
+These rows do not suggest catastrophic capability loss. The memory-bank condition stays
+close to the plain model and usually remains within the spread already induced by prompt
+or CAA steering.
+
+F.8   Mechanistic routing examples
+Table 20 reports representative selector diagnostics from memory-bank runs. Each row
+freezes the selected layers and attention units chosen by the selector, then averages the
+diagnostic attention mass assigned to target, reference, and prompt banks over the selected
+units in the trace. The examples illustrate that the intervention is selective routing rather
+than uniform prompt prepending.
+The warm and formal persistence examples show concentrated routing: roughly 91% of the
+measured bank/prompt attention mass goes to the target bank at the selected mid-to-late
+layers, corresponding to judged target/persistence/quality triples of 8.40/8.77/8.77 and
+6.41/8.05/8.98. The dialogue-shift example uses an explicit opposite-style reference bank,
+producing a still-dominant target route but leaving nonzero prompt and reference mass that
+makes the update behavior auditable; its post-shift target and old-trait scores are 4.16 and
+1.52, giving alignment 2.64.
+
+F.9   Outstanding ablations and omissions
+We omit unfinished ablation sweeps rather than presenting unstable numbers. The main
+missing item is a fully frozen layer-count ablation that varies the number and identity of
+selected layers while keeping bank content fixed. That study would help isolate how much of
+MI’s gain comes from selective placement rather than from the bank text alone.
+
+
+                                             25
+Table 11: Big Five contrastive generation judged by an LLM judge on Qwen3-30B-
+A3B. Columns report target-trait score, target-score shift from the plain model, non-target
+drift, contrastive margin, and generation-adjusted score, where GAS = ∆target − Dnon-target .
+This is the detailed version of the matched-task summary in Table 1.
+            Trait                    Method   Score     Shift   Drift   Margin     GAS
+            Openness                 Plain     2.17   +0.00     0.83       0.67   -0.830
+                                     Prompt    2.83   +0.66     0.83       1.67   -0.170
+                                     CAA       1.83    -0.34    1.00      -0.33   -1.340
+                                     Ours      3.83   +1.66     1.12       2.00   0.540
+            Conscientiousness        Plain     3.83   +0.00     0.71       2.83   -0.710
+                                     Prompt    4.17   +0.34     0.58       3.17   -0.240
+                                     CAA       3.83   +0.00     0.62       2.83   -0.620
+                                     Ours      5.00   +1.17     0.92       4.00   0.250
+            Extraversion             Plain     2.00   +0.00     0.92       0.83   -0.920
+                                     Prompt    3.67   +1.67     0.92       2.67   0.750
+                                     CAA       2.00   +0.00     0.96       0.83   -0.960
+                                     Ours      3.33   +1.33     1.17       0.83    0.160
+            Agreeableness            Plain     3.50   +0.00     0.62       2.50   -0.620
+                                     Prompt    4.17   +0.67     0.71       3.17   -0.040
+                                     CAA       3.50   +0.00     0.75       2.33   -0.750
+                                     Ours      5.00   +1.50     0.88       4.00   0.620
+            Neuroticism              Plain     1.00   +0.00     0.96      -4.00   -0.960
+                                     Prompt    2.67   +1.67     0.67      -0.33   1.000
+                                     CAA       1.00   +0.00     0.96      -4.00   -0.960
+                                     Ours      2.67   +1.67     1.04      -0.67    0.630
+            Average                  Plain     2.50   +0.00     0.81       0.57   -0.808
+                                     Prompt    3.50   +1.00     0.74       2.07    0.260
+                                     CAA       2.43    -0.07    0.86       0.33   -0.926
+                                     Ours      3.97   +1.47     1.02       2.03   0.440
+
+
+
+Table 12: Qwen3 long-context dialogue persistence by trait and prefill length. Each
+method cell reports P/T /Q: conversation-level target persistence, mean turn-level target
+style score, and conversation-level overall quality. Prefill is non-task assistant-history context
+inserted before the dialogue. Prompt is the once-initialized visible-instruction baseline; Ours
+is memory-bank steering. Missing cells indicate no valid judged run after judge-completion
+filtering.
+Trait        Prefill         Plain             Prompt              CAA                Ours
+Warm         8k        9.04 / 8.68 / 9.19 9.19 / 8.95 / 9.34 8.94 / 8.41 / 9.02 8.51 / 8.29 / 8.39
+             16k       9.01 / 8.62 / 9.14 9.12 / 8.79 / 9.21 8.91 / 8.43 / 9.00 8.90 / 8.43 / 8.92
+             24k       8.96 / 8.64 / 9.10 9.06 / 8.73 / 9.13 8.94 / 8.48 / 8.99 8.91 / 8.47 / 9.00
+Formal       8k        8.07 / 6.31 / 9.07 8.41 / 6.68 / 9.18 8.06 / 6.43 / 9.01 8.04 / 6.40 / 8.97
+             16k       8.04 / 6.36 / 9.01 8.16 / 6.58 / 9.05 8.10 / 6.51 / 8.98 8.06 / 6.43 / 9.00
+             24k       8.05 / 6.35 / 9.04 8.18 / 6.53 / 9.05 8.05 / 6.47 / 8.97 8.05 / 6.41 / 8.98
+Assertive    8k        8.94 / 7.88 / 9.24 9.01 / 8.12 / 9.30 8.79 / 7.59 / 9.01 8.73 / 7.56 / 9.01
+             16k       8.83 / 7.91 / 9.05 9.01 / 8.15 / 9.19 8.77 / 7.60 / 8.98 8.72 / 7.57 / 8.99
+             24k       8.85 / 7.91 / 9.05 8.98 / 8.06 / 9.11 8.73 / 7.62 / 8.97 8.71 / 7.57 / 8.96
+Cautious     8k        8.65 / 6.18 / 9.12 8.86 / 6.34 / 9.20 8.65 / 6.23 / 9.02 8.71 / 6.29 / 8.97
+             16k       8.60 / 6.13 / 9.10 8.72 / 6.25 / 9.12 8.66 / 6.12 / 8.99 8.74 / 6.19 / 8.99
+             24k       8.56 / 6.10 / 9.06 8.65 / 6.19 / 9.06 8.67 / 6.10 / 8.99 8.70 / 6.22 / 8.99
+Dismissive 8k          1.00 / 1.01 / 9.69 1.61 / 1.26 / 9.49 1.00 / 1.04 / 9.28 2.35 / 1.99 / 6.56
+           16k         1.00 / 1.02 / 9.54 1.05 / 1.05 / 9.60 1.01 / 1.03 / 9.17 1.85 / 1.84 / 6.51
+           24k         1.00 / 1.01 / 9.58 1.00 / 1.02 / 9.58 1.00 / 1.04 / 9.23 1.68 / 1.60 / 6.55
+Anxious      8k        4.96 / 1.67 / 8.90 5.59 / 2.14 / 8.90 5.73 / 1.96 / 8.55 6.23 / 2.54 / 6.53
+             16k       4.99 / 1.74 / 8.73 4.94 / 1.73 / 8.81 5.86 / 2.01 / 8.52 6.21 / 2.39 / 7.12
+             24k       4.69 / 1.75 / 8.75 4.88 / 1.74 / 8.77 6.05 / 2.03 / 8.51 6.27 / 2.27 / 7.35
+
+
+
+                                                 26
+Table 13: Meta-Llama-3.1-8B-Instruct long-context dialogue persistence by trait
+and prefill length. Each cell reports P/T /Q: conversation-level target persistence, mean
+turn-level target style score, and conversation-level overall quality. The main text reports
+only the model-level averages; this table gives the full trait×budget breakdown. Plain is the
+opposite-prefill baseline. Prompt adds one visible target-style system instruction before the
+same opposite-prefill context. CAA is the frozen post-attention residual baseline (layer 14,
+scale 2), and Ours reports the frozen memory-bank configuration used in the final judged
+audit.
+ Trait       Prefill         Plain             Prompt              CAA                 Ours
+ Warm        8k        7.66 / 7.38 / 8.57 8.76 / 8.06 / 8.99 8.23 / 7.49 / 8.83 8.08 / 7.41 / 8.83
+             16k       8.17 / 7.52 / 8.83 8.75 / 8.00 / 8.95 7.92 / 7.47 / 8.71 8.26 / 7.43 / 8.83
+             24k       7.72 / 7.60 / 8.61 8.70 / 8.01 / 9.00 8.29 / 7.71 / 8.81 7.92 / 7.46 / 8.70
+ Formal      8k        7.66 / 6.09 / 8.79 8.01 / 6.20 / 8.98 8.04 / 6.56 / 9.00 7.69 / 6.01 / 8.76
+             16k       7.51 / 6.05 / 8.75 7.96 / 6.27 / 8.93 8.11 / 6.58 / 9.00 7.51 / 6.01 / 8.63
+             24k       7.48 / 6.04 / 8.67 7.93 / 6.26 / 8.93 8.06 / 6.62 / 8.99 7.52 / 5.99 / 8.64
+ Assertive   8k        7.80 / 6.79 / 8.78 7.91 / 7.10 / 8.82 8.32 / 7.25 / 8.98 7.54 / 6.37 / 8.51
+             16k       6.55 / 6.26 / 7.87 7.68 / 6.95 / 8.58 8.12 / 7.22 / 8.89 6.95 / 6.25 / 8.00
+             24k       7.10 / 6.50 / 8.19 7.67 / 6.89 / 8.61 7.99 / 7.21 / 8.87 7.04 / 6.21 / 7.97
+ Cautious    8k        7.36 / 5.73 / 8.46 8.39 / 6.39 / 9.00 7.84 / 6.17 / 8.77 7.46 / 5.71 / 8.48
+             16k       7.47 / 5.70 / 8.62 8.32 / 6.37 / 8.97 7.92 / 6.16 / 8.86 7.34 / 5.70 / 8.34
+             24k       7.47 / 5.85 / 8.57 8.22 / 6.30 / 8.97 7.98 / 6.28 / 8.80 7.87 / 5.86 / 8.78
+ Dismissive 8k         1.00 / 1.06 / 8.69 7.62 / 6.06 / 5.87 1.02 / 1.19 / 8.74 3.63 / 2.74 / 4.45
+            16k        1.01 / 1.06 / 8.71 8.41 / 7.09 / 5.39 1.10 / 1.20 / 8.66 4.08 / 2.69 / 4.14
+            24k        1.03 / 1.07 / 8.73 8.45 / 6.87 / 5.37 1.21 / 1.16 / 8.57 3.92 / 2.62 / 4.46
+ Anxious     8k        5.88 / 2.09 / 8.06 6.11 / 2.20 / 8.04 6.08 / 2.29 / 8.03 6.53 / 2.72 / 7.78
+             16k       6.09 / 2.14 / 8.07 6.56 / 2.88 / 8.07 6.13 / 2.29 / 8.07 6.49 / 2.67 / 7.78
+             24k       6.12 / 2.14 / 8.03 6.46 / 2.47 / 8.13 6.16 / 2.29 / 8.04 6.50 / 2.66 / 7.89
+
+
+
+
+Table 14: Qwen3 dialogue-shift post-shift alignment by transition and dialogue
+length. Entries report Align on post-shift turns. Bold marks the best matched-budget
+method in each row among Plain, Prompt-init, CAA, and Ours. Prompt-repl. is shown only
+as an audit because it adds visible steering text at the shift point.
+   Transition                  Turns Metric Plain Prompt-init CAA           Ours    Prompt-repl.
+   Warm→Assertive                8     Align   -0.04     -0.46      0.19    -0.50      -0.29
+   Warm→Assertive               16     Align   -0.23     -0.25      0.00    -0.34      -0.29
+   Warm→Assertive               24     Align   -0.40     -0.43      -0.30   -0.80      -0.35
+   Assertive→Warm                8     Align   1.33       1.17      1.56    1.88        1.12
+   Assertive→Warm               16     Align   1.43       1.38      1.66    2.29        1.34
+   Assertive→Warm               24     Align   1.25       1.24      1.38    1.90        1.17
+   Formal→Cautious               8     Align   0.22      -0.06      0.46     0.06       0.11
+   Formal→Cautious              16     Align   -0.14     -0.21      0.19    -0.02      -0.12
+   Formal→Cautious              24     Align   -0.29     -0.44      -0.17   -0.15      -0.06
+   Cautious→Formal               8     Align   1.50       1.58      1.69    1.42        1.67
+   Cautious→Formal              16     Align   0.79       0.89      1.16    0.71        1.21
+   Cautious→Formal              24     Align   0.82       1.05      1.29    0.93        1.09
+   Dismissive→Anxious            8     Align   0.83       1.00      1.96    2.83        2.06
+   Dismissive→Anxious           16     Align   1.02       1.55      1.65    2.74        4.17
+   Dismissive→Anxious           24     Align   1.11       1.02      2.52    2.48        2.86
+   Anxious→Dismissive            8     Align   -1.17     -0.67      0.12    -1.17       0.00
+   Anxious→Dismissive           16     Align   -0.93     -0.79      -0.44   -0.36      0.21
+   Anxious→Dismissive           24     Align   -0.77     -0.55      -0.42   -0.32      -0.86
+
+
+
+
+                                                 27
+Table 15: Qwen3 dialogue-shift post-shift turn quality by transition and dialogue
+length. Entries report Qturn on post-shift turns. Bold marks the best matched-budget
+method in each row among Plain, Prompt-init, CAA, and Ours. Prompt-repl. is shown only
+as an audit because it adds visible steering text at the shift point.
+    Transition               Turns Metric Plain Prompt-init CAA Ours Prompt-repl.
+    Warm→Assertive             8   Qturn     8.67       8.72        8.64     7.86     8.65
+    Warm→Assertive            16   Qturn     8.73       8.77        8.71     7.64     8.78
+    Warm→Assertive            24   Qturn     8.70       8.66        8.59     7.25     8.63
+    Assertive→Warm             8   Qturn     8.47       8.62        8.41     7.27     8.58
+    Assertive→Warm            16   Qturn     8.58       8.55        8.45     6.45     8.51
+    Assertive→Warm            24   Qturn     8.55       8.53        8.47     6.44     8.57
+    Formal→Cautious            8   Qturn     8.60       8.58        8.51     8.44     8.49
+    Formal→Cautious           16   Qturn     8.55       8.50        8.54     8.27     8.49
+    Formal→Cautious           24   Qturn     8.39       8.43        8.35     8.19     8.40
+    Cautious→Formal            8   Qturn      8.46      8.46        8.50     7.67     8.42
+    Cautious→Formal           16   Qturn      8.58      8.63        8.59     7.47     8.59
+    Cautious→Formal           24   Qturn      8.66      8.70        8.68     7.89     8.61
+    Dismissive→Anxious         8   Qturn     8.56       8.49        8.33     6.28     7.53
+    Dismissive→Anxious        16   Qturn     8.56       8.24        8.31     4.79     6.27
+    Dismissive→Anxious        24   Qturn     8.44       8.52        7.42     3.98     6.99
+    Anxious→Dismissive         8   Qturn     8.62       8.29        8.03     7.33     7.50
+    Anxious→Dismissive        16   Qturn     8.18       7.95        7.72     5.27     6.64
+    Anxious→Dismissive        24   Qturn     8.15       8.12        8.05     4.16     7.70
+
+
+
+
+Table 16: Meta-Llama-3.1-8B-Instruct halfway-shift dialogue summary. Each
+breakdown is split into two metric rows: post-shift alignment Align and judged turn quality
+Qturn . Bold marks the best method in each metric row. CAA is the frozen layer-14, scale-2
+post-attention residual baseline; Ours is memory-bank summary update.
+        Breakdown                    Metric          Plain     Prompt-init    CAA    Ours
+        Overall                      Align           1.112        1.178      1.554   1.516
+                                     Qturn           7.72          7.58       7.34   7.00
+        Anxious→Dismissive           Align            1.654       2.212      2.808 2.692
+                                     Qturn            5.92         5.49       4.63   4.49
+        Assertive→Warm               Align            1.026       1.087      1.209 1.148
+                                     Qturn             8.30       8.35        8.23   8.03
+        Cautious→Formal              Align            0.835       0.852      1.157 0.913
+                                     Qturn             8.33       8.35        8.27   7.87
+        Dismissive→Anxious           Align            3.615       3.240      4.298 4.577
+                                     Qturn            7.06         6.44       5.98   5.85
+        Formal→Cautious              Align           -0.252      -0.113      -0.191 -0.209
+                                     Qturn             8.11       8.14        8.05   7.77
+        Warm→Assertive               Align            0.087       0.087      0.426 0.383
+                                     Qturn             8.40        8.40       8.48   7.65
+        8 turns                      Align           1.185        1.204      1.398   1.278
+                                     Qturn           7.84          7.57       7.52   7.22
+        16 turns                     Align           1.373        1.429      1.833   1.829
+                                     Qturn           7.56          7.36       7.15   6.88
+        24 turns                     Align           0.873        0.964      1.380   1.344
+                                     Qturn           7.82          7.76       7.43   7.03
+
+
+
+
+                                               28
+Table 17: Full PHYSICS subject×mode matrix on Qwen3-30B-A3B. Values are
+mean 0–5 partial-credit judge scores, normalized to percent and averaged over three grading
+passes. Chain of thought (CoT) denotes Qwen3 thinking mode; no-CoT disables it.
+ Domain                                 Mode      Plain (%) ↑     Prompt (%) ↑     Ours (%) ↑
+ Classical mechanics                    no-CoT       66.0               69.4             68.2
+ Classical mechanics                    CoT          82.0               84.0             85.4
+ Quantum mechanics                      no-CoT       65.4               63.5             68.1
+ Quantum mechanics                      CoT          69.2               75.0             76.6
+ Atomic physics                         no-CoT       71.4               71.8             73.2
+ Atomic physics                         CoT          80.2               79.5             84.2
+ Optics                                 no-CoT       69.2               72.9             74.2
+ Optics                                 CoT          85.0               83.2             83.0
+ Electromagnetism                       no-CoT       60.6               63.6             64.4
+ Electromagnetism                       CoT          75.8               76.6             77.8
+ Thermodynamics/statistical mechanics   no-CoT       72.2               76.4             76.8
+ Thermodynamics/statistical mechanics   CoT          89.4               89.0             90.6
+
+
+
+
+Table 18: Full HARDMath category breakdown on Qwen3-30B-A3B with chain
+of thought. Values are category partial-credit total / maximum partial-credit total, with
+the normalized percentage in parentheses.
+ Category                    Plain                Prompt                  Ours
+ Integral 0             13.5 / 30 (45.0)        14.5 / 30 (48.3)         14.5 / 30 (48.3)
+ Integral 1            13.5 / 30 (45.0)          13.0 / 30 (43.3)        13.5 / 30 (45.0)
+ Laplace-integral 0     26.0 / 30 (86.7)       29.0 / 30 (96.7)           28.0 / 30 (93.3)
+ Laplace-integral 1     25.0 / 30 (83.3)       29.0 / 30 (96.7)           22.0 / 30 (73.3)
+ ODE                     7.0 / 54 (13.0)         11.0 / 54 (20.4)        14.0 / 54 (25.9)
+ Polynomial roots       12.0 / 63 (19.0)       22.0 / 63 (34.9)           15.0 / 63 (23.8)
+ Nondim-symbolic       65.0 / 65 (100.0)       65.0 / 65 (100.0)         65.0 / 65 (100.0)
+ Nondim-numeric         59.0 / 60 (98.3)       60.0 / 60 (100.0)          59.0 / 60 (98.3)
+ Overall               220.0 / 362 (60.8)    243.5 / 362 (67.3)          231.0 / 362 (63.8)
+
+
+
+
+Table 19: Qwen3 GSM8K and MMLU capability checks. These appendix results are
+intended as coarse capability-preservation checks rather than main steering results.
+           Benchmark   Model            Trait/Bank   Plain   Prompt      CAA     Ours
+           GSM8K       Qwen3-30B-A3B    Warm         0.975      0.960    0.970   0.960
+           GSM8K       Qwen3-30B-A3B    Formal       0.970      0.960    0.970   0.955
+           GSM8K       Qwen3-30B-A3B    Direct       0.970      0.950    0.975   0.950
+           GSM8K       Qwen3-30B-A3B    Careful      0.970      0.945    0.955   0.945
+           GSM8K       Qwen3-30B-A3B    Curt         0.970      0.910    0.955   0.955
+           GSM8K       Qwen3-30B-A3B    Anxious      0.970      0.935    0.965   0.940
+           MMLU        Qwen3-30B-A3B    Warm         0.768      0.772    0.772   0.772
+           MMLU        Qwen3-30B-A3B    Formal       0.768      0.718    0.768   0.768
+           MMLU        Qwen3-30B-A3B    Direct       0.768      0.784    0.768   0.764
+           MMLU        Qwen3-30B-A3B    Careful      0.768      0.756    0.768   0.768
+           MMLU        Qwen3-30B-A3B    Curt         0.768      0.776    0.768   0.764
+           MMLU        Qwen3-30B-A3B    Anxious      0.768      0.706    0.768   0.764
+
+
+
+
+                                            29
+Table 20: Representative mechanistic routing examples. Bank masses are averaged
+over selected attention units in selector diagnostic traces. Target/ref slots are latent KV
+slots. Selected units are heads for standard attention, or grouped-query KV units expanded
+to the corresponding query heads.
+Example           Selected layers      Slots (tar- Units Target mass Ref. mass Prompt mass
+                                       get/ref)
+Warm persistence 12, 14, 16, 18, 20,   498 / 0     24     0.911      0.000       0.089
+                 22
+Formal           12, 14, 16, 18, 20,   474 / 0     24     0.911      0.000       0.089
+persistence      22
+Dismissive→Anxious
+                 16, 18, 20, 24, 26,   480 / 432   20     0.685      0.126       0.190
+                 32
+
+
+
+
+                                             30
+G     Technical derivations
+G.1   Bank-mixture derivation
+Let Ib index the slots belonging to bank b. Concatenated attention with bank-specific slot
+bias gives
+                                               (b)    (b)
+                             (b)         exp(st,m + ct )
+                           αet,m = P P              (b′ )  (b′ )
+                                                                 .
+                                     b′  r∈Ib′ exp(st,r + ct )
+Factor the numerator as
+                                                                                 (b)
+                                                              !
+                    (b)    (b)
+                                          X           (b)               exp(st,m )              (b)
+               exp(st,m + ct ) =                 exp(st,r )       P               (b)
+                                                                                           exp(ct ).
+                                          r∈Ib                          r∈Ib exp(st,r )
+
+Define the within-bank softmax
+                                                                  (b)
+                                          (b)            exp(st,m )
+                                         αt,m = P                (b)
+                                                       r∈Ib exp(st,r )
+
+and bank evidence
+                                     (b)                          (b)          (b)
+                                                  X
+                                   βet = log               exp(st,r ) + ct .
+                                                  r∈Ib
+       (b)   (b) (b)
+Then α
+     et,m = πt αt,m , where
+                                                                (b)
+                                           (b)         exp(βet )
+                                         πt      =P                    .
+                                                              e(b′ ) )
+                                                        ′ exp(β
+                                                       b            t
+Therefore
+                                   (b)                     (b)           (b)                 (b) (b)
+                       X X                       X             X                       X
+               o⋆t =              α     (b)
+                                  et,m vm   =          πt                     (b)
+                                                                        αt,m vm   =        π t ot .
+                       b   m∈Ib                    b          m∈Ib                     b
+
+Subtracting log Mb from each bank evidence gives the size-normalized version in Eq. (5).
+
+G.2   RoPE derivation
+With RoPE, a prompt score between query position t and key position j is
+                                    ⟨Rt q̄t , Rj k̄j ⟩   ⟨q̄t , Rj−t k̄j ⟩
+                                         √             =        √          .
+                                             dh                   dh
+For a canonical key k̃m , assigning virtual relative phase δm gives
+                                  ⟨Rt−1 qt , Rδm k̃m ⟩   ⟨q̄t , Rδm k̃m ⟩
+                                         √             =        √         .
+                                            dh                    dh
+The memory score therefore depends on the chosen relative phase, not on the absolute
+position at which the bank was built. The default δm = 0 gives a position-agnostic reminder
+slot.
+
+
+
+
+                                                       31
+
