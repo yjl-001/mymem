@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import os
 from typing import Optional, Literal, Set
@@ -11,6 +11,12 @@ from transformers.generation.utils import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 
+from memgen.model.augmentation_strategy import (
+    CANDIDATE_SINK_THRESHOLD,
+    SEQUENCE_SINK_THRESHOLD,
+    InferenceInsertionPoint,
+    query_index_for_insertion_point,
+)
 from memgen.model.trigger import MemGenTrigger
 from memgen.model.weaver import MemGenWeaver
 from memgen.utils import (
@@ -177,8 +183,38 @@ class MemGenGenerationMixin(GenerationMixin):
             delimiter_token_ids.update(ids)
         return delimiter_token_ids
 
-    def _check_ends_with_delimiter(
+    def _check_ends_with_delimiter_legacy_text(
         self, input_ids: torch.Tensor, tokenizer, delimiters: list[str]
+    ) -> torch.Tensor:
+        """复现 93d7747 之前的字符级 delimiter 判断，供 A/B 评测使用。
+
+        该实现刻意保留旧版语义：直接 ``batch_decode`` 整行 token ids，再判断
+        解码文本是否以任一 delimiter 结束。它不跳过 padding，也不使用 token-id
+        快速路径；因此可能与当前 token 级实现得到不同的候选增强位置。
+
+        注意：此函数默认不在任何生成路径中调用。若要做 legacy A/B，请只把目标
+        调用点的函数名替换为本函数，当前 ``_check_ends_with_delimiter`` 保持不变。
+        """
+        batch_size = input_ids.size(0)
+        augmentation_decisions = torch.zeros(
+            batch_size, 1, dtype=torch.bool, device=input_ids.device
+        )
+
+        # Exact historical mechanism: decode each full padded row, then use text endswith.
+        decoded_inputs = tokenizer.batch_decode(input_ids)
+        for index, decoded_input in enumerate(decoded_inputs):
+            augmentation_decisions[index] = any(
+                decoded_input.endswith(delimiter) for delimiter in delimiters
+            )
+
+        return augmentation_decisions
+
+    def _check_ends_with_delimiter(
+        self,
+        input_ids: torch.Tensor,
+        tokenizer,
+        delimiters: list[str],
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """检查每个序列的最后一个有效 token 是否以 delimiter 结尾。
 
@@ -191,8 +227,17 @@ class MemGenGenerationMixin(GenerationMixin):
 
         # 获取最后一个有效 token (跳过 padding)。
         # 左 padding 时有效 token 在序列右侧，不能用 mask.sum()-1 推最后位置。
-        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-        mask = input_ids != pad_token_id
+        if attention_mask is not None:
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError(
+                    "delimiter attention_mask must match input_ids: "
+                    f"input_ids={tuple(input_ids.shape)}, "
+                    f"attention_mask={tuple(attention_mask.shape)}"
+                )
+            mask = attention_mask.bool()
+        else:
+            pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+            mask = input_ids != pad_token_id
         positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
         masked_positions = torch.where(mask, positions, torch.full_like(positions, -1))
         last_positions = masked_positions.max(dim=1).values.clamp(min=0)
@@ -237,70 +282,302 @@ class MemGenGenerationMixin(GenerationMixin):
 
         return is_delimiter.unsqueeze(1)
     
-    def _select_augment_points_after_delimiter(
+    def _find_prompt_augment_idx(
         self,
         input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        tokenizer: PreTrainedTokenizerBase,
+    ) -> int:
+        """找到当前单轮样本唯一有效的 prompt -> completion 边界。"""
+
+        if input_ids.shape != labels.shape:
+            raise ValueError("input_ids and labels must have the same shape")
+        assert input_ids.shape == labels.shape
+        batch_size, seq_len = input_ids.shape
+        prompt_boundary_candidates = []
+        for index in range(1, seq_len):
+            if (
+                (labels[:, index] != -100).all().item()
+                and (labels[:, index - 1] == -100).all().item()
+            ):
+                prompt_boundary_candidates.append(index)
+
+        if not prompt_boundary_candidates:
+            logging.error("No prompt augment boundary found for augmentation point selection")
+            logging.error("Batch size=%d, seq_len=%d", batch_size, seq_len)
+            for batch_index in range(batch_size):
+                logging.error(
+                    "Sample %d decoded text:\n%s",
+                    batch_index,
+                    tokenizer.decode(
+                        input_ids[batch_index].tolist(),
+                        skip_special_tokens=False,
+                    ),
+                )
+            raise ValueError("Single-turn forward requires at least one prompt augment boundary")
+
+        return prompt_boundary_candidates[0]
+
+    def _collect_inference_insertion_points(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        delimiters: list[str],
+        tokenizer: PreTrainedTokenizerBase,
+        prompt_augment_idx: int,
+        requires_delimiter_flags: bool,
+    ) -> list[InferenceInsertionPoint]:
+        """收集 completion 中所有连续监督 token 之间的可插入位置。"""
+
+        if not (input_ids.shape == attention_mask.shape == labels.shape):
+            raise ValueError("input_ids, attention_mask and labels must have the same shape")
+        if input_ids.size(0) != 1:
+            raise ValueError("Weaver insertion-point collection requires per-sample forward")
+
+        points = []
+        for index in range(prompt_augment_idx + 1, input_ids.size(1)):
+            if (
+                (labels[:, index] != -100).all().item()
+                and (labels[:, index - 1] != -100).all().item()
+            ):
+                is_delimiter = False
+                if requires_delimiter_flags:
+                    is_delimiter = bool(
+                        self._check_ends_with_delimiter(
+                            input_ids[:, :index],
+                            tokenizer,
+                            delimiters,
+                            attention_mask=attention_mask[:, :index],
+                        ).item()
+                    )
+                points.append(
+                    InferenceInsertionPoint(index=index, is_delimiter=is_delimiter)
+                )
+        return points
+
+    @torch.no_grad()
+    def _score_first_key_attention(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        point_indices: list[int],
+        layer_window: int,
+    ) -> dict[int, float]:
+        """在 token-only reasoner 上计算插点前 query 对首个有效 key 的注意力。"""
+
+        if not point_indices:
+            return {}
+        if input_ids.shape != attention_mask.shape:
+            raise ValueError("input_ids and attention_mask must have the same shape")
+        if input_ids.size(0) != 1:
+            raise ValueError("Sink-aware Weaver scoring requires per-sample forward")
+        if layer_window < 0:
+            raise ValueError("sink_score_layer_window must be >= 0")
+
+        position_ids = self._generate_position_ids(attention_mask)
+        reasoner_was_training = self.reasoner.training
+        self.reasoner.eval()
+        try:
+            outputs = self.reasoner(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                output_attentions=True,
+                output_hidden_states=False,
+                use_cache=False,
+                return_dict=True,
+            )
+        finally:
+            self.reasoner.train(reasoner_was_training)
+
+        attentions = outputs.attentions
+        if not attentions or any(layer_attention is None for layer_attention in attentions):
+            raise RuntimeError(
+                "Sink-aware strategies require attention tensors; "
+                "load the reasoner with attn_implementation='eager'"
+            )
+
+        valid_positions = torch.nonzero(
+            attention_mask[0] != 0,
+            as_tuple=False,
+        ).flatten()
+        if valid_positions.numel() == 0:
+            raise ValueError("Cannot compute sink score for an empty sequence")
+        first_key = int(valid_positions[0].item())
+        selected_layers = attentions[-layer_window:] if layer_window > 0 else attentions
+
+        scores = {}
+        for point_index in point_indices:
+            query_index = query_index_for_insertion_point(point_index)
+            layer_scores = []
+            for layer_attention in selected_layers:
+                if query_index >= layer_attention.size(-2) or first_key >= layer_attention.size(-1):
+                    raise IndexError(
+                        f"Attention tensor cannot score insertion point {point_index}: "
+                        f"shape={tuple(layer_attention.shape)}"
+                    )
+                layer_scores.append(
+                    layer_attention[0, :, query_index, first_key].float().mean()
+                )
+            if not layer_scores:
+                raise RuntimeError("No attention layers were selected")
+            scores[point_index] = float(torch.stack(layer_scores).mean().item())
+        return scores
+
+    def _select_weaver_augmentation_points(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
         labels: torch.Tensor,
         delimiters: list[str],
         tokenizer: PreTrainedTokenizerBase,
         max_num: int = 10,
     ) -> list[int]:
-        """训练时选择 latent 插入点。
+        """由配置的策略选择 SFT prompt 与 inference latent 插入位置。"""
 
-        返回的 index 都是“在原始 input_ids 的该位置之前插入 latent”：
-        - 第一个 index: prompt augmentation 点，即第一个被监督 token 的位置；
-        - 后续 index: completion 内 delimiter 后的 inference augmentation 点。
+        if not (input_ids.shape == attention_mask.shape == labels.shape):
+            raise ValueError("input_ids, attention_mask and labels must have the same shape")
 
-        这里要求 batch 内同一列都被监督，保证一次插入可以对整批样本对齐。
-        """
+        strategy = self.weaver_insertion_strategy
+        prompt_augment_idx = self._find_prompt_augment_idx(input_ids, labels, tokenizer)
+        points = self._collect_inference_insertion_points(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            delimiters=delimiters,
+            tokenizer=tokenizer,
+            prompt_augment_idx=prompt_augment_idx,
+            requires_delimiter_flags=strategy.requires_delimiter_candidates,
+        )
 
-        assert input_ids.shape == labels.shape
-        B, seq_len = input_ids.size(0), input_ids.size(1)
+        if strategy.requires_sink_scores:
+            score_scope = (
+                [point for point in points if point.is_delimiter]
+                if strategy.requires_delimiter_candidates
+                else points
+            )
+            scores = self._score_first_key_attention(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                point_indices=[point.index for point in score_scope],
+                layer_window=strategy.config.sink_score_layer_window,
+            )
+            points = [
+                replace(point, sink_score=scores.get(point.index))
+                for point in points
+            ]
 
-        inference_augment_idx = []
+        inference_points = strategy.select(points, max_num=max_num)
+        augmentation_points = (
+            [prompt_augment_idx]
+            if self.config.max_prompt_aug_num > 0
+            else []
+        )
+        augmentation_points.extend(inference_points)
+        augmentation_points.sort()
 
-        # 仍然用原版语义寻找 prompt 边界：labels 从 -100 切换到 supervised 的位置。
-        # 但 completion 内部可能包含模型生成的 ChatML assistant header，随后会被
-        # _postprocess_assistant_labels mask 掉，形成额外的 -100 -> supervised 跳变。
-        # 这种额外跳变不是真实 prompt 边界，所以这里只取第一个边界作为 prompt augmentation 点。
-        prompt_boundary_candidates = []
-        for i in range(1, seq_len):
-            if (labels[:, i] != -100).all() and (labels[:, i - 1] == -100).all():
-                prompt_boundary_candidates.append(i)
+        selected_log_count = getattr(self, "_weaver_selected_log_count", 0)
+        if selected_log_count < 20:
+            selected_by_index = {point.index: point for point in points}
+            selected_summary = [
+                {
+                    "index": point_index,
+                    "score": (
+                        None
+                        if selected_by_index[point_index].sink_score is None
+                        else round(float(selected_by_index[point_index].sink_score), 4)
+                    ),
+                }
+                for point_index in inference_points
+            ]
+            logging.info(
+                "[WeaverSelected] strategy=%s prompt=%s inference=%s",
+                strategy.config.name,
+                prompt_augment_idx if self.config.max_prompt_aug_num > 0 else None,
+                selected_summary,
+            )
+            self._weaver_selected_log_count = selected_log_count + 1
+        return augmentation_points
 
-        if len(prompt_boundary_candidates) == 0:
-            logging.error("❌ No prompt augment boundary found for augmentation point selection")
-            logging.error("Batch size = %d, seq_len = %d", B, seq_len)
-            for b in range(B):
-                logging.error("---- Sample %d ----", b)
-                logging.error("Decoded text:\n%s", tokenizer.decode(input_ids[b].tolist(), skip_special_tokens=False))
-            raise ValueError("Single-turn forward requires at least one prompt augment boundary")
+    def _select_augment_points_after_delimiter(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        delimiters: list[str],
+        tokenizer: PreTrainedTokenizerBase,
+        max_num: int = 10,
+    ) -> list[int]:
+        """旧函数名的兼容入口。"""
 
-        prompt_augment_idx = prompt_boundary_candidates[0]
+        return self._select_weaver_augmentation_points(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            delimiters=delimiters,
+            tokenizer=tokenizer,
+            max_num=max_num,
+        )
 
-        for i in range(prompt_augment_idx + 1, seq_len):
-            # Detect valid label regions for inference augmentation.
-            # Masked gaps inside completions can occur when generated ChatML markers
-            # are hidden from loss; they must not create extra prompt boundaries.
-            if (labels[:, i] != -100).all() and (labels[:, i - 1] != -100).all():
-                batch_tokens_before_i = input_ids[:, :i]
-                # Fast token-level check (no decode)
-                if self._check_ends_with_delimiter(batch_tokens_before_i, tokenizer, delimiters).any():
-                    inference_augment_idx.append(i)
+    @torch.no_grad()
+    def _online_sink_augment_decision(
+        self,
+        input_ids: torch.Tensor,
+        token_attention_mask: torch.Tensor,
+        sentence_augment_count: torch.Tensor,
+    ) -> tuple[torch.LongTensor, float | None]:
+        """对当前 token-only prefix 执行在线 threshold + budget 决策。"""
 
-        final_points = [prompt_augment_idx]
+        if input_ids.shape != token_attention_mask.shape:
+            raise ValueError("token_attention_mask must match input_ids")
+        if input_ids.size(0) != 1:
+            raise ValueError("Sink-aware generation currently requires batch_size=1")
 
-        # Limit the number of inference augmentation points to max_num
-        if len(inference_augment_idx) > max_num: 
-            inference_augment_idx = inference_augment_idx[:max_num]
+        decision = torch.full(
+            (1,),
+            fill_value=-100,
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        max_augment_num = int(self.config.max_inference_aug_num)
+        if (
+            max_augment_num <= 0
+            or int(sentence_augment_count[0].item()) >= max_augment_num
+        ):
+            return decision, None
 
-        final_points.extend(inference_augment_idx)
-        
-        if len(final_points) == 0:
-            raise RuntimeError("No valid augmentation points found")
-        
-        final_points.sort()
-        return final_points
+        strategy = self.weaver_insertion_strategy
+        if strategy.config.name == CANDIDATE_SINK_THRESHOLD:
+            is_candidate = bool(
+                self._check_ends_with_delimiter(
+                    input_ids,
+                    self.tokenizer,
+                    self.delimiters,
+                    attention_mask=token_attention_mask,
+                )[0, 0].item()
+            )
+        elif strategy.config.name == SEQUENCE_SINK_THRESHOLD:
+            is_candidate = True
+        else:
+            raise ValueError(
+                "Online sink decision requires a sink-aware strategy, got "
+                f"{strategy.config.name!r}"
+            )
+
+        if not is_candidate:
+            return decision, None
+
+        insertion_point = input_ids.size(1)
+        score_by_point = self._score_first_key_attention(
+            input_ids=input_ids,
+            attention_mask=token_attention_mask,
+            point_indices=[insertion_point],
+            layer_window=strategy.config.sink_score_layer_window,
+        )
+        sink_score = float(score_by_point[insertion_point])
+        decision[0] = int(sink_score > strategy.config.sink_score_threshold)
+        return decision, sink_score
 
     @torch.no_grad()
     def _should_augment(
@@ -339,7 +616,7 @@ class MemGenGenerationMixin(GenerationMixin):
             attention_mask = (input_ids != tokenizer.pad_token_id).long()
             position_ids = self._generate_position_ids(attention_mask)
             aug_vector = torch.full((batch_size,), -100, dtype=torch.long, device=input_ids.device)
-            ends_with_delimiters = self._check_ends_with_delimiter(input_ids, tokenizer, delimiters).squeeze(1)
+            ends_with_delimiters = self._check_ends_with_delimiter_legacy_text(input_ids, tokenizer, delimiters).squeeze(1)
             aug_vector[ends_with_delimiters] = 0
             over_limit = (sentence_augment_count >= max_augment_num)
             aug_vector[over_limit] = -100
@@ -485,6 +762,9 @@ class MemGenGenerationMixin(GenerationMixin):
                     continue
 
                 if is_augment_point == 1 or is_augment_point == 0:
+                    # sequence_sink_threshold 明确允许非 delimiter 插入。
+                    if not self.weaver_insertion_strategy.requires_delimiter_candidates:
+                        continue
                     prefix_input_ids = input_ids[b, :i].unsqueeze(0)
 
                     ends_with_delimiter = self._check_ends_with_delimiter(

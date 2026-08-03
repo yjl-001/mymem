@@ -1,10 +1,15 @@
 import argparse
 from datetime import datetime
+import json
 import os
 import random
+import socket
+import subprocess
+import sys
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from common.config import Config
 from common.logger import setup_logger
@@ -37,6 +42,10 @@ def parse_args():
 
     parser.add_argument("--cfg-path", required=True, help="path to configuration file.")
     parser.add_argument(
+        "--experiment-cfg",
+        help="optional experiment YAML containing overrides of --cfg-path.",
+    )
+    parser.add_argument(
         "--options",
         nargs="+",
         help="override some settings in the used config, the key-value pair "
@@ -59,7 +68,8 @@ def build_working_dir(config: Config) -> str:
     mode = config.run_cfg.mode
     dataset_name = config.dataset_cfg.name
     model_name = config.model_cfg.model_name.split("/")[1]
-    parent_dir = os.path.join(".cache", mode, dataset_name, model_name)
+    output_root = os.environ.get("MEMGEN_OUTPUT_ROOT", ".cache")
+    parent_dir = os.path.join(output_root, mode, dataset_name, model_name)
 
     # name: <prompt_aug_num>_<prompt_latents_len>_<inference_aug_num>_<inference_latents_len>_<timestamp>
     max_prompt_aug_num = config.model_cfg.max_prompt_aug_num
@@ -67,9 +77,55 @@ def build_working_dir(config: Config) -> str:
     max_inference_aug_num = config.model_cfg.max_inference_aug_num
     inference_latents_len = config.model_cfg.weaver.inference_latents_len
     time = datetime.now().strftime("%Y%m%d-%H%M%S")
-    working_dir = f"pn={max_prompt_aug_num}_pl={prompt_latents_len}_in={max_inference_aug_num}_il={inference_latents_len}_{time}" 
+    experiment_name = config.run_cfg.get("experiment_name", None)
+    if experiment_name:
+        # 文件系统安全的名称由启动器生成；这里仍做一层防御，避免路径穿越。
+        experiment_name = str(experiment_name).replace("/", "_").replace("\\", "_")
+        prefix = f"{experiment_name}__"
+    else:
+        prefix = ""
+    working_dir = f"{prefix}pn={max_prompt_aug_num}_pl={prompt_latents_len}_in={max_inference_aug_num}_il={inference_latents_len}_{time}"
 
     return os.path.join(parent_dir, working_dir)
+
+
+def _git_value(*args: str) -> str | None:
+    """Best-effort Git metadata; source archives may not contain a .git directory."""
+    try:
+        return subprocess.check_output(
+            ["git", *args], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def write_run_manifest(working_dir: str, config: Config, args) -> None:
+    """Save the exact resolved setup once per distributed launch.
+
+    A checkpoint alone cannot identify the code/configuration that produced it.
+    These small text files deliberately live beside every train/evaluate output.
+    """
+    if int(os.environ.get("RANK", "0")) != 0:
+        return
+
+    os.makedirs(working_dir, exist_ok=True)
+    OmegaConf.save(config.get_config(), os.path.join(working_dir, "resolved_config.yaml"))
+
+    manifest = {
+        "created_at": datetime.now().astimezone().isoformat(),
+        "hostname": socket.gethostname(),
+        "python": sys.version,
+        "argv": sys.argv,
+        "base_config": os.path.abspath(args.cfg_path),
+        "experiment_config": (
+            os.path.abspath(args.experiment_cfg) if args.experiment_cfg else None
+        ),
+        "git_commit": _git_value("rev-parse", "HEAD"),
+        "git_branch": _git_value("branch", "--show-current"),
+        "git_dirty": bool(_git_value("status", "--porcelain")),
+    }
+    with open(os.path.join(working_dir, "run_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
 
 def main():
     """命令行入口：配置 -> 数据 -> 模型 -> Runner -> train/evaluate。"""
@@ -81,6 +137,7 @@ def main():
     
     # set up working directory
     working_dir = build_working_dir(config)
+    write_run_manifest(working_dir, config, args)
     
     # set up logger
     config.run_cfg.log_dir = os.path.join(working_dir, "logs")

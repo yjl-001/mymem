@@ -1,0 +1,33 @@
+# Evaluate a particular checkpoint by supplying its absolute path at launch:
+#   python scripts/launch_experiment.py eval configs/experiments/kodcode/eval.yaml \
+#       --set model.load_model_path=/mnt/memgen/checkpoints/<run>/model
+base_cfg_path: configs/latent_memory/kodcode.yaml
+
+launcher:
+  accelerate_config: configs/zero2.yaml
+  cuda_visible_devices: "0"
+  num_processes: 1
+
+model:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  attn_implementation: flash_attention_2
+  load_model_path: null
+  max_prompt_aug_num: 1
+  max_inference_aug_num: 5
+  weaver:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    prompt_latents_len: 8
+    inference_latents_len: 8
+  trigger:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    active: false
+
+dataset:
+  mode: sft
+
+run:
+  mode: evaluate
+  interaction:
+    batch_size: 4
+    temperature: 0.0
+    max_response_length: 1024

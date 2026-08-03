@@ -11,7 +11,18 @@ class Config:
 
         user_config = self._build_opt_list(self.args.options)   
 
-        config = OmegaConf.load(self.args.cfg_path)           
+        config = OmegaConf.load(self.args.cfg_path)
+
+        # 实验配置只包含相对基线配置的差异，避免为每个实验复制整份
+        # dataset/model/run YAML。命令行 --options 的优先级最高，便于在
+        # 不改动已提交配置的情况下做少量 sweep。
+        experiment_cfg_path = getattr(self.args, "experiment_cfg", None)
+        if experiment_cfg_path:
+            experiment_config = OmegaConf.load(experiment_cfg_path)
+            experiment_config.pop("base_cfg_path", None)
+            experiment_config.pop("launcher", None)
+            config = OmegaConf.merge(config, experiment_config)
+
         runner_config = self.build_runner_config(config, **user_config)
         model_config = self.build_model_config(config, **user_config)
         dataset_config = self.build_dataset_config(config, **user_config)

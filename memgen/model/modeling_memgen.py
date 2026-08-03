@@ -14,6 +14,10 @@ from transformers import (
 )
 from transformers.modeling_utils import PreTrainedModel
 
+from memgen.model.augmentation_strategy import (
+    WeaverInsertionStrategyConfig,
+    build_weaver_insertion_strategy,
+)
 from memgen.model.configuration_memgen import MemGenConfig
 from memgen.model.modeling_utils import (
     MemGenOutputWithPast,
@@ -85,6 +89,14 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         # 训练/生成都只在这些“句子边界感较强”的位置考虑插 latent。
         self.delimiters: list[str] = [",", ".", "\n"]  
 
+        self.weaver_insertion_strategy = build_weaver_insertion_strategy(
+            config.weaver_insertion_strategy
+        )
+        logging.info(
+            "Weaver insertion strategy: %s",
+            self.weaver_insertion_strategy.config.to_dict(),
+        )
+
         # forward 第一次看到数据时决定是 single-turn 还是 conversation。
         # 后续 batch 复用这个状态，避免每次重新推断。
         self.state = None
@@ -152,8 +164,13 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         # select augment idx.
         # augmentation_indices 存的是“在原始 token 序列的哪个 index 前插入 latent”。
         # 第一个点一定是 prompt augmentation；后续点是 inference augmentation。
-        augmentation_indices = self._select_augment_points_after_delimiter(
-            input_ids, labels, delimiters, tokenizer, max_augment_num
+        augmentation_indices = self._select_weaver_augmentation_points(
+            input_ids,
+            attention_mask,
+            labels,
+            delimiters,
+            tokenizer,
+            max_augment_num,
         )
         
         # origin inputs embeds: (B, L_origin, H_reasoner)
@@ -551,6 +568,25 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         inputs_embeds = reasoner.get_input_embeddings()(input_ids)
         B, _, hidden_size = inputs_embeds.shape
         device = inputs_embeds.device
+        sink_aware_generation = bool(
+            getattr(generation_config, "sink_aware_generation", False)
+        )
+        use_online_sink = (
+            sink_aware_generation
+            and self.weaver_insertion_strategy.requires_sink_scores
+        )
+        if (
+            sink_aware_generation
+            and not self.weaver_insertion_strategy.requires_sink_scores
+        ):
+            raise ValueError(
+                "sink_aware_generation=True requires "
+                "candidate_sink_threshold or sequence_sink_threshold"
+            )
+        if use_online_sink and B != 1:
+            raise ValueError(
+                "Sink-aware generation currently requires interaction.batch_size=1"
+            )
         
         # --- generation loop state ---
         # current_inputs_embeds 里包含真实 token embedding 和可能插入的 latent embedding；
@@ -559,6 +595,8 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         current_attention_mask = attention_mask
         current_position_ids = self._generate_position_ids(current_attention_mask)
         current_input_ids = input_ids
+        # 只跟踪真实 token；current_attention_mask 后续还会包含 latent。
+        current_token_attention_mask = attention_mask.clone()
         current_cache: DynamicCache = None
 
         # Generation Loop Initialization.
@@ -576,13 +614,48 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
             assert current_inputs_embeds.shape[:2] == current_attention_mask.shape == current_position_ids.shape
             # 第 0 步总是 prompt 级候选；之后只有当前前缀以 delimiter 结尾才会成为候选。
             # 返回值语义：-100=非候选，0=候选但不插，1=候选且插入。
-            augment_decision = self._should_augment(
-                current_input_ids, 
-                sentence_augment_count=sentence_augment_count, 
-                do_sample=trigger_do_sample,
-                temperature=generation_config.temperature,
-                is_prompt=(i==0)  
-            )
+            sink_score = None
+            if i == 0:
+                if self.config.max_prompt_aug_num > 0:
+                    augment_decision = self._should_augment(
+                        current_input_ids,
+                        sentence_augment_count=sentence_augment_count,
+                        do_sample=trigger_do_sample,
+                        temperature=generation_config.temperature,
+                        is_prompt=True,
+                    )
+                else:
+                    augment_decision = torch.full(
+                        (B,),
+                        fill_value=invalid_token_id,
+                        dtype=torch.long,
+                        device=device,
+                    )
+            elif use_online_sink:
+                augment_decision, sink_score = self._online_sink_augment_decision(
+                    input_ids=current_input_ids,
+                    token_attention_mask=current_token_attention_mask,
+                    sentence_augment_count=sentence_augment_count,
+                )
+            else:
+                augment_decision = self._should_augment(
+                    current_input_ids,
+                    sentence_augment_count=sentence_augment_count,
+                    do_sample=trigger_do_sample,
+                    temperature=generation_config.temperature,
+                    is_prompt=False,
+                )
+
+            if sink_score is not None:
+                logging.info(
+                    "[SinkGenerate] step=%d score=%.4f threshold=%.4f insert=%s count=%d/%d",
+                    i,
+                    sink_score,
+                    self.weaver_insertion_strategy.config.sink_score_threshold,
+                    bool(augment_decision[0].item() == 1),
+                    int(sentence_augment_count[0].item()),
+                    max_augment_num,
+                )
             augmentation_pos[:, i] = augment_decision
             augment_indices = torch.where(augment_decision == 1)[0]
 
@@ -697,6 +770,19 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                 do_sample=weaver_do_sample,
                 temperature=generation_config.temperature
             )
+            next_token_mask = torch.ones(
+                (B, 1),
+                dtype=current_token_attention_mask.dtype,
+                device=current_token_attention_mask.device,
+            )
+            current_token_attention_mask = torch.cat(
+                [current_token_attention_mask, next_token_mask],
+                dim=1,
+            )
+            if current_token_attention_mask.shape != current_input_ids.shape:
+                raise RuntimeError(
+                    "token-only attention mask drifted from generated input_ids"
+                )
             current_cache = outputs.past_key_values
 
             # If all sequences in the batch have already generated an EOS token, stop early.
@@ -736,6 +822,11 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         """
         # base LLM
         model_name = config_dict.get("model_name")
+        attn_implementation = config_dict.get(
+            "attn_implementation",
+            "flash_attention_2",
+        )
+        load_model_path = config_dict.get("load_model_path", None)
 
         # max augment numbers
         max_prompt_aug_num = config_dict.get("max_prompt_aug_num", 1) # 对 prompt 增强次数
@@ -747,6 +838,7 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         inference_latents_len = weaver_config.get("inference_latents_len", 8)
         weaver_lora_config_dict = weaver_config.get("lora_config", None) # weaver LoRA 配置
         weaver_model_name = weaver_config.get("model_name", None) # weaver LoRA 的底座
+        runtime_insertion_strategy = weaver_config.get("insertion_strategy", None)
 
         # trigger configs
         trigger_config = config_dict.get("trigger", {})
@@ -754,33 +846,63 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         trigger_lora_config_dict = trigger_config.get("lora_config", None) # trigger LoRA 配置
         trigger_model_name = trigger_config.get("model_name", None) # trigger LoRA 的底座
 
-        # build MemGenConfig.
-        # 先从 HF 原始 config 继承 vocab/hidden/layer 等基础字段，
-        # 再追加 MemGen 特有的 latent 长度、增强次数和 LoRA 配置。
-        from transformers import AutoConfig
-        memgen_config = AutoConfig.from_pretrained(model_name)
-        memgen_config = MemGenConfig.from_pretrained(
-            model_name, 
-            max_prompt_aug_num=max_prompt_aug_num,
-            max_inference_aug_num=max_inference_aug_num,
-            prompt_latents_len=prompt_latents_len,
-            inference_latents_len=inference_latents_len,
-            weaver_lora_config=weaver_lora_config_dict,
-            trigger_active=trigger_active,
-            trigger_lora_config=trigger_lora_config_dict
+        # checkpoint 决定 latent/LoRA 结构；运行配置允许覆盖预算、Trigger 开关和策略。
+        if load_model_path:
+            memgen_config = MemGenConfig.from_pretrained(load_model_path)
+            strategy_source = (
+                runtime_insertion_strategy
+                if runtime_insertion_strategy is not None
+                else getattr(memgen_config, "weaver_insertion_strategy", None)
+            )
+        else:
+            memgen_config = MemGenConfig.from_pretrained(model_name)
+            memgen_config.prompt_latents_len = prompt_latents_len
+            memgen_config.inference_latents_len = inference_latents_len
+            memgen_config.weaver_lora_config = weaver_lora_config_dict
+            memgen_config.trigger_lora_config = trigger_lora_config_dict
+            strategy_source = runtime_insertion_strategy
+
+        weaver_insertion_strategy = WeaverInsertionStrategyConfig.from_mapping(
+            strategy_source
+        )
+        memgen_config.max_prompt_aug_num = max_prompt_aug_num
+        memgen_config.max_inference_aug_num = max_inference_aug_num
+        memgen_config.trigger_active = trigger_active
+        memgen_config.weaver_insertion_strategy = (
+            weaver_insertion_strategy.to_dict()
+        )
+        logging.info(
+            "Resolved Weaver insertion strategy: %s",
+            memgen_config.weaver_insertion_strategy,
         )
         
         # load pretrained base models.
         # 三份模型物理上独立，方便分别冻结/打开 LoRA；dtype 与训练配置保持 bf16。
         base_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        reasoner_base_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
-        weaver_base_model = AutoModelForCausalLM.from_pretrained(weaver_model_name, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
-        trigger_base_model = AutoModelForCausalLM.from_pretrained(trigger_model_name, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+        load_kwargs = {
+            "torch_dtype": torch.bfloat16,
+            "attn_implementation": attn_implementation,
+        }
+        reasoner_load_kwargs = dict(load_kwargs)
+        if weaver_insertion_strategy.requires_sink_scores:
+            reasoner_load_kwargs["attn_implementation"] = "eager"
+            logging.info(
+                "Sink-aware strategy enabled; loading reasoner with eager attention"
+            )
+        reasoner_base_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            **reasoner_load_kwargs,
+        )
+        weaver_base_model = AutoModelForCausalLM.from_pretrained(
+            weaver_model_name,
+            **load_kwargs,
+        )
+        trigger_base_model = AutoModelForCausalLM.from_pretrained(
+            trigger_model_name,
+            **load_kwargs,
+        )
         
         # instantiate MemGen Model.
-        # load_model_path 为空表示从底座模型开始训练；非空表示恢复 MemGen checkpoint。
-        load_model_path = config_dict.get("load_model_path", None)
-        
         if not load_model_path:
             model = cls(
                 config=memgen_config, 

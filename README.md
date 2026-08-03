@@ -71,6 +71,13 @@ If you prefer to evaluate the vanilla model instead of MemGen, simply modify `me
 ## ▶️ How to Run
 MemGen consists of **two modules**: *Weaver* and *Trigger*. We follow a two-stage training approach, training each module separately.
 
+### Versioned local-to-server experiments
+
+For development on a local machine and reproducible server-side training, see
+[the experiment workflow](docs/experiment_workflow.md). It provides a unified
+launcher based on versioned YAML experiment files, explicit checkpoint paths,
+and automatic snapshots of the resolved parameters and Git commit.
+
 If you would like to reproduce results for a specific dataset + model, please refer to the table above. If the corresponding checkpoint is not yet available, we kindly ask for your patience as we are actively preparing more comprehensive releases.
 
 ### Weaver Model

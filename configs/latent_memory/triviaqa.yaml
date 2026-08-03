@@ -1,6 +1,7 @@
 model: 
   # base llm
   model_name: Qwen/Qwen2.5-1.5B-Instruct
+  attn_implementation: flash_attention_2
   load_model_path: null
   
   # max prompt/inference augmentation num
@@ -12,6 +13,11 @@ model:
     model_name: Qwen/Qwen2.5-1.5B-Instruct
     prompt_latents_len: 8
     inference_latents_len: 8
+
+    insertion_strategy:
+      name: first_k
+      sink_score_threshold: 0.3
+      sink_score_layer_window: 4
     
     lora_config:
       r: 16
@@ -170,3 +176,4 @@ run:
     batch_size: 8
     weaver_do_sample: False
     trigger_do_sample: False
+    sink_aware_generation: False

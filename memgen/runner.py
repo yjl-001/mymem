@@ -527,4 +527,15 @@ class MemGenRunner:
             output_dir=os.path.join(self.working_dir, "evaluate"),
             weaver_do_sample=interaction_configs.get("weaver_do_sample", False),
             trigger_do_sample=interaction_configs.get("trigger_do_sample", False),
+            sink_aware_generation=interaction_configs.get(
+                "sink_aware_generation",
+                False,
+            ),
         )
+        if (
+            self.interaction_config.sink_aware_generation
+            and self.interaction_config.batch_size != 1
+        ):
+            raise ValueError(
+                "Sink-aware generation requires run.interaction.batch_size=1"
+            )

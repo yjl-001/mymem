@@ -23,6 +23,7 @@ class InteractionConfig:
     output_dir: Optional[str] = None
     weaver_do_sample: bool = False
     trigger_do_sample: bool = False
+    sink_aware_generation: bool = False
 
 @dataclass
 class InteractionDataProto:
@@ -70,8 +71,14 @@ class InteractionManager(ABC):
         )
         self.generation_config.weaver_do_sample = self.config.weaver_do_sample
         self.generation_config.trigger_do_sample = self.config.trigger_do_sample
+        self.generation_config.sink_aware_generation = self.config.sink_aware_generation
 
-        logging.info(f"Weaver do sample: {self.generation_config.weaver_do_sample}, Trigger do sample: {self.generation_config.trigger_do_sample}")
+        logging.info(
+            "Weaver do sample: %s, Trigger do sample: %s, Sink-aware generation: %s",
+            self.generation_config.weaver_do_sample,
+            self.generation_config.trigger_do_sample,
+            self.generation_config.sink_aware_generation,
+        )
     
     @abstractmethod
     def run_agent_loop(self, gen_batch: InteractionDataProto) -> InteractionDataProto:
