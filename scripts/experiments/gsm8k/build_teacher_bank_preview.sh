@@ -25,6 +25,7 @@ python scripts/build_teacher_bank.py \
   --split train \
   --limit 5 \
   --model "${DEEPSEEK_MODEL:-deepseek-v4-pro}" \
+  --thinking "${DEEPSEEK_THINKING:-disabled}" \
   --output "$OUTPUT_PATH"
 
 echo "Preview bank: $OUTPUT_PATH"

@@ -24,7 +24,7 @@ from urllib import error, request
 
 
 PROMPT_VERSION = "teacher-bank-v1"
-DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
+DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-pro"
 
 
@@ -56,6 +56,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=900)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument(
+        "--thinking",
+        choices=("enabled", "disabled"),
+        default="disabled",
+        help=(
+            "DeepSeek thinking mode. JSON-mode requests default to disabled because some "
+            "providers occasionally return an empty final content field in thinking mode."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -155,6 +164,8 @@ generic counter-pattern and do not claim that it was observed in this episode.""
 
 
 def parse_json_payload(content: str) -> dict[str, Any]:
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Teacher returned an empty final content field")
     cleaned = content.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.split("\n", 1)[1]
@@ -168,7 +179,7 @@ def parse_json_payload(content: str) -> dict[str, Any]:
 
 def call_teacher(
     *, base_url: str, api_key: str, model: str, messages: list[dict[str, str]],
-    max_tokens: int, temperature: float, retries: int,
+    max_tokens: int, temperature: float, retries: int, thinking: str,
 ) -> dict[str, Any]:
     endpoint = base_url.rstrip("/") + "/chat/completions"
     body = json.dumps(
@@ -178,6 +189,7 @@ def call_teacher(
             "temperature": temperature,
             "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
+            "thinking": {"type": thinking},
         }
     ).encode("utf-8")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -192,6 +204,11 @@ def call_teacher(
         except (error.HTTPError, error.URLError, KeyError, IndexError, ValueError) as exc:
             if attempt == retries:
                 raise RuntimeError(f"Teacher API failed after {retries} attempts: {exc}") from exc
+            print(
+                f"[teacher-bank] API attempt {attempt}/{retries} failed: {exc}; retrying...",
+                file=sys.stderr,
+                flush=True,
+            )
             time.sleep(2 ** (attempt - 1))
     raise AssertionError("unreachable")
 
@@ -222,6 +239,7 @@ def main() -> None:
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
                 retries=args.retries,
+                thinking=args.thinking,
             )
             record = {
                 "schema_version": "teacher-bank-record-v1",

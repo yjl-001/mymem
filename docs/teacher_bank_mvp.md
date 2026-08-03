@@ -13,6 +13,10 @@ Configure `DEEPSEEK_API_KEY` in the untracked
 bash scripts/experiments/gsm8k/build_teacher_bank_preview.sh
 ```
 
+Set `DEEPSEEK_BASE_URL="https://api.deepseek.com"`. The preview defaults to
+`DEEPSEEK_THINKING="disabled"` so that the API returns a reliable final JSON
+payload; this bank-building task does not need a visible chain-of-thought.
+
 The script reads five **GSM8K train** examples and writes one JSON object per
 line under `MEMGEN_OUTPUT_ROOT/banks/gsm8k/`. Each record contains a
 teacher-generated target and reference experience record.
