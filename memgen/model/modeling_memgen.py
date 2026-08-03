@@ -464,79 +464,6 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         return_entropy_gate_trace: bool = False,
         **kwargs
     ) -> Union[torch.LongTensor, tuple]:
-        
-        tokenizer = self.tokenizer
-        reasoner = self.reasoner
-        weaver = self.weaver
-        max_augment_num = self.config.max_inference_aug_num
-        invalid_token_id = -100
-
-        # preproecess inputs
-        input_ids = input_ids.to(self.device)
-        attention_mask = attention_mask.to(self.device)
-        max_new_tokens = generation_config.max_new_tokens
-        pad_token_id = tokenizer.pad_token_id
-        eos_token_id = tokenizer.eos_token_id
-        prompt_len = input_ids.size(1)
-
-        inputs_embeds = reasoner.get_input_embeddings()(input_ids)
-        B, _, hidden_size = inputs_embeds.shape
-        device = inputs_embeds.device
-        
-        # --- generation loop ---
-        current_inputs_embeds = inputs_embeds
-        current_attention_mask = attention_mask
-        current_position_ids = self._generate_position_ids(current_attention_mask)
-        current_input_ids = input_ids
-        current_cache: DynamicCache = None
-
-        # Generation Loop Initialization
-        sentence_augment_count = torch.zeros(B, dtype=torch.int, device=device)
-        
-        # NOTE - Whether to call the trigger and insert latent memory before generating the token at this position
-        # - augmentation_pos[b][i] == -100: For the b-th sequence, no augmentation was sampled before generating the i-th token
-        # - augmentation_pos[b][i] == 0: For the b-th sequence, augmentation was sampled before generating the i-th token, but the trigger decided NOT to insert latent memory
-        # - augmentation_pos[b][i] == 1: For the b-th sequence, augmentation was sampled before generating the i-th token, and the trigger decided to insert latent memory
-        augmentation_pos = torch.full((B, max_new_tokens), fill_value=invalid_token_id, device=device) 
-
-        generation_config = GenerationConfig(
-            do_sample=False,
-            pad_token_id=pad_token_id,
-            eos_token_id=eos_token_id,
-            use_cache=False,
-            max_new_tokens=max_new_tokens
-        )
-        # Perform generation for the remaining tokens using the reasoner
-        generated = reasoner.generate(
-            inputs_embeds=current_inputs_embeds,
-            attention_mask=current_attention_mask,
-            generation_config=generation_config
-        )
-        current_input_ids = torch.cat([current_input_ids, generated], dim=1)
-
-        # postprocess
-        new_generated_len = current_input_ids.size(1) - prompt_len
-        augmentation_pos = augmentation_pos[:, :new_generated_len]
-        
-        self._check_generate(
-            current_input_ids[:, prompt_len:],
-            augmentation_pos
-        )
-        
-        if return_augmentation_mask:
-            return (current_input_ids, augmentation_pos)
-        else:
-            return current_input_ids
-
-    @torch.no_grad()
-    def generate(
-        self, 
-        input_ids: torch.Tensor, 
-        attention_mask: torch.Tensor,
-        generation_config: GenerationConfig = None, 
-        return_augmentation_mask: bool = False,
-        **kwargs
-    ) -> Union[torch.LongTensor, tuple[torch.LongTensor, torch.LongTensor]]: 
         """带 latent memory 的自回归生成。
 
         每一步循环的顺序是：
@@ -547,7 +474,8 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         5. 把新 token 的 id/embedding/mask/position 追加回当前上下文。
 
         return_augmentation_mask=True 时会额外返回 augmentation_pos，便于训练 GRPO
-        或调试 trigger 决策。
+        或调试门控决策。若同时设置 return_entropy_gate_trace=True，第三个返回值为
+        每个 delimiter 候选点的熵门控记录。
         """
         
         tokenizer = self.tokenizer
