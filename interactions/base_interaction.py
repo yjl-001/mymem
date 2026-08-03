@@ -24,6 +24,8 @@ class InteractionConfig:
     weaver_do_sample: bool = False
     trigger_do_sample: bool = False
     sink_aware_generation: bool = False
+    record_entropy_gate_trace: bool = False
+    evaluation_split: str = "test"
 
 @dataclass
 class InteractionDataProto:

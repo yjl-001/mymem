@@ -1,0 +1,39 @@
+# Formal entropy-gated evaluation. Set entropy_threshold to the calibration
+# quantile before use, for example with --set ...entropy_threshold=4.12.
+base_cfg_path: configs/latent_memory/gsm8k.yaml
+
+launcher:
+  accelerate_config: configs/zero2.yaml
+
+model:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  attn_implementation: eager
+  load_model_path: null
+  max_prompt_aug_num: 0
+  max_inference_aug_num: 5
+  weaver:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    prompt_latents_len: 8
+    inference_latents_len: 8
+    insertion_strategy:
+      name: candidate_entropy_threshold
+      # Placeholder only: override this with the calibration result.
+      entropy_threshold: 100.0
+      attention_sink_token_count: 4
+  trigger:
+    model_name: Qwen/Qwen2.5-1.5B-Instruct
+    active: false
+
+dataset:
+  mode: sft
+
+run:
+  mode: evaluate
+  train_weaver: false
+  train_trigger: false
+  interaction:
+    batch_size: 1
+    temperature: 0.0
+    max_response_length: 1024
+    sink_aware_generation: true
+    record_entropy_gate_trace: true

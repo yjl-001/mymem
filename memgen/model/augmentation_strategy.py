@@ -10,8 +10,14 @@ from typing import Mapping, Sequence
 FIRST_K = "first_k"
 CANDIDATE_SINK_THRESHOLD = "candidate_sink_threshold"
 SEQUENCE_SINK_THRESHOLD = "sequence_sink_threshold"
+CANDIDATE_ENTROPY_THRESHOLD = "candidate_entropy_threshold"
 SUPPORTED_STRATEGIES = frozenset(
-    {FIRST_K, CANDIDATE_SINK_THRESHOLD, SEQUENCE_SINK_THRESHOLD}
+    {
+        FIRST_K,
+        CANDIDATE_SINK_THRESHOLD,
+        SEQUENCE_SINK_THRESHOLD,
+        CANDIDATE_ENTROPY_THRESHOLD,
+    }
 )
 
 
@@ -39,6 +45,8 @@ class WeaverInsertionStrategyConfig:
     name: str = FIRST_K
     sink_score_threshold: float = 0.0
     sink_score_layer_window: int = 4
+    entropy_threshold: float = 0.0
+    attention_sink_token_count: int = 4
 
     @classmethod
     def from_mapping(
@@ -50,6 +58,8 @@ class WeaverInsertionStrategyConfig:
             name=str(values.get("name", FIRST_K)),
             sink_score_threshold=float(values.get("sink_score_threshold", 0.0)),
             sink_score_layer_window=int(values.get("sink_score_layer_window", 4)),
+            entropy_threshold=float(values.get("entropy_threshold", 0.0)),
+            attention_sink_token_count=int(values.get("attention_sink_token_count", 4)),
         )
         config.validate()
         return config
@@ -65,10 +75,28 @@ class WeaverInsertionStrategyConfig:
             raise ValueError("sink_score_threshold must be finite")
         if self.sink_score_layer_window < 0:
             raise ValueError("sink_score_layer_window must be >= 0")
+        if not math.isfinite(self.entropy_threshold):
+            raise ValueError("entropy_threshold must be finite")
+        if self.attention_sink_token_count < 0:
+            raise ValueError("attention_sink_token_count must be >= 0")
 
     @property
     def requires_sink_scores(self) -> bool:
-        return self.name != FIRST_K
+        return self.name in {CANDIDATE_SINK_THRESHOLD, SEQUENCE_SINK_THRESHOLD}
+
+    @property
+    def requires_attention_scores(self) -> bool:
+        """Whether runtime needs reasoner attention tensors rather than FlashAttention."""
+
+        return self.name in {
+            CANDIDATE_SINK_THRESHOLD,
+            SEQUENCE_SINK_THRESHOLD,
+            CANDIDATE_ENTROPY_THRESHOLD,
+        }
+
+    @property
+    def is_entropy_gate(self) -> bool:
+        return self.name == CANDIDATE_ENTROPY_THRESHOLD
 
     @property
     def requires_delimiter_candidates(self) -> bool:
@@ -79,6 +107,8 @@ class WeaverInsertionStrategyConfig:
             "name": self.name,
             "sink_score_threshold": self.sink_score_threshold,
             "sink_score_layer_window": self.sink_score_layer_window,
+            "entropy_threshold": self.entropy_threshold,
+            "attention_sink_token_count": self.attention_sink_token_count,
         }
 
 
@@ -91,6 +121,14 @@ class WeaverInsertionStrategy:
     @property
     def requires_sink_scores(self) -> bool:
         return self.config.requires_sink_scores
+
+    @property
+    def requires_attention_scores(self) -> bool:
+        return self.config.requires_attention_scores
+
+    @property
+    def is_entropy_gate(self) -> bool:
+        return self.config.is_entropy_gate
 
     @property
     def requires_delimiter_candidates(self) -> bool:
@@ -109,6 +147,12 @@ class WeaverInsertionStrategy:
         if self.config.name == FIRST_K:
             candidates = [point for point in points if point.is_delimiter]
             return [point.index for point in candidates[:max_num]]
+
+        if self.config.is_entropy_gate:
+            raise ValueError(
+                "candidate_entropy_threshold is an online evaluation gate and "
+                "cannot select teacher-forced Weaver training positions."
+            )
 
         if self.config.name == CANDIDATE_SINK_THRESHOLD:
             candidates = [point for point in points if point.is_delimiter]

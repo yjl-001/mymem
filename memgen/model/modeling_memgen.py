@@ -461,8 +461,9 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         attention_mask: torch.Tensor,
         generation_config: GenerationConfig = None, 
         return_augmentation_mask: bool = False,
+        return_entropy_gate_trace: bool = False,
         **kwargs
-    ) -> Union[torch.LongTensor, tuple[torch.LongTensor, torch.LongTensor]]: 
+    ) -> Union[torch.LongTensor, tuple]:
         
         tokenizer = self.tokenizer
         reasoner = self.reasoner
@@ -571,19 +572,20 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         sink_aware_generation = bool(
             getattr(generation_config, "sink_aware_generation", False)
         )
-        use_online_sink = (
+        use_online_attention_gate = (
             sink_aware_generation
-            and self.weaver_insertion_strategy.requires_sink_scores
+            and self.weaver_insertion_strategy.requires_attention_scores
         )
         if (
             sink_aware_generation
-            and not self.weaver_insertion_strategy.requires_sink_scores
+            and not self.weaver_insertion_strategy.requires_attention_scores
         ):
             raise ValueError(
                 "sink_aware_generation=True requires "
-                "candidate_sink_threshold or sequence_sink_threshold"
+                "candidate_sink_threshold, sequence_sink_threshold, or "
+                "candidate_entropy_threshold"
             )
-        if use_online_sink and B != 1:
+        if use_online_attention_gate and B != 1:
             raise ValueError(
                 "Sink-aware generation currently requires interaction.batch_size=1"
             )
@@ -608,6 +610,7 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         # - augmentation_pos[b][i] == 0: For the b-th sequence, augmentation was sampled before generating the i-th token, but the trigger decided NOT to insert latent memory
         # - augmentation_pos[b][i] == 1: For the b-th sequence, augmentation was sampled before generating the i-th token, and the trigger decided to insert latent memory
         augmentation_pos = torch.full((B, max_new_tokens), fill_value=invalid_token_id, device=device) 
+        entropy_gate_trace: list[dict[str, float | int | bool]] = []
 
         for i in range(max_new_tokens):
             
@@ -615,6 +618,7 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
             # 第 0 步总是 prompt 级候选；之后只有当前前缀以 delimiter 结尾才会成为候选。
             # 返回值语义：-100=非候选，0=候选但不插，1=候选且插入。
             sink_score = None
+            entropy_gate_event = None
             if i == 0:
                 if self.config.max_prompt_aug_num > 0:
                     augment_decision = self._should_augment(
@@ -631,12 +635,20 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                         dtype=torch.long,
                         device=device,
                     )
-            elif use_online_sink:
-                augment_decision, sink_score = self._online_sink_augment_decision(
-                    input_ids=current_input_ids,
-                    token_attention_mask=current_token_attention_mask,
-                    sentence_augment_count=sentence_augment_count,
-                )
+            elif use_online_attention_gate:
+                if self.weaver_insertion_strategy.is_entropy_gate:
+                    augment_decision, entropy_gate_event = self._online_entropy_augment_decision(
+                        input_ids=current_input_ids,
+                        token_attention_mask=current_token_attention_mask,
+                        sentence_augment_count=sentence_augment_count,
+                        generation_step=i,
+                    )
+                else:
+                    augment_decision, sink_score = self._online_sink_augment_decision(
+                        input_ids=current_input_ids,
+                        token_attention_mask=current_token_attention_mask,
+                        sentence_augment_count=sentence_augment_count,
+                    )
             else:
                 augment_decision = self._should_augment(
                     current_input_ids,
@@ -655,6 +667,20 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                     bool(augment_decision[0].item() == 1),
                     int(sentence_augment_count[0].item()),
                     max_augment_num,
+                )
+            if entropy_gate_event is not None:
+                entropy_gate_trace.append(entropy_gate_event)
+                logging.info(
+                    "[EntropyGate] step=%d entropy=%s threshold=%.4f insert=%s budget_exhausted=%s",
+                    i,
+                    (
+                        "n/a"
+                        if "entropy" not in entropy_gate_event
+                        else f"{float(entropy_gate_event['entropy']):.4f}"
+                    ),
+                    self.weaver_insertion_strategy.config.entropy_threshold,
+                    entropy_gate_event["insert"],
+                    entropy_gate_event["budget_exhausted"],
                 )
             augmentation_pos[:, i] = augment_decision
             augment_indices = torch.where(augment_decision == 1)[0]
@@ -803,6 +829,8 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
             augmentation_pos
         )
         
+        if return_augmentation_mask and return_entropy_gate_trace:
+            return (current_input_ids, augmentation_pos, entropy_gate_trace)
         if return_augmentation_mask:
             return (current_input_ids, augmentation_pos)
         else:
@@ -884,10 +912,10 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
             "attn_implementation": attn_implementation,
         }
         reasoner_load_kwargs = dict(load_kwargs)
-        if weaver_insertion_strategy.requires_sink_scores:
+        if weaver_insertion_strategy.requires_attention_scores:
             reasoner_load_kwargs["attn_implementation"] = "eager"
             logging.info(
-                "Sink-aware strategy enabled; loading reasoner with eager attention"
+                "Attention-based insertion strategy enabled; loading reasoner with eager attention"
             )
         reasoner_base_model = AutoModelForCausalLM.from_pretrained(
             model_name,

@@ -97,12 +97,18 @@ class SingleTurnInteractionManager(InteractionManager):
         }  
 
         # model generation
-        gen_output, augmentation_pos = self.actor_rollout_wg.generate(
+        generation_result = self.actor_rollout_wg.generate(
             rollings_active["input_ids"], 
             rollings_active["attention_mask"], 
             generation_config=self.generation_config,
             return_augmentation_mask=True,
+            return_entropy_gate_trace=self.config.record_entropy_gate_trace,
         )
+        if self.config.record_entropy_gate_trace:
+            gen_output, augmentation_pos, entropy_gate_trace = generation_result
+        else:
+            gen_output, augmentation_pos = generation_result
+            entropy_gate_trace = []
         responses_ids = gen_output[:, rollings_active["input_ids"].size(1):]
         im_start_ids = self.tokenizer.encode("<|im_start|>", add_special_tokens=False)
         responses_ids = self.tensor_fn.erase_from_first_token_sequence(
@@ -118,6 +124,7 @@ class SingleTurnInteractionManager(InteractionManager):
         # construct final output
         final_output = self._compose_final_output(original_left_side, original_right_side)
         final_output.batch["augmentation_pos"] = augmentation_pos
+        final_output.no_tensor_batch["entropy_gate_trace"] = entropy_gate_trace
         return final_output
     
     def _compose_final_output(

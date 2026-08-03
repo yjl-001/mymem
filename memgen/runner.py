@@ -80,6 +80,12 @@ class MemGenRunner:
         self.trigger_train_dataset = self._filter_dataset(self.trigger_train_dataset)
         self.weaver_valid_dataset = self._filter_dataset(self.weaver_valid_dataset)
         self.trigger_valid_dataset = self._filter_dataset(self.trigger_valid_dataset)
+        if self.interaction_config.evaluation_split == "valid":
+            self.evaluation_dataset = self.weaver_valid_dataset
+        elif self.interaction_config.evaluation_split == "test":
+            self.evaluation_dataset = self.test_dataset
+        else:
+            raise ValueError("run.interaction.evaluation_split must be 'valid' or 'test'.")
         
         # initialize generation manager.
         # StaticEnv -> SingleTurnInteractionManager；DynamicEnv -> MultiTurnInteractionManager。
@@ -289,13 +295,16 @@ class MemGenRunner:
 
         batch_size = self.interaction_config.batch_size
         csv_path = os.path.join(self.interaction_config.output_dir, "augmentation_positions.csv")
+        entropy_csv_path = os.path.join(self.interaction_config.output_dir, "entropy_gate_trace.csv")
         all_aug_rows = []
+        all_entropy_rows = []
         global_sample_offset = 0
+        entropy_sample_offset = 0
 
         # Accelerator 只切分 dataloader；真实 generation 在 unwrap_model_for_generation 中执行，
         # 这样可以拿到未被 DDP 包裹的模型对象。
         test_dataloader = accelerator.prepare(DataLoader(
-            dataset=self.test_dataset,
+            dataset=self.evaluation_dataset,
             batch_size=batch_size,
             shuffle=False,
             collate_fn=lambda batch: batch
@@ -328,6 +337,7 @@ class MemGenRunner:
                 gen_output = self.generation_manager.run_agent_loop(gen_batch)
                 augmentation_pos = gen_output.batch.get("augmentation_pos")
                 aug_pos_cpu = augmentation_pos.cpu() if augmentation_pos is not None else None
+                entropy_gate_trace = gen_output.no_tensor_batch.get("entropy_gate_trace", [])
 
                 completion_ids = gen_output.batch["responses"]
                 completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -336,10 +346,15 @@ class MemGenRunner:
             local_completions = completions
             local_batches = test_batch
             local_aug_pos = aug_pos_cpu
+            local_entropy_gate_trace = {
+                "batch_size": len(test_batch),
+                "events": entropy_gate_trace,
+            }
 
             all_completions = gather_objects(local_completions)
             all_batches = gather_objects(local_batches)
             all_aug_pos_list = gather_objects(local_aug_pos) if local_aug_pos is not None else []
+            all_entropy_payloads = gather_objects(local_entropy_gate_trace)
 
             if accelerator.is_main_process:
                 for comps, batch in zip(all_completions, all_batches):
@@ -363,6 +378,14 @@ class MemGenRunner:
                     if rank_aug_pos is not None:
                         global_sample_offset += rank_aug_pos.size(0)
 
+                if isinstance(all_entropy_payloads, dict):
+                    all_entropy_payloads = [all_entropy_payloads]
+                for payload in all_entropy_payloads:
+                    for event in payload["events"]:
+                        row = {"sample_idx": entropy_sample_offset, **event}
+                        all_entropy_rows.append(row)
+                    entropy_sample_offset += int(payload["batch_size"])
+
         accelerator.wait_for_everyone()
 
         if accelerator.is_main_process:
@@ -374,6 +397,26 @@ class MemGenRunner:
                     csv_writer = csv.DictWriter(f, fieldnames=["sample_idx", "aug_type", "step_in_generation", "total_generated_len", "relative_position"])
                     csv_writer.writeheader()
                     csv_writer.writerows(all_aug_rows)
+
+            if all_entropy_rows:
+                fieldnames = [
+                    "sample_idx",
+                    "generation_step",
+                    "entropy",
+                    "entropy_head_std",
+                    "entropy_threshold",
+                    "mean_sink_attention_mass",
+                    "valid_key_count",
+                    "sink_token_count",
+                    "non_sink_key_count",
+                    "inference_augmentation_count_before",
+                    "budget_exhausted",
+                    "insert",
+                ]
+                with open(entropy_csv_path, "w", newline="") as f:
+                    csv_writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                    csv_writer.writeheader()
+                    csv_writer.writerows(all_entropy_rows)
 
     def _dynamic_evaluate(self):
         """动态任务评测：每条样本先创建 Env，再由 agent loop 多轮交互。"""
@@ -424,7 +467,7 @@ class MemGenRunner:
         
         # prepare dataset and dataloader
         test_dataloader = accelerator.prepare(DataLoader(
-            dataset=self.test_dataset, 
+            dataset=self.evaluation_dataset,
             batch_size=batch_size, 
             shuffle=False,
             collate_fn=lambda batch: batch  # use the identity function
@@ -546,6 +589,11 @@ class MemGenRunner:
                 "sink_aware_generation",
                 False,
             ),
+            record_entropy_gate_trace=interaction_configs.get(
+                "record_entropy_gate_trace",
+                False,
+            ),
+            evaluation_split=interaction_configs.get("evaluation_split", "test"),
         )
         if (
             self.interaction_config.sink_aware_generation

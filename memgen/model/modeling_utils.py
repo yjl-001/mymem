@@ -12,6 +12,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 
 from memgen.model.augmentation_strategy import (
+    CANDIDATE_ENTROPY_THRESHOLD,
     CANDIDATE_SINK_THRESHOLD,
     SEQUENCE_SINK_THRESHOLD,
     InferenceInsertionPoint,
@@ -578,6 +579,127 @@ class MemGenGenerationMixin(GenerationMixin):
         sink_score = float(score_by_point[insertion_point])
         decision[0] = int(sink_score > strategy.config.sink_score_threshold)
         return decision, sink_score
+
+    @torch.no_grad()
+    def _last_layer_sink_masked_entropy(
+        self,
+        input_ids: torch.Tensor,
+        token_attention_mask: torch.Tensor,
+    ) -> dict[str, float | int]:
+        """Compute FlashMem-style entropy after removing leading attention sinks.
+
+        The score is the mean Shannon entropy across heads in the reasoner's
+        final layer.  It is deliberately computed on the token-only prefix:
+        previously inserted latent tokens must not become artificial sink
+        positions.  ``attention_sink_token_count`` refers to the first valid
+        tokens in that prefix, never to left-padding positions.
+        """
+        if input_ids.shape != token_attention_mask.shape:
+            raise ValueError("token_attention_mask must match input_ids")
+        if input_ids.size(0) != 1:
+            raise ValueError("Entropy-gated generation currently requires batch_size=1")
+
+        valid_positions = torch.nonzero(token_attention_mask[0] != 0, as_tuple=False).flatten()
+        if valid_positions.numel() < 2:
+            raise ValueError("Need at least two valid tokens to compute attention entropy")
+        query_index = int(valid_positions[-1].item())
+        key_positions = valid_positions[valid_positions <= query_index]
+        sink_count = min(
+            int(self.weaver_insertion_strategy.config.attention_sink_token_count),
+            max(int(key_positions.numel()) - 1, 0),
+        )
+        non_sink_keys = key_positions[sink_count:]
+        if non_sink_keys.numel() == 0:
+            raise RuntimeError("Sink masking removed every valid attention key")
+
+        position_ids = self._generate_position_ids(token_attention_mask)
+        reasoner_was_training = self.reasoner.training
+        self.reasoner.eval()
+        try:
+            outputs = self.reasoner(
+                input_ids=input_ids,
+                attention_mask=token_attention_mask,
+                position_ids=position_ids,
+                output_attentions=True,
+                output_hidden_states=False,
+                use_cache=False,
+                return_dict=True,
+            )
+        finally:
+            self.reasoner.train(reasoner_was_training)
+
+        attentions = outputs.attentions
+        if not attentions or attentions[-1] is None:
+            raise RuntimeError(
+                "Entropy gating requires final-layer attention tensors; "
+                "load the reasoner with eager attention."
+            )
+        final_attention = attentions[-1]
+        raw_probs = final_attention[0, :, query_index, :]
+        masked_probs = raw_probs.index_select(1, non_sink_keys).float()
+        normalizer = masked_probs.sum(dim=-1, keepdim=True)
+        if torch.any(normalizer <= 0):
+            raise RuntimeError("Attention mass after sink masking is zero")
+        probs = masked_probs / normalizer
+        head_entropy = -(probs * probs.clamp_min(torch.finfo(probs.dtype).tiny).log()).sum(dim=-1)
+        sink_mass = (
+            raw_probs.index_select(1, key_positions[:sink_count]).float().sum(dim=-1)
+            if sink_count > 0
+            else torch.zeros_like(head_entropy)
+        )
+        return {
+            "entropy": float(head_entropy.mean().item()),
+            "entropy_head_std": float(head_entropy.std(unbiased=False).item()),
+            "mean_sink_attention_mass": float(sink_mass.mean().item()),
+            "valid_key_count": int(key_positions.numel()),
+            "sink_token_count": sink_count,
+            "non_sink_key_count": int(non_sink_keys.numel()),
+        }
+
+    @torch.no_grad()
+    def _online_entropy_augment_decision(
+        self,
+        input_ids: torch.Tensor,
+        token_attention_mask: torch.Tensor,
+        sentence_augment_count: torch.Tensor,
+        generation_step: int,
+    ) -> tuple[torch.LongTensor, dict[str, float | int | bool] | None]:
+        """Evaluate the entropy gate at a delimiter and return an audit record."""
+        if input_ids.size(0) != 1:
+            raise ValueError("Entropy-gated generation currently requires batch_size=1")
+        if self.weaver_insertion_strategy.config.name != CANDIDATE_ENTROPY_THRESHOLD:
+            raise ValueError("Entropy gate requires candidate_entropy_threshold strategy")
+
+        decision = torch.full((1,), -100, dtype=torch.long, device=input_ids.device)
+        is_candidate = bool(
+            self._check_ends_with_delimiter(
+                input_ids,
+                self.tokenizer,
+                self.delimiters,
+                attention_mask=token_attention_mask,
+            )[0, 0].item()
+        )
+        if not is_candidate:
+            return decision, None
+
+        threshold = self.weaver_insertion_strategy.config.entropy_threshold
+        budget_exhausted = int(sentence_augment_count[0].item()) >= int(
+            self.config.max_inference_aug_num
+        )
+        event: dict[str, float | int | bool] = {
+            "generation_step": generation_step,
+            "entropy_threshold": float(threshold),
+            "budget_exhausted": budget_exhausted,
+            "inference_augmentation_count_before": int(sentence_augment_count[0].item()),
+        }
+        if budget_exhausted:
+            event["insert"] = False
+            return decision, event
+
+        event.update(self._last_layer_sink_masked_entropy(input_ids, token_attention_mask))
+        decision[0] = int(float(event["entropy"]) > threshold)
+        event["insert"] = bool(decision[0].item())
+        return decision, event
 
     @torch.no_grad()
     def _should_augment(
