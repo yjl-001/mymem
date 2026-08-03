@@ -454,6 +454,63 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         outputs.supervised_labels = all_labels  # Positions in input_ids that are supervised
         return outputs
 
+    # ------------------------------------------------------------------
+    # Vanilla reasoner baseline (disabled by default).
+    #
+    # To evaluate the original model without any Memory/Weaver path, comment
+    # out the active `generate` method below and uncomment this whole method.
+    # It is intentionally kept in its original form rather than routed through
+    # a runtime flag, so the baseline uses HuggingFace's native generate path.
+    #
+    # @torch.no_grad()
+    # def generate(
+    #     self,
+    #     input_ids: torch.Tensor,
+    #     attention_mask: torch.Tensor,
+    #     generation_config: GenerationConfig = None,
+    #     return_augmentation_mask: bool = False,
+    #     **kwargs,
+    # ) -> Union[torch.LongTensor, tuple[torch.LongTensor, torch.LongTensor]]:
+    #     tokenizer = self.tokenizer
+    #     reasoner = self.reasoner
+    #     max_augment_num = self.config.max_inference_aug_num
+    #     invalid_token_id = -100
+    #
+    #     input_ids = input_ids.to(self.device)
+    #     attention_mask = attention_mask.to(self.device)
+    #     max_new_tokens = generation_config.max_new_tokens
+    #     pad_token_id = tokenizer.pad_token_id
+    #     eos_token_id = tokenizer.eos_token_id
+    #     prompt_len = input_ids.size(1)
+    #
+    #     inputs_embeds = reasoner.get_input_embeddings()(input_ids)
+    #     batch_size = inputs_embeds.size(0)
+    #     augmentation_pos = torch.full(
+    #         (batch_size, max_new_tokens),
+    #         fill_value=invalid_token_id,
+    #         device=inputs_embeds.device,
+    #     )
+    #     vanilla_generation_config = GenerationConfig(
+    #         do_sample=False,
+    #         pad_token_id=pad_token_id,
+    #         eos_token_id=eos_token_id,
+    #         use_cache=False,
+    #         max_new_tokens=max_new_tokens,
+    #     )
+    #     generated = reasoner.generate(
+    #         inputs_embeds=inputs_embeds,
+    #         attention_mask=attention_mask,
+    #         generation_config=vanilla_generation_config,
+    #     )
+    #     current_input_ids = torch.cat([input_ids, generated], dim=1)
+    #     new_generated_len = current_input_ids.size(1) - prompt_len
+    #     augmentation_pos = augmentation_pos[:, :new_generated_len]
+    #     self._check_generate(current_input_ids[:, prompt_len:], augmentation_pos)
+    #
+    #     if return_augmentation_mask:
+    #         return current_input_ids, augmentation_pos
+    #     return current_input_ids
+
     @torch.no_grad()
     def generate(
         self, 
