@@ -58,6 +58,7 @@ env/
 .env
 .env.local
 .env.*.local
+scripts/experiments/.server.env
 
 # Weights & Biases
 wandb/

@@ -41,38 +41,38 @@ export MEMGEN_OUTPUT_ROOT=/mnt/experiments/memgen-runs
 
 `MEMGEN_OUTPUT_ROOT` 未设置时仍兼容旧行为，结果写入当前仓库的 `.cache/`。
 
-## 3. 参数文件与覆盖
+## 3. 参数文件、一键脚本与覆盖
 
 `configs/latent_memory/*.yaml` 是各数据集的基线。`configs/experiments/**/*.yaml`
-只保存一次实验相对基线的差异，并指定 `base_cfg_path` 与 GPU 启动参数。新的正式实验
-应复制最接近的文件并提交，例如：
+只保存一次实验相对基线的差异，并指定 `base_cfg_path` 与 GPU 启动参数。每个正式训练或
+评测还必须有一个匹配的 `scripts/experiments/**/*.sh` 一键脚本；二者都随代码提交。脚本
+读取服务器本地 `.server.env` 中的路径与设备配置，并固定描述实验核心的 `run-id`。
+
+新的正式实验应复制最接近的配置和脚本，例如：
 
 ```bash
 cp configs/experiments/kodcode/weaver_sft.yaml \
    configs/experiments/kodcode/mi_entropy_weaver_sft.yaml
+cp scripts/experiments/gsm8k/run_entropy_calibration_sink4_q85.sh \
+   scripts/experiments/kodcode/run_mi_entropy_weaver_sft.sh
 ```
 
 需要临时改变一个值时，使用 `--set key=value`；这不会污染已提交的 YAML：
 
-```bash
-python scripts/launch_experiment.py train \
-  configs/experiments/kodcode/weaver_sft.yaml \
-  --devices 0 \
-  --set run.weaver.sft.learning_rate=2e-5 \
-  --set model.weaver.prompt_latents_len=16
-```
+临时覆盖参数应写进本次实验对应的 Bash 脚本；脚本与配置共同构成完整、可重跑的实验定义。
+不要把正式实验参数仅留在聊天记录或服务器命令历史中。
 
 ## 4. 训练、评测与 checkpoint 衔接
 
-训练：
+训练或评测时，服务器只执行版本化的一键脚本：
 
 ```bash
-python scripts/launch_experiment.py train \
-  configs/experiments/kodcode/weaver_sft.yaml \
-  --devices 0
+git pull --ff-only origin main
+bash scripts/experiments/<dataset>/run_<method>.sh
 ```
 
-评测始终显式传入 checkpoint 的**绝对路径**，不根据时间倒序猜测“最新模型”：
+需要前一阶段 checkpoint 的脚本应读取 `.server.env` 或接受其**绝对路径**作为参数，
+不根据时间倒序猜测“最新模型”。
 
 ```bash
 python scripts/launch_experiment.py eval \
