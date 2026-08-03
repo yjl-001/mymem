@@ -1,6 +1,6 @@
-# A committed, portable experiment specification.  Machine-specific paths
-# (checkpoints, data caches, output root) are supplied via environment vars or
-# --set overrides at launch time and must not be committed here.
+# Continue a Weaver-SFT checkpoint with reward optimization. Supply the
+# preceding checkpoint at launch time; it is intentionally machine-specific:
+#   --set model.load_model_path=/data/memgen-runs/.../model
 base_cfg_path: configs/latent_memory/kodcode.yaml
 
 launcher:
@@ -21,17 +21,18 @@ model:
     active: false
 
 dataset:
-  mode: sft
+  mode: grpo
 
 run:
   mode: train
   train_weaver: true
-  train_weaver_method: sft
+  train_weaver_method: grpo
   train_trigger: false
   weaver:
-    sft:
-      num_train_epochs: 2
-      per_device_train_batch_size: 1
-      per_device_eval_batch_size: 1
+    grpo:
+      num_train_epochs: 1
+      per_device_train_batch_size: 8
+      per_device_eval_batch_size: 8
+      num_generations: 8
       gradient_accumulation_steps: 1
       learning_rate: 1.0e-5

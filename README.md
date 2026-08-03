@@ -52,20 +52,17 @@ Please follow the instructions in the [Search-R1](https://github.com/PeterGriffi
 
 ## 🤗 Quick Evaluation
 
-Below are several MemGen models based on Qwen2.5-1.5B-Instruct and SmolLM3-3B across multiple datasets. We are currently in the process of carefully validating additional checkpoints to ensure they are fully reproducible and can be released in a clean, one-click setup. We appreciate your patience as we complete this verification process.
+All training and evaluation use the same versioned launcher. Select an
+experiment YAML, then supply the server GPU and the exact MemGen checkpoint:
 
-| model | dataset | mode | link | eval_script | train_script |
-|-------|---------|------|------|-------------|--------------|
-| Qwen2.5-1.5B-Instruct | KodCode | weaver-sft | [huggingface link](https://huggingface.co/Kana-s/MemGen/tree/main/Qwen2.5-1.5B-Instruct/kodcode/weaver-sft) | `scripts/eval/qwen2_5_kodcode_sft.sh` | `scripts/train/qwen2_5_kodcode_sft.sh` |
-| Qwen2.5-1.5B-Instruct | KodCode | weaver-grpo | [huggingface link](https://huggingface.co/Kana-s/MemGen/tree/main/Qwen2.5-1.5B-Instruct/kodcode/weaver-grpo) | `scripts/eval/qwen2_5_kodcode_grpo.sh` | `scripts/train/qwen2_5_kodcode_grpo.sh` |
-| Qwen2.5-1.5B-Instruct | GSM8K | weaver-sft | [huggingface link](https://huggingface.co/Kana-s/MemGen/tree/main/Qwen2.5-1.5B-Instruct/gsm8k/weaver-sft) | `scripts/eval/qwen2_5_gsm8k_sft.sh` | `scripts/train/qwen2_5_gsm8k_sft.sh` |
-| Qwen2.5-1.5B-Instruct | GSM8K | weaver-grpo | [huggingface link](https://huggingface.co/Kana-s/MemGen/tree/main/Qwen2.5-1.5B-Instruct/gsm8k/weaver-grpo) | `scripts/eval/qwen2_5_gsm8k_grpo.sh` | `scripts/train/qwen2_5_gsm8k_grpo.sh` |
-| Qwen2.5-1.5B-Instruct | TriviaQA | weaver-sft | [huggingface link](https://huggingface.co/Kana-s/MemGen/tree/main/Qwen2.5-1.5B-Instruct/triviaqa/weaver-sft) | `scripts/eval/qwen2_5_triviaqa.sh` | `scripts/train/qwen2_5_triviaqa.sh` |
-| SmolLM3-3B | KodCode | weaver-sft | [huggingface link](https://huggingface.co/Kana-s/MemGen/tree/main/SmolLM3-3B/kodcode/weaver-sft) | `scripts/eval/smollm_kodcode.sh` | `scripts/train/smollm_kodcode.sh` |
-| SmolLM3-3B | TriviaQA | weaver-sft | [huggingface link](https://huggingface.co/Kana-s/MemGen/tree/main/SmolLM3-3B/triviaqa/weaver-sft) | `scripts/eval/smollm_triviaqa.sh` | `scripts/train/smollm_triviaqa.sh` |
+```bash
+python scripts/launch_experiment.py eval configs/experiments/kodcode/eval.yaml \
+  --devices 0 \
+  --set model.load_model_path=/data/memgen-runs/train/<run>/model
+```
 
-
-If you prefer to evaluate the vanilla model instead of MemGen, simply modify `memgen/model/modeling_memgen.py` by replacing the current `generate` function (Lines 452–629) with the commented alternative `generate` implementation (Lines 379–450), and then run the standard evaluation script.
+The launcher rejects an empty or incomplete checkpoint, and records the
+resolved configuration and Git commit beside the evaluation result.
 
 
 ## ▶️ How to Run
@@ -78,30 +75,10 @@ For development on a local machine and reproducible server-side training, see
 launcher based on versioned YAML experiment files, explicit checkpoint paths,
 and automatic snapshots of the resolved parameters and Git commit.
 
-If you would like to reproduce results for a specific dataset + model, please refer to the table above. If the corresponding checkpoint is not yet available, we kindly ask for your patience as we are actively preparing more comprehensive releases.
-
-### Weaver Model
-- **Train the Weaver model**
-    ```bash
-    bash weaver_train.sh
-    ```
-
-- **Evaluate the Weaver model**  
-    Before running, make sure to update `LOAD_MODEL_PATH` in `eval.sh` to point to the trained checkpoint: `<weaver_dir>`
-    ```bash
-    bash eval.sh
-    ```
-
-### Trigger Model
-- **Train the Trigger model**
-    ```bash
-    bash trigger_train.sh
-    ```
-- **Evaluate the Trigger model**  
-    Before running, make sure to update `LOAD_MODEL_PATH` in `eval.sh` to point to the trained checkpoint: `<trigger_dir>`
-    ```bash
-    bash eval.sh
-    ```
+The canonical KodCode templates are `weaver_sft.yaml`, `weaver_grpo.yaml`,
+`trigger_grpo.yaml`, and `eval.yaml` under `configs/experiments/kodcode/`.
+For the full local-to-server workflow, see
+[docs/experiment_workflow.md](docs/experiment_workflow.md).
 
 
 

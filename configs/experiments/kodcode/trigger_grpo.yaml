@@ -1,6 +1,5 @@
-# Evaluate a particular checkpoint by supplying its absolute path at launch:
-#   python scripts/launch_experiment.py eval configs/experiments/kodcode/eval.yaml \
-#       --set model.load_model_path=/mnt/memgen/checkpoints/<run>/model
+# Train only the Trigger after a Weaver checkpoint exists. Supply that
+# checkpoint at launch time with --set model.load_model_path=<.../model>.
 base_cfg_path: configs/latent_memory/kodcode.yaml
 
 launcher:
@@ -18,16 +17,21 @@ model:
     inference_latents_len: 8
   trigger:
     model_name: Qwen/Qwen2.5-1.5B-Instruct
-    active: false
+    active: true
 
 dataset:
-  mode: sft
+  mode: grpo
 
 run:
-  mode: evaluate
+  mode: train
   train_weaver: false
-  train_trigger: false
-  interaction:
-    batch_size: 4
-    temperature: 0.0
-    max_response_length: 1024
+  train_trigger: true
+  train_trigger_method: grpo
+  trigger:
+    grpo:
+      num_train_epochs: 1
+      per_device_train_batch_size: 8
+      per_device_eval_batch_size: 8
+      num_generations: 8
+      gradient_accumulation_steps: 4
+      learning_rate: 1.0e-5

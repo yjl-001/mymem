@@ -19,20 +19,17 @@ git push -u origin feature/mi-entropy-gate
 均由 `.gitignore` 排除。若本地工作区有尚未提交的改动，运行清单会标为 `git_dirty: true`，
 但这类运行不应作为正式结果。
 
-## 2. 服务器检出指定代码版本
+## 2. 服务器同步代码
 
-服务器保留一个只用于 `fetch` 的主 clone，然后为每个提交创建一个独立 worktree：
+本地与服务器共同使用 `main` 分支。服务器不修改源码，只在开始新任务前同步：
 
 ```bash
-cd /path/to/MemGen-mirror
-bash scripts/create_server_worktree.sh /mnt/worktrees/memgen origin/feature/mi-entropy-gate
-cd /mnt/worktrees/memgen/memgen-<timestamp>-<sha>
+cd /path/to/MemGen
+git switch main
+git pull --ff-only origin main
 ```
 
-这样后续 `git fetch` 不会改变正在训练的源码。若服务器空间有限，也可以在确认没有运行
-任务、且工作区干净后执行 `git pull --ff-only`；不要使用会丢失未提交内容的同步命令。
-
-首次在服务器使用时，在 worktree 中创建环境并缓存依赖/模型。建议将两者放在仓库外：
+首次在服务器使用时，创建环境并缓存依赖/模型。建议将两者放在仓库外：
 
 ```bash
 conda create -n memgen python=3.10
@@ -60,6 +57,7 @@ cp configs/experiments/kodcode/weaver_sft.yaml \
 ```bash
 python scripts/launch_experiment.py train \
   configs/experiments/kodcode/weaver_sft.yaml \
+  --devices 0 \
   --set run.weaver.sft.learning_rate=2e-5 \
   --set model.weaver.prompt_latents_len=16
 ```
@@ -70,7 +68,8 @@ python scripts/launch_experiment.py train \
 
 ```bash
 python scripts/launch_experiment.py train \
-  configs/experiments/kodcode/weaver_sft.yaml
+  configs/experiments/kodcode/weaver_sft.yaml \
+  --devices 0
 ```
 
 评测始终显式传入 checkpoint 的**绝对路径**，不根据时间倒序猜测“最新模型”：
@@ -78,6 +77,7 @@ python scripts/launch_experiment.py train \
 ```bash
 python scripts/launch_experiment.py eval \
   configs/experiments/kodcode/eval.yaml \
+  --devices 0 \
   --set model.load_model_path=/mnt/experiments/memgen-runs/train/kodcode/Qwen2.5-1.5B-Instruct/<run>/model
 ```
 
@@ -92,7 +92,8 @@ python scripts/launch_experiment.py eval \
 
 ## 5. 建议的阶段配置
 
-不要用一个巨大的 shell pipeline 隐式串联所有阶段。每个阶段是一份独立、可提交的配置：
+不要使用旧的 `scripts/train/*.sh`、`scripts/eval/*.sh` 或 `scripts/pipeline.sh`。
+每个阶段是一份独立、可提交的配置：
 
 1. `weaver_sft.yaml`：从基础模型训练 Weaver；
 2. `weaver_grpo.yaml`：通过 `model.load_model_path` 明确指向 SFT checkpoint；

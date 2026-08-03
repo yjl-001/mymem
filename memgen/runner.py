@@ -114,7 +114,11 @@ class MemGenRunner:
         # Determine max length based on training mode.
         # SFT 用 max_length；GRPO 用 max_prompt_length，因为 completion 由 rollout 生成。
         max_len = 1024
-        if self.train_weaver and self.train_weaver_method == "sft":
+        if self.run_mode == "evaluate":
+            # Evaluation has no trainer stage. Filter only by the initial
+            # context budget configured for the interaction loop.
+            max_len = self.interaction_config.max_start_length
+        elif self.train_weaver and self.train_weaver_method == "sft":
             max_len = self.weaver_sft_training_args.max_length
         elif self.train_weaver and self.train_weaver_method == "grpo":
             max_len = self.weaver_grpo_training_args.max_prompt_length
@@ -475,8 +479,16 @@ class MemGenRunner:
         即使某一套本轮不用，也会先建出来，方便后续代码根据训练模式统一取字段。
         """
         
+        self.run_mode = configs.get("mode", "train")
+        if self.run_mode not in {"train", "evaluate"}:
+            raise ValueError("run.mode must be 'train' or 'evaluate'.")
+
         self.train_weaver = configs.get("train_weaver", True)
         self.train_trigger = configs.get("train_trigger", False)
+        if self.run_mode == "train" and self.train_weaver == self.train_trigger:
+            raise ValueError(
+                "Training requires exactly one of run.train_weaver and run.train_trigger."
+            )
         
         # --- Parse weaver training args ---
         self.train_weaver_method = configs.get("train_weaver_method", "sft")
@@ -506,7 +518,10 @@ class MemGenRunner:
         updated_args = {
             "output_dir": os.path.join(self.working_dir, "model"),
             "logging_dir": os.path.join(self.working_dir, "run"),
-            "save_strategy": "no"
+            # A stage produces one explicit final checkpoint at model/. Do
+            # not claim to reload a nonexistent "best" intermediate model.
+            "save_strategy": "no",
+            "load_best_model_at_end": False,
         }
         for k, v in updated_args.items():
             setattr(self.weaver_sft_training_args, k, v)
