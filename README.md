@@ -56,3 +56,15 @@ bash scripts/experiments/gsm8k/run_entropy_eval_sink4_q85.sh \
 - `answer.json`：模型回答与结果；
 - `augmentation_positions.csv`：实际 latent 插入位置；
 - `entropy_gate_trace.csv`：每个 delimiter 候选点的 entropy 与门控决定。
+
+## Teacher-constructed bank MVP
+
+离线 bank 构造不会更新 student 模型参数。配置好未提交的
+`DEEPSEEK_API_KEY` 后，可生成五条可检查的 GSM8K train bank record：
+
+```bash
+bash scripts/experiments/gsm8k/build_teacher_bank_preview.sh
+```
+
+输出位于 `MEMGEN_OUTPUT_ROOT/banks/gsm8k/`；详情见
+[docs/teacher_bank_mvp.md](docs/teacher_bank_mvp.md)。

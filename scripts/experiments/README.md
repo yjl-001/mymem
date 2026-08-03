@@ -27,3 +27,7 @@ bash scripts/experiments/gsm8k/run_entropy_calibration_sink4_q85.sh
 ```
 
 需要依赖前一阶段产物时，后续脚本接受该产物的绝对路径作为参数，而不会猜测“最新”运行。
+
+离线 bank 构造同样使用版本化的一键脚本。当前 GSM8K 预览见
+[`gsm8k/build_teacher_bank_preview.sh`](gsm8k/build_teacher_bank_preview.sh)；它需要
+未提交的 `DEEPSEEK_API_KEY`，且输出仅写入服务器的 `MEMGEN_OUTPUT_ROOT`。
