@@ -2,7 +2,6 @@
 stuff/
 .cache/
 .cursor/
-interactions/
 outputs/
 logs/
 *.log
