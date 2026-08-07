@@ -1,3 +1,4 @@
+import copy
 import logging
 import os
 import random
@@ -541,6 +542,9 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         max_augment_num = self.config.max_inference_aug_num
         invalid_token_id = -100
 
+        if generation_config is None:
+            raise ValueError("MemGenModel.generate requires an explicit generation_config.")
+
         # preprocess inputs
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
@@ -550,6 +554,29 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         pad_token_id = tokenizer.pad_token_id
         eos_token_id = tokenizer.eos_token_id
         prompt_len = input_ids.size(1)
+
+        def _context_limit(model) -> int | None:
+            limit = getattr(model.config, "max_position_embeddings", None)
+            return int(limit) if isinstance(limit, int) and limit > 0 else None
+
+        reasoner_context_limit = _context_limit(reasoner)
+        weaver_context_limit = _context_limit(weaver.model)
+
+        def _ensure_context_capacity(
+            mask: torch.Tensor,
+            extra_tokens: int,
+            limit: int | None,
+            component: str,
+        ) -> None:
+            if limit is None:
+                return
+            effective_lengths = mask.sum(dim=1)
+            if torch.any(effective_lengths + extra_tokens > limit):
+                longest = int(effective_lengths.max().item())
+                raise ValueError(
+                    f"{component} context limit ({limit}) would be exceeded: "
+                    f"current effective length={longest}, additional tokens={extra_tokens}."
+                )
 
         inputs_embeds = reasoner.get_input_embeddings()(input_ids)
         B, _, hidden_size = inputs_embeds.shape
@@ -589,6 +616,9 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         # Generation Loop Initialization.
         # sentence_augment_count 只统计 inference augmentation 次数，不统计第 0 步 prompt augmentation。
         sentence_augment_count = torch.zeros(B, dtype=torch.int, device=device)
+        # A row that has emitted EOS stays in the rectangular batch, but no
+        # longer receives trigger/Weaver decisions or valid generated tokens.
+        unfinished_sequences = torch.ones(B, dtype=torch.bool, device=device)
         
         # NOTE - Whether to call the trigger and insert latent memory before generating the token at this position
         # - augmentation_pos[b][i] == -100: For the b-th sequence, no augmentation was sampled before generating the i-th token
@@ -612,6 +642,7 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                         do_sample=trigger_do_sample,
                         temperature=generation_config.temperature,
                         is_prompt=True,
+                        attention_mask=current_token_attention_mask,
                     )
                 else:
                     augment_decision = torch.full(
@@ -641,7 +672,14 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                     do_sample=trigger_do_sample,
                     temperature=generation_config.temperature,
                     is_prompt=False,
+                    attention_mask=current_token_attention_mask,
                 )
+
+            augment_decision = torch.where(
+                unfinished_sequences,
+                augment_decision,
+                torch.full_like(augment_decision, invalid_token_id),
+            )
 
             if sink_score is not None:
                 logging.info(
@@ -687,10 +725,22 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                 # i == 0 使用 prompt latent；后续使用 inference latent。
                 weaver_inputs_embeds = self.reasoner_to_weaver(candidate_inputs_embeds)
                 if i == 0:
+                    _ensure_context_capacity(
+                        candidate_attention_mask,
+                        weaver.prompt_latents_num,
+                        weaver_context_limit,
+                        "Weaver",
+                    )
                     weaver_hidden_states, attn_mask, _ = weaver.augment_prompt(
                         weaver_inputs_embeds, candidate_attention_mask, candidate_position_ids
                     )                    
                 else:
+                    _ensure_context_capacity(
+                        candidate_attention_mask,
+                        weaver.inference_latents_num,
+                        weaver_context_limit,
+                        "Weaver",
+                    )
                     weaver_hidden_states, attn_mask, _ = weaver.augment_inference(
                         weaver_inputs_embeds, candidate_attention_mask, candidate_position_ids
                     )
@@ -735,14 +785,20 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
             # Check if all sequences have reached the maximum number of augmentations.
             # 一旦整批都达到上限，后面不再需要逐步调用 trigger/weaver，可以直接交给
             # HuggingFace generate 续写剩余 token。
-            if (sentence_augment_count >= max_augment_num).all():
-                # Adjust the remaining generation length
-                generation_config_continue = GenerationConfig(
-                    do_sample=weaver_do_sample,
-                    pad_token_id=pad_token_id,
-                    eos_token_id=eos_token_id,
-                    use_cache=False,
-                    max_new_tokens=max_new_tokens-i
+            if unfinished_sequences.all() and (sentence_augment_count >= max_augment_num).all():
+                # Preserve all caller settings (especially temperature) when
+                # switching from the custom loop to HuggingFace generation.
+                generation_config_continue = copy.deepcopy(generation_config)
+                generation_config_continue.do_sample = weaver_do_sample
+                generation_config_continue.pad_token_id = pad_token_id
+                generation_config_continue.eos_token_id = eos_token_id
+                generation_config_continue.use_cache = False
+                generation_config_continue.max_new_tokens = max_new_tokens - i
+                _ensure_context_capacity(
+                    current_attention_mask,
+                    generation_config_continue.max_new_tokens,
+                    reasoner_context_limit,
+                    "Reasoner",
                 )
                 # Perform generation for the remaining tokens using the reasoner
                 generated = reasoner.generate(
@@ -763,6 +819,13 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                 reasoner_inputs_embeds = current_inputs_embeds
                 reasoner_position_ids = current_position_ids
 
+            _ensure_context_capacity(
+                current_attention_mask,
+                1,
+                reasoner_context_limit,
+                "Reasoner",
+            )
+
             # reasoner 输出下一个真实 token 的分布；latent 不会直接出现在 output ids 中。
             outputs = reasoner(
                 inputs_embeds=reasoner_inputs_embeds,
@@ -779,13 +842,13 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                 current_position_ids, 
                 current_input_ids, 
                 do_sample=weaver_do_sample,
-                temperature=generation_config.temperature
+                temperature=generation_config.temperature,
+                active_mask=unfinished_sequences,
             )
-            next_token_mask = torch.ones(
-                (B, 1),
+            next_token_mask = unfinished_sequences.to(
                 dtype=current_token_attention_mask.dtype,
                 device=current_token_attention_mask.device,
-            )
+            ).unsqueeze(1)
             current_token_attention_mask = torch.cat(
                 [current_token_attention_mask, next_token_mask],
                 dim=1,
@@ -796,8 +859,9 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                 )
             current_cache = outputs.past_key_values
 
+            unfinished_sequences &= current_input_ids[:, -1].ne(eos_token_id)
             # If all sequences in the batch have already generated an EOS token, stop early.
-            if (current_input_ids[:, -1] == eos_token_id).all():
+            if not unfinished_sequences.any():
                 break  
 
             # This is needed to properly delete outputs.logits which may be very large for first iteration

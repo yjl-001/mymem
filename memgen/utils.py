@@ -92,16 +92,19 @@ class StaticEvalRecorder:
     # Internal storage
     metric_sums: Dict[str, float] = field(init=False)
     metric_counts: Dict[str, int] = field(init=False)
+    sample_idx:int = field(default=0, init=False)  # Track the number of samples recorded
 
     def __post_init__(self):
         self.metric_sums = {metric.__name__: 0.0 for metric in self.compute_metrics}
         self.metric_counts = {metric.__name__: 0 for metric in self.compute_metrics}
+        self._all_token_counts = []  # Store generated token counts for all samples
+        self.sample_idx = 0  # Initialize sample index
         if self.log_file:
             os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
             with open(self.log_file, 'w') as f:
                 f.write('')  # Clear file
 
-    def record_batch(self, completions: List[str], examples: List[Dict]):
+    def record_batch(self, completions: List[str], examples: List[Dict], generated_token_counts: List[int]):
         """Record results for a batch of model outputs.
 
         Args:
@@ -139,11 +142,20 @@ class StaticEvalRecorder:
             prompt = example.get("prompt", "")
             solution = example.get("solution", "")
             record = {
+                'sample_idx': self.sample_idx,
                 'prompt': prompt,
                 'solution': solution,
                 'completion': completion,
-                'metrics': metrics_result
+                'metrics': metrics_result,
+                'generated_token_count': generated_token_counts[i] if generated_token_counts else None
             }
+            for key in ("test", "test_info"):
+                if key in example:
+                    record[key] = example[key]
+
+            self.sample_idx += 1  # Increment sample index for the next record
+            if generated_token_counts and len(generated_token_counts) > i:
+                self._all_token_counts.append(generated_token_counts[i])  # Store the generated token count for this sample
 
             # Write the record into a log file (if available)
             if self.log_file:
@@ -168,6 +180,14 @@ class StaticEvalRecorder:
         final_record = {
             'summary_metrics': mean_metrics
         }
+
+        if self._all_token_counts:
+            final_record['summary_token_count'] = {
+                'avg': round(sum(self._all_token_counts) / len(self._all_token_counts), 2),
+                'max': max(self._all_token_counts),
+                'min': min(self._all_token_counts),
+                'total': sum(self._all_token_counts),
+            }
 
         if self.log_file:
             with open(self.log_file, 'a', encoding='utf-8') as f:

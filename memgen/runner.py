@@ -137,8 +137,17 @@ class MemGenRunner:
         # Static 数据通常有 prompt 字段；Dynamic/多轮数据通常有 messages 字段。
         def filter_func(sample):
             if "prompt" in sample and sample["prompt"] is not None:
-                prompt = tokenizer.apply_chat_template(sample["prompt"], tokenize=True)
-                return len(prompt) < max_len
+                prompt = sample["prompt"]
+                # Static builders historically support both raw strings (GPQA)
+                # and conversational prompts (GSM8K/KodCode).  A raw string is
+                # not valid input to apply_chat_template, so encode it directly.
+                if isinstance(prompt, str):
+                    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+                else:
+                    prompt_ids = tokenizer.apply_chat_template(
+                        prompt, tokenize=True, add_generation_prompt=True
+                    )
+                return len(prompt_ids) < max_len
             elif "messages" in sample and sample["messages"] is not None:
                 conversation = tokenizer.apply_chat_template(sample["messages"][:2], tokenize=True)
                 return len(conversation) < max_len
@@ -148,6 +157,42 @@ class MemGenRunner:
         dataset = dataset.filter(filter_func)
 
         return dataset
+
+    def _tokenize_static_prompts(self, prompts: list):
+        """Encode static-evaluation prompts using the same convention as GRPO.
+
+        Static datasets can contain either raw strings or ChatML message lists.
+        Keep the two formats separate instead of passing raw strings to
+        ``apply_chat_template``.  The chat template already emits structural
+        special tokens, so neither path asks the tokenizer to add another set.
+        """
+        if not prompts:
+            raise ValueError("Cannot generate from an empty static-evaluation batch.")
+
+        are_strings = [isinstance(prompt, str) for prompt in prompts]
+        if any(are_strings) and not all(are_strings):
+            raise TypeError(
+                "A static-evaluation batch must contain either only string prompts "
+                "or only chat-message prompts."
+            )
+
+        self.processing_class.padding_side = "left"
+        if all(are_strings):
+            return self.processing_class(
+                text=prompts,
+                return_tensors="pt",
+                padding=True,
+                add_special_tokens=False,
+            )
+
+        return self.processing_class.apply_chat_template(
+            prompts,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            padding=True,
+            return_dict=True,
+        )
     
     # ===== train weaver =====
     def _create_weaver_trainer(self):
@@ -316,22 +361,14 @@ class MemGenRunner:
         for test_batch in tqdm(test_dataloader, disable=not accelerator.is_main_process):
             with unwrap_model_for_generation(model_wrapped, accelerator) as unwrapped_model:
                 prompts = [x["prompt"] for x in test_batch]
-                prompt_inputs = self.processing_class.apply_chat_template(
-                    prompts,
-                    add_generation_prompt=True,
-                    return_tensors="pt",
-                    padding=True,
-                    padding_side="left",
-                    add_special_tokens=True,
-                    return_dict=True
-                )
+                prompt_inputs = self._tokenize_static_prompts(prompts)
                 prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
                 gen_batch = InteractionDataProto()
                 # InteractionManager 统一消费 InteractionDataProto：
-                # tensor_batch 放 input_ids/attention_mask，no_tensor_batch 放原始 prompt/env。
+                # batch 放 input_ids/attention_mask。单轮 manager 不消费原始 prompt，
+                # 因此不要在 no_tensor_batch 中留下看似会被使用的字段。
                 gen_batch.batch["input_ids"] = prompt_ids.to(accelerator.device)
                 gen_batch.batch["attention_mask"] = prompt_mask.to(accelerator.device)
-                gen_batch.no_tensor_batch["initial_prompts"] = prompts
 
                 self.generation_manager.actor_rollout_wg = unwrapped_model
                 gen_output = self.generation_manager.run_agent_loop(gen_batch)
@@ -341,11 +378,28 @@ class MemGenRunner:
 
                 completion_ids = gen_output.batch["responses"]
                 completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+                pad_id = self.processing_class.pad_token_id
+                eos_id = self.processing_class.eos_token_id
+                valid_mask = completion_ids.ne(pad_id)
+                is_eos = completion_ids.eq(eos_id) & valid_mask
+                has_eos = is_eos.any(dim=-1)
+                # argmax returns 0 for rows without EOS; torch.where selects
+                # non_pad_counts for those rows, so no Python-side correction is needed.
+                first_eos = is_eos.int().argmax(dim=-1)
+                non_pad_counts = valid_mask.sum(dim=-1)
+                generated_token_counts = torch.where(
+                    has_eos,
+                    first_eos + 1,  # Count the EOS generation step.
+                    non_pad_counts,
+                )
 
             # only main rank can write the json
             local_completions = completions
             local_batches = test_batch
             local_aug_pos = aug_pos_cpu
+            # all_gather_object serializes Python objects; stage this small
+            # tensor on CPU but keep it as a tensor until recorder output.
+            local_token_counts = generated_token_counts.cpu()
             local_entropy_gate_trace = {
                 "batch_size": len(test_batch),
                 "events": entropy_gate_trace,
@@ -354,11 +408,16 @@ class MemGenRunner:
             all_completions = gather_objects(local_completions)
             all_batches = gather_objects(local_batches)
             all_aug_pos_list = gather_objects(local_aug_pos) if local_aug_pos is not None else []
+            all_token_counts = gather_objects(local_token_counts)
             all_entropy_payloads = gather_objects(local_entropy_gate_trace)
 
             if accelerator.is_main_process:
-                for comps, batch in zip(all_completions, all_batches):
-                    recorder.record_batch(comps, batch)
+                for comps, batch, token_counts in zip(all_completions, all_batches, all_token_counts):
+                    recorder.record_batch(
+                        comps,
+                        batch,
+                        generated_token_counts=token_counts.tolist(),
+                    )
 
                 for rank_aug_pos in all_aug_pos_list:
                     if rank_aug_pos is not None:

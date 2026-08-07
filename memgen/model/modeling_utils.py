@@ -708,7 +708,8 @@ class MemGenGenerationMixin(GenerationMixin):
         sentence_augment_count: torch.LongTensor, 
         do_sample: bool,
         temperature: float,
-        is_prompt: bool = False
+        is_prompt: bool = False,
+        attention_mask: Optional[torch.LongTensor] = None,
     ) -> torch.LongTensor:
         """生成时决定当前位置是否插入 latent。
 
@@ -725,20 +726,32 @@ class MemGenGenerationMixin(GenerationMixin):
 
         batch_size = input_ids.size(0)
         
+        if attention_mask is None:
+            attention_mask = (input_ids != tokenizer.pad_token_id).long()
+        elif attention_mask.shape != input_ids.shape:
+            raise ValueError(
+                "trigger attention_mask must match input_ids: "
+                f"input_ids={tuple(input_ids.shape)}, "
+                f"attention_mask={tuple(attention_mask.shape)}"
+            )
+
+        position_ids = self._generate_position_ids(attention_mask)
+
         if is_prompt:  
             # 第 0 步是 prompt augmentation 候选点。先把所有样本标记为候选，
             # 再交给 trigger 或 active=False 默认策略决定是否插入。
-            attention_mask = (input_ids != tokenizer.pad_token_id).long()
-            position_ids = self._generate_position_ids(attention_mask)
             aug_vector = torch.zeros((batch_size,), dtype=torch.long, device=input_ids.device)
             trigger_indices = (aug_vector != -100).nonzero(as_tuple=True)[0]
 
         else:  
             # inference augmentation 只在 delimiter 后触发，并受每条样本的增强次数上限约束。
-            attention_mask = (input_ids != tokenizer.pad_token_id).long()
-            position_ids = self._generate_position_ids(attention_mask)
             aug_vector = torch.full((batch_size,), -100, dtype=torch.long, device=input_ids.device)
-            ends_with_delimiters = self._check_ends_with_delimiter_legacy_text(input_ids, tokenizer, delimiters).squeeze(1)
+            ends_with_delimiters = self._check_ends_with_delimiter(
+                input_ids,
+                tokenizer,
+                delimiters,
+                attention_mask=attention_mask,
+            ).squeeze(1)
             aug_vector[ends_with_delimiters] = 0
             over_limit = (sentence_augment_count >= max_augment_num)
             aug_vector[over_limit] = -100
@@ -773,7 +786,8 @@ class MemGenGenerationMixin(GenerationMixin):
         current_position_ids: torch.Tensor,
         current_input_ids: torch.Tensor,
         do_sample: bool,
-        temperature: float
+        temperature: float,
+        active_mask: Optional[torch.BoolTensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """把 reasoner 刚生成的一个真实 token 同步追加到四份生成状态中。"""
         B = current_inputs_embeds.size(0)
@@ -782,6 +796,16 @@ class MemGenGenerationMixin(GenerationMixin):
         # current_input_ids 只包含真实 token，不包含 latent。
         next_token_logits = reasoner_outputs.logits[:, -1]
         next_token_ids = self._get_next_token(next_token_logits, do_sample=do_sample, temperature=temperature)
+        if active_mask is None:
+            active_mask = torch.ones(B, dtype=torch.bool, device=current_input_ids.device)
+        elif active_mask.shape != (B,):
+            raise ValueError(
+                f"active_mask must have shape {(B,)}, got {tuple(active_mask.shape)}"
+            )
+        # Finished rows remain rectangular but only append masked padding. This
+        # prevents post-EOS ids from becoming trigger/Weaver candidates.
+        pad_token_ids = torch.full_like(next_token_ids, self.tokenizer.pad_token_id)
+        next_token_ids = torch.where(active_mask.unsqueeze(1), next_token_ids, pad_token_ids)
         current_input_ids = torch.cat([current_input_ids, next_token_ids], dim=1)
         
         # Append next token embeds.
@@ -790,8 +814,12 @@ class MemGenGenerationMixin(GenerationMixin):
         current_inputs_embeds = torch.cat([current_inputs_embeds, next_token_embeds], dim=1)
         
         # Append attention mask.
-        # 新生成 token 总是有效 token，mask 为 1。
-        attn_mask = torch.ones((B, 1), dtype=current_attention_mask.dtype, device=current_attention_mask.device)
+        # Only still-active rows append a valid token. Finished rows append a
+        # masked pad solely to preserve a rectangular batch tensor.
+        attn_mask = active_mask.to(
+            dtype=current_attention_mask.dtype,
+            device=current_attention_mask.device,
+        ).unsqueeze(1)
         current_attention_mask = torch.cat([current_attention_mask, attn_mask], dim=1)
         
         # Append position ids.
