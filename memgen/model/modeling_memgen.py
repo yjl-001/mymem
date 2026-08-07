@@ -1,7 +1,6 @@
 import copy
 import logging
 import os
-import random
 from typing import Union
 
 from peft import PeftModel
@@ -130,12 +129,36 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
     @property
     def device(self):
         return self.reasoner.device
+
+    @staticmethod
+    def _context_limit(model) -> int | None:
+        limit = getattr(model.config, "max_position_embeddings", None)
+        return int(limit) if isinstance(limit, int) and limit > 0 else None
+
+    @staticmethod
+    def _ensure_context_capacity(
+        mask: torch.Tensor,
+        extra_tokens: int,
+        limit: int | None,
+        component: str,
+    ) -> None:
+        """Fail before an augmented sequence exceeds a model's context window."""
+        if limit is None:
+            return
+        effective_lengths = mask.sum(dim=1)
+        if torch.any(effective_lengths + extra_tokens > limit):
+            longest = int(effective_lengths.max().item())
+            raise ValueError(
+                f"{component} context limit ({limit}) would be exceeded: "
+                f"current effective length={longest}, additional tokens={extra_tokens}."
+            )
     
     def _forward(
         self, 
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: torch.Tensor,   
+        enable_prompt_augmentation: bool = True,
         **kwargs
     ) -> torch.Tensor:
         """单个 instruction/turn 的 latent-augmented forward。
@@ -172,7 +195,10 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
             delimiters,
             tokenizer,
             max_augment_num,
+            enable_prompt_augmentation=enable_prompt_augmentation,
         )
+        reasoner_context_limit = self._context_limit(reasoner)
+        weaver_context_limit = self._context_limit(weaver.model)
         
         # origin inputs embeds: (B, L_origin, H_reasoner)
         inputs_embeds = reasoner.get_input_embeddings()(input_ids)
@@ -210,10 +236,22 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
             # Depending on type, use weaver to augment prompt or inference.
             # 两类 augment 使用不同的 query latent 参数。
             if is_prompt_end_aug:
+                self._ensure_context_capacity(
+                    current_attention_mask,
+                    weaver.prompt_latents_num,
+                    weaver_context_limit,
+                    "Weaver",
+                )
                 weaver_hidden_states, attn_mask, pos_ids = weaver.augment_prompt(
                     weaver_inputs_embeds, current_attention_mask, current_position_ids
                 )
             else:
+                self._ensure_context_capacity(
+                    current_attention_mask,
+                    weaver.inference_latents_num,
+                    weaver_context_limit,
+                    "Weaver",
+                )
                 weaver_hidden_states, attn_mask, pos_ids = weaver.augment_inference(
                     weaver_inputs_embeds, current_attention_mask, current_position_ids
                 ) 
@@ -242,6 +280,13 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         current_attention_mask = torch.cat([current_attention_mask, remaining_attention_mask], dim=1)
         current_position_ids = self._generate_position_ids(current_attention_mask)
         current_latents_mask = torch.cat([current_latents_mask, latent_mask], dim=1)
+
+        self._ensure_context_capacity(
+            current_attention_mask,
+            0,
+            reasoner_context_limit,
+            "Reasoner",
+        )
 
         reasoner_outputs = reasoner(
             inputs_embeds=current_inputs_embeds,
@@ -346,39 +391,46 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
             triplets.append((start, s, e))
             start = e
         
-        # If there are more segments than allowed, randomly select self.max_prompt_aug_num segments.
-        # conversation 模式下 max_prompt_aug_num 表示最多对多少个 turn 做 prompt augmentation。
-        if len(triplets) <= self.config.max_prompt_aug_num:
-            select_turns = [1] * len(triplets)
-        else:
-            triplets_num = len(triplets)
-            selected_indices = set(random.sample(range(triplets_num), self.config.max_prompt_aug_num))
-            select_turns = [1 if i in selected_indices else 0 for i in range(triplets_num)]
+        # ``max_prompt_aug_num`` limits prompt-latent insertion, never which
+        # assistant turns contribute to SFT loss. Use a deterministic subset
+        # for augmentation so evaluation is reproducible and checkpointed
+        # forwards cannot sample a different objective during recomputation.
+        augment_turn_count = min(len(triplets), self.config.max_prompt_aug_num)
+        augment_turns = [index < augment_turn_count for index in range(len(triplets))]
 
         # Initialize tensors to store logits and labels for the entire sequence
-        all_logits = torch.zeros(1, seq_len, vocab_size, device=device)
+        all_logits = torch.zeros(
+            1,
+            seq_len,
+            vocab_size,
+            device=device,
+            dtype=self.reasoner.get_input_embeddings().weight.dtype,
+        )
         all_labels = torch.full((1, seq_len), -100, device=device)
 
         # Loop over each conversation turn and perform single-turn forward if supervised.
         # 注意：这里每个 turn 都重新调用 _forward，因此上一轮插入的 latent 不会泄漏到下一轮。
-        for triplet, should_supervise in zip(triplets, select_turns):
+        for triplet, enable_prompt_augmentation in zip(triplets, augment_turns):
             start, valid_start, end = triplet
-            if should_supervise:
-                cur_input_ids = input_ids[0, :end].unsqueeze(0)
-                cur_attention = attention_mask[0, :end].unsqueeze(0)
-                # cur_labels only used for _forward, does not represent the true supervision range.
-                # 它的主要作用是告诉 _forward 当前 turn 的 prompt 边界在哪里。
-                # cur_labels = labels[0, :end].clone().unsqueeze(0)
-                # cur_labels[0, :valid_start] = -100  # Mask tokens before supervision start
-                cur_labels = torch.full((1, end), -100, device=device)
-                cur_labels[0, valid_start:end] = labels[0, valid_start:end]
+            cur_input_ids = input_ids[0, :end].unsqueeze(0)
+            cur_attention = attention_mask[0, :end].unsqueeze(0)
+            # cur_labels only identifies this turn's prompt/completion boundary;
+            # earlier assistant turns remain context but are not re-supervised.
+            cur_labels = torch.full((1, end), -100, device=device)
+            cur_labels[0, valid_start:end] = labels[0, valid_start:end]
 
-                # Single-turn forward for the current conversation segment
-                logits = self._forward(cur_input_ids, cur_attention, cur_labels, **kwargs)
-                
-                # Update overall logits and labels with the results of this segment
-                all_logits[0, start:end, :] = logits[0, start:end, :]
-                all_labels[0, start:end] = labels[0, start:end]
+            logits = self._forward(
+                cur_input_ids,
+                cur_attention,
+                cur_labels,
+                enable_prompt_augmentation=enable_prompt_augmentation,
+                **kwargs,
+            )
+
+            # Every assistant turn remains supervised, including turns that
+            # intentionally receive no prompt latent.
+            all_logits[0, start:end, :] = logits[0, start:end, :]
+            all_labels[0, start:end] = labels[0, start:end]
 
         # Return logits and labels:
         # - supervised positions retain computed logits and original labels
@@ -405,8 +457,18 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
        
         # Use only the first data sample of each dataset to determine the model state.
         # 当前实现假设同一次训练/评测的数据形态一致。
-        if self.state is None:  
-            self.state = MemGenModel.CONVERSATION_STATE if self._is_conversation(input_ids, tokenizer) else MemGenModel.INSTRUCTION_STATE
+        observed_state = (
+            MemGenModel.CONVERSATION_STATE
+            if self._is_conversation(input_ids, tokenizer)
+            else MemGenModel.INSTRUCTION_STATE
+        )
+        if self.state is None:
+            self.state = observed_state
+        elif self.state != observed_state:
+            raise ValueError(
+                "MemGenModel received mixed instruction and conversation batches in one run. "
+                "Use a homogeneous dataset or reset model.state before switching datasets."
+            )
 
         if self.state == MemGenModel.INSTRUCTION_STATE:
             forward_func = self._instructional_forward
@@ -446,6 +508,8 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         # 原始 labels 做标准 causal LM shift。
         shift_logits = all_logits[..., :-1, :].contiguous()
         shift_labels = all_labels[..., 1:].contiguous()
+        if not (shift_labels != -100).any():
+            raise ValueError("SFT batch has no supervised target tokens after preprocessing.")
         # assert shift_logits.shape[:-1] == shift_labels.shape
         loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
@@ -555,28 +619,8 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         eos_token_id = tokenizer.eos_token_id
         prompt_len = input_ids.size(1)
 
-        def _context_limit(model) -> int | None:
-            limit = getattr(model.config, "max_position_embeddings", None)
-            return int(limit) if isinstance(limit, int) and limit > 0 else None
-
-        reasoner_context_limit = _context_limit(reasoner)
-        weaver_context_limit = _context_limit(weaver.model)
-
-        def _ensure_context_capacity(
-            mask: torch.Tensor,
-            extra_tokens: int,
-            limit: int | None,
-            component: str,
-        ) -> None:
-            if limit is None:
-                return
-            effective_lengths = mask.sum(dim=1)
-            if torch.any(effective_lengths + extra_tokens > limit):
-                longest = int(effective_lengths.max().item())
-                raise ValueError(
-                    f"{component} context limit ({limit}) would be exceeded: "
-                    f"current effective length={longest}, additional tokens={extra_tokens}."
-                )
+        reasoner_context_limit = self._context_limit(reasoner)
+        weaver_context_limit = self._context_limit(weaver.model)
 
         inputs_embeds = reasoner.get_input_embeddings()(input_ids)
         B, _, hidden_size = inputs_embeds.shape
@@ -725,7 +769,7 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                 # i == 0 使用 prompt latent；后续使用 inference latent。
                 weaver_inputs_embeds = self.reasoner_to_weaver(candidate_inputs_embeds)
                 if i == 0:
-                    _ensure_context_capacity(
+                    self._ensure_context_capacity(
                         candidate_attention_mask,
                         weaver.prompt_latents_num,
                         weaver_context_limit,
@@ -735,7 +779,7 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                         weaver_inputs_embeds, candidate_attention_mask, candidate_position_ids
                     )                    
                 else:
-                    _ensure_context_capacity(
+                    self._ensure_context_capacity(
                         candidate_attention_mask,
                         weaver.inference_latents_num,
                         weaver_context_limit,
@@ -794,7 +838,7 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                 generation_config_continue.eos_token_id = eos_token_id
                 generation_config_continue.use_cache = False
                 generation_config_continue.max_new_tokens = max_new_tokens - i
-                _ensure_context_capacity(
+                self._ensure_context_capacity(
                     current_attention_mask,
                     generation_config_continue.max_new_tokens,
                     reasoner_context_limit,
@@ -819,7 +863,7 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
                 reasoner_inputs_embeds = current_inputs_embeds
                 reasoner_position_ids = current_position_ids
 
-            _ensure_context_capacity(
+            self._ensure_context_capacity(
                 current_attention_mask,
                 1,
                 reasoner_context_limit,
