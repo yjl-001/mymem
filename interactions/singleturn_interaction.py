@@ -117,13 +117,24 @@ class SingleTurnInteractionManager(InteractionManager):
             self.tokenizer.eos_token_id,
         )
         responses_ids = self.tensor_fn.erase_after_first_eos(responses_ids, self.tokenizer.eos_token_id)
+
+        # ``augmentation_pos`` is indexed by raw generation step.  Response
+        # cleanup above only replaces trailing tokens with padding, so retain
+        # the common tensor width but invalidate every removed step.  This
+        # keeps exported augmentation records aligned with decoded responses.
+        augmentation_pos = augmentation_pos.masked_fill(
+            responses_ids == self.tokenizer.pad_token_id, -100
+        )
         
         # update right side
         original_right_side = self._update_right_side(original_right_side, responses_ids, next_obs_ids=None)
         
         # construct final output
         final_output = self._compose_final_output(original_left_side, original_right_side)
-        final_output.batch["augmentation_pos"] = augmentation_pos
+        response_width = final_output.batch["responses"].size(1)
+        final_output.batch["augmentation_pos"] = augmentation_pos[:, :response_width]
+        if final_output.batch["augmentation_pos"].shape != final_output.batch["responses"].shape:
+            raise RuntimeError("augmentation_pos must align with cleaned response tokens")
         final_output.no_tensor_batch["entropy_gate_trace"] = entropy_gate_trace
         return final_output
     
