@@ -133,9 +133,35 @@ class MemGenRunner:
         else:
             raise ValueError("Wrong training mode.")
 
+        def _sft_input_ids(sample):
+            """Mirror TRL's full-example tokenization for SFT length filtering."""
+            if "messages" in sample and sample["messages"] is not None:
+                return tokenizer.apply_chat_template(sample["messages"], tokenize=True)
+
+            prompt = sample.get("prompt")
+            completion = sample.get("completion")
+            if prompt is None or completion is None:
+                return None
+            if isinstance(prompt, str) and isinstance(completion, str):
+                full_text = prompt + completion
+                if tokenizer.eos_token and not completion.endswith(tokenizer.eos_token):
+                    full_text += tokenizer.eos_token
+                return tokenizer(text=full_text)["input_ids"]
+            if isinstance(prompt, list) and isinstance(completion, list):
+                return tokenizer.apply_chat_template(
+                    prompt + completion,
+                    tokenize=True,
+                )
+            raise TypeError("SFT prompt and completion must both be strings or message lists.")
+
         # Function to filter out samples exceeding max length.
-        # Static 数据通常有 prompt 字段；Dynamic/多轮数据通常有 messages 字段。
+        # SFT must validate the complete rendered sequence, not just its prompt:
+        # truncating away every answer token would yield an invalid loss batch.
         def filter_func(sample):
+            if self.run_mode != "evaluate" and self.train_weaver and self.train_weaver_method == "sft":
+                full_input_ids = _sft_input_ids(sample)
+                if full_input_ids is not None:
+                    return len(full_input_ids) <= max_len
             if "prompt" in sample and sample["prompt"] is not None:
                 prompt = sample["prompt"]
                 # Static builders historically support both raw strings (GPQA)

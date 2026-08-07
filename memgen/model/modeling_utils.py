@@ -434,6 +434,7 @@ class MemGenGenerationMixin(GenerationMixin):
         delimiters: list[str],
         tokenizer: PreTrainedTokenizerBase,
         max_num: int = 10,
+        enable_prompt_augmentation: bool = True,
     ) -> list[int]:
         """由配置的策略选择 SFT prompt 与 inference latent 插入位置。"""
 
@@ -472,7 +473,7 @@ class MemGenGenerationMixin(GenerationMixin):
         inference_points = strategy.select(points, max_num=max_num)
         augmentation_points = (
             [prompt_augment_idx]
-            if self.config.max_prompt_aug_num > 0
+            if enable_prompt_augmentation and self.config.max_prompt_aug_num > 0
             else []
         )
         augmentation_points.extend(inference_points)
@@ -495,7 +496,9 @@ class MemGenGenerationMixin(GenerationMixin):
             logging.info(
                 "[WeaverSelected] strategy=%s prompt=%s inference=%s",
                 strategy.config.name,
-                prompt_augment_idx if self.config.max_prompt_aug_num > 0 else None,
+                prompt_augment_idx
+                if enable_prompt_augmentation and self.config.max_prompt_aug_num > 0
+                else None,
                 selected_summary,
             )
             self._weaver_selected_log_count = selected_log_count + 1
