@@ -62,6 +62,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Accelerate process count; defaults to the number of selected CUDA devices",
     )
+    parser.add_argument(
+        "--main-process-port",
+        type=int,
+        help="override Accelerate's main-process port from the config file",
+    )
     return parser.parse_args()
 
 
@@ -156,6 +161,11 @@ def main() -> None:
         str(accelerate_cfg),
         "--num_processes",
         str(num_processes),
+        *(
+            ["--main_process_port", str(args.main_process_port)]
+            if args.main_process_port is not None
+            else []
+        ),
         "main.py",
         "--cfg-path",
         str(base_path),

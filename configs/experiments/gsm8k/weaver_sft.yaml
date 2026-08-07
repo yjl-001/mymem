@@ -1,0 +1,21 @@
+# GSM8K Weaver SFT with deterministic first-k delimiter insertion.
+base_cfg_path: configs/latent_memory/gsm8k.yaml
+
+launcher:
+  accelerate_config: configs/zero2.yaml
+
+model:
+  max_prompt_aug_num: 1
+  max_inference_aug_num: 5
+  weaver:
+    insertion_strategy:
+      name: first_k
+
+dataset:
+  mode: sft
+
+run:
+  mode: train
+  train_weaver: true
+  train_weaver_method: sft
+  train_trigger: false
