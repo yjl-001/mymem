@@ -1,0 +1,14 @@
+# GSM8K evaluation for a Weaver SFT checkpoint using deterministic first-k
+# delimiter insertion. Runtime values are set by the companion shell script.
+base_cfg_path: configs/latent_memory/gsm8k.yaml
+
+launcher:
+  accelerate_config: configs/zero2.yaml
+
+dataset:
+  mode: sft
+
+run:
+  mode: evaluate
+  train_weaver: false
+  train_trigger: false
