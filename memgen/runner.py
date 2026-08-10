@@ -279,8 +279,11 @@ class MemGenRunner:
             # Trigger GRPO 训练时固定 Weaver 的生成采样，只让 Trigger 决策探索。
             self.generation_manager.generation_config.trigger_do_sample = True
             self.generation_manager.generation_config.weaver_do_sample = False
-            self.generation_manager.generation_config.temperature = self.weaver_grpo_training_args.temperature
-            self.generation_manager.generation_config.max_new_tokens = self.weaver_grpo_training_args.max_completion_length
+            # Trigger stage must use its own rollout settings.  Reading the
+            # Weaver GRPO config here silently made trigger-only overrides of
+            # temperature/max_completion_length ineffective.
+            self.generation_manager.generation_config.temperature = self.trigger_grpo_training_args.temperature
+            self.generation_manager.generation_config.max_new_tokens = self.trigger_grpo_training_args.max_completion_length
             
             trigger_trainer = TriggerGRPOTrainer(
                 model=self.model, 

@@ -1,0 +1,15 @@
+# Train the Trigger with GRPO from a completed GSM8K Weaver checkpoint.
+# Runtime model paths and hyperparameters are set by the companion shell script.
+base_cfg_path: configs/latent_memory/gsm8k.yaml
+
+launcher:
+  accelerate_config: configs/zero2.yaml
+
+dataset:
+  mode: grpo
+
+run:
+  mode: train
+  train_weaver: false
+  train_trigger: true
+  train_trigger_method: grpo
