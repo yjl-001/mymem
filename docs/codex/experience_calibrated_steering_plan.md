@@ -306,11 +306,13 @@ injection_applied, generation_length, final_reward, output_path
 - GSM8K delimiter 上的 sink-masked entropy tracing、阈值校准和实验脚本；
 - DeepSeek 离线 teacher-bank MVP，能产生可审计的 target/reference schema；
 - 原始 MemGen 与 entropy gate 的基础实验工作流。
+- Phase 1 verifier-backed bank 流水线代码：固定 split manifest、冻结 student rollout、
+  success/failure 配对、teacher quality mark、自动审计与 30 条人工复核清单；
 
 尚未完成：
 
-- verifier-backed student success/failure rollout collection；
-- bank quality gate、经验聚类与正式 reference；
+- 在服务器上运行完整 Phase 1 rollout/teacher 流水线，并完成人工复核验收；
+- 经验聚类；
 - vector compiler、layer hook、soft-gated residual integrator；
 - Phase 2–4 的对照评测；
 - MI side-KV bank 实现。

@@ -31,3 +31,13 @@ bash scripts/experiments/gsm8k/run_entropy_calibration_sink4_q85.sh
 离线 bank 构造同样使用版本化的一键脚本。当前 GSM8K 预览见
 [`gsm8k/build_teacher_bank_preview.sh`](gsm8k/build_teacher_bank_preview.sh)；它需要
 未提交的 `DEEPSEEK_API_KEY`，且输出仅写入服务器的 `MEMGEN_OUTPUT_ROOT`。
+
+正式的 verifier-backed Phase 1 bank 使用：
+
+```bash
+bash scripts/experiments/gsm8k/run_phase1_verified_bank.sh
+```
+
+它会依次冻结 split、采样 student rollout、用 GSM8K verifier 标记成功/失败、形成
+同题 contrast、调用离线 teacher、执行自动 quality gate，并生成 30 条人工复核清单。
+`approved_bank_records.jsonl` 只包含绑定了真实 `verified_failure` episode 的记录。

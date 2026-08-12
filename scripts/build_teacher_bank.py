@@ -19,11 +19,12 @@ import os
 from pathlib import Path
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Any, Iterable
 from urllib import error, request
 
 
-PROMPT_VERSION = "teacher-bank-v1"
+PROMPT_VERSION = "teacher-bank-v2-verified-contrast"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-pro"
 
@@ -56,6 +57,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=900)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Append to an existing output and skip already written episode/experience IDs.",
+    )
     parser.add_argument(
         "--thinking",
         choices=("enabled", "disabled"),
@@ -99,8 +105,40 @@ def jsonl_examples(path: Path, offset: int, limit: int) -> Iterable[dict[str, An
         missing = [key for key in ("context", "trajectory") if not item.get(key)]
         if missing:
             raise ValueError(f"Episode {index} missing required fields: {', '.join(missing)}")
+        reference_evidence = item.get(
+            "reference_evidence",
+            "verified_failure" if item.get("reference_trajectory") else "teacher_inferred",
+        )
+        if reference_evidence == "verified_failure":
+            if item.get("outcome") != "verified_success" or item.get("reward") != 1.0:
+                raise ValueError(
+                    f"Episode {index} claims verified contrast but target is not verified_success"
+                )
+            target_verifier = item.get("target_verifier")
+            reference_verifier = item.get("reference_verifier")
+            if not isinstance(target_verifier, dict) or target_verifier.get("reward") != 1.0:
+                raise ValueError(
+                    f"Episode {index} claims verified target without a one-reward verifier record"
+                )
+            if not isinstance(reference_verifier, dict) or reference_verifier.get("reward") != 0.0:
+                raise ValueError(
+                    f"Episode {index} claims verified failure without a zero-reward verifier record"
+                )
+            if not item.get("target_episode_id") or not item.get("reference_episode_id"):
+                raise ValueError(
+                    f"Episode {index} claims verified contrast without source episode IDs"
+                )
+            if not item.get("reference_trajectory") or not item.get("provenance_sha256"):
+                raise ValueError(
+                    f"Episode {index} claims verified contrast without trajectory/provenance"
+                )
+            if item.get("source", {}).get("logical_split") != "bank-source":
+                raise ValueError(
+                    f"Episode {index} formal contrast must come from bank-source"
+                )
         yield {
-            "id": str(item.get("id", f"episode-{index}")),
+            "id": str(item.get("experience_id", item.get("id", f"episode-{index}"))),
+            "experience_id": item.get("experience_id"),
             "source": item.get("source", {"input_jsonl": str(path.expanduser())}),
             "context": str(item["context"]),
             "trajectory": str(item["trajectory"]),
@@ -108,10 +146,15 @@ def jsonl_examples(path: Path, offset: int, limit: int) -> Iterable[dict[str, An
             "reward": item.get("reward"),
             "feedback": item.get("feedback", ""),
             "reference_trajectory": item.get("reference_trajectory", ""),
-            "reference_evidence": item.get(
-                "reference_evidence",
-                "verified_failure" if item.get("reference_trajectory") else "teacher_inferred",
-            ),
+            "reference_evidence": reference_evidence,
+            "target_episode_id": item.get("target_episode_id"),
+            "reference_episode_id": item.get("reference_episode_id"),
+            "target_verifier": item.get("target_verifier"),
+            "reference_verifier": item.get("reference_verifier"),
+            "student": item.get("student"),
+            "rollout_configuration": item.get("rollout_configuration"),
+            "provenance_sha256": item.get("provenance_sha256"),
+            "experience_created_at": item.get("created_at"),
         }
 
 
@@ -155,11 +198,20 @@ Return this JSON object exactly:
     "failure_mechanism": "...",
     "non_reuse_boundary": "...",
     "confidence": 0.0
+  }},
+  "quality": {{
+    "target_supported": true,
+    "reference_supported": true,
+    "target_reference_distinct": true,
+    "contains_instance_specific_details": false,
+    "issues": []
   }}
 }}
 
 Use confidence in [0, 1]. If no failed trajectory was supplied, infer only a
-generic counter-pattern and do not claim that it was observed in this episode."""
+generic counter-pattern and do not claim that it was observed in this episode.
+The quality booleans are strict evidence checks. Mark an item unsupported or
+not distinct instead of repairing it with invented details."""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -174,6 +226,8 @@ def parse_json_payload(content: str) -> dict[str, Any]:
     for section in ("target", "reference"):
         if not isinstance(payload.get(section), dict):
             raise ValueError(f"Teacher response missing object: {section}")
+    if not isinstance(payload.get("quality"), dict):
+        raise ValueError("Teacher response missing object: quality")
     return payload
 
 
@@ -228,9 +282,20 @@ def main() -> None:
 
     output_path = args.output.expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    completed_ids: set[str] = set()
+    if args.resume and output_path.exists():
+        with output_path.open(encoding="utf-8") as existing:
+            for line in existing:
+                if line.strip():
+                    record = json.loads(line)
+                    completed_ids.add(str(record.get("experience_id") or record["episode_id"]))
     records_written = 0
-    with output_path.open("w", encoding="utf-8") as handle:
+    mode = "a" if args.resume else "w"
+    with output_path.open(mode, encoding="utf-8") as handle:
         for episode in episodes:
+            if episode["id"] in completed_ids:
+                print(f"[teacher-bank] skip completed {episode['id']}", flush=True)
+                continue
             bank = call_teacher(
                 base_url=args.base_url,
                 api_key=api_key,
@@ -242,14 +307,26 @@ def main() -> None:
                 thinking=args.thinking,
             )
             record = {
-                "schema_version": "teacher-bank-record-v1",
+                "schema_version": "teacher-bank-record-v2",
                 "prompt_version": PROMPT_VERSION,
+                "created_at": datetime.now(timezone.utc).isoformat(),
                 "teacher": {"model": args.model, "base_url": args.base_url},
                 "source": episode["source"],
                 "episode_id": episode["id"],
+                "experience_id": episode.get("experience_id") or episode["id"],
                 "outcome": episode["outcome"],
                 "reward": episode["reward"],
                 "reference_evidence": episode["reference_evidence"],
+                "source_episode_ids": {
+                    "target": episode.get("target_episode_id"),
+                    "reference": episode.get("reference_episode_id"),
+                },
+                "target_verifier": episode.get("target_verifier"),
+                "reference_verifier": episode.get("reference_verifier"),
+                "student": episode.get("student"),
+                "rollout_configuration": episode.get("rollout_configuration"),
+                "provenance_sha256": episode.get("provenance_sha256"),
+                "experience_created_at": episode.get("experience_created_at"),
                 "bank": bank,
             }
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")

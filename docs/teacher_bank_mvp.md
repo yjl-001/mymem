@@ -27,6 +27,9 @@ failed rollout in this preview, so every generated reference is labelled
 quality inspection only; they must not be used as the reference bank for a
 formal contrastive evaluation.
 
+Teacher output now also includes a strict `quality` object. The preview still
+does not become formal evidence merely because the teacher self-check passes.
+
 ## Generic episode input
 
 For a verified rollout dataset, pass `--input-jsonl`. Each input line must
@@ -36,5 +39,12 @@ contain `context` and `trajectory`; optional fields are `id`, `source`,
 `"reference_evidence": "verified_failure"`.
 
 This allows GSM8K, code, retrieval, and interactive-agent episodes to share a
-single bank-building interface. The next stage will add verifier-backed student
-rollouts so that both target and reference banks derive from observed outcomes.
+single bank-building interface. The formal Phase 1 workflow supplies
+verifier-backed student rollouts so that both target and reference records derive
+from observed outcomes.
+
+The formal GSM8K implementation is now available through
+`scripts/experiments/gsm8k/run_phase1_verified_bank.sh`; see
+`docs/gsm8k_phase1_verified_bank.md`. For any record claiming
+`reference_evidence=verified_failure`, the builder rejects missing success/failure
+verifier records, source episode IDs, `bank-source` provenance, or provenance hash.

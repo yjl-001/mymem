@@ -10,29 +10,8 @@ from safetensors import safe_open
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 
+from memgen.chat_templates import CONVERSATION_TEMPLATE
 
-# ===== chat template =====
-
-# from https://huggingface.co/HuggingFaceTB/SmolLM3-3B/blob/main/chat_template.jinja
-CONVERSATION_TEMPLATE = r"""
-{# ───── main loop ───── #}
-{%- for message in messages -%}
-    {%- set content = message.content if message.content is string else "" -%}
-    {%- if (message.role == "user") or (message.role == "system") -%}
-        {{ "<|im_start|>" + message.role + "\n"  + content + "<|im_end|>\n" }}
-    {%- elif message.role == "assistant" -%}
-        {%- generation -%}
-        {{ "<|im_start|>assistant\n" + content + "<|im_end|>\n" }}
-        {%- endgeneration -%}
-    {%- elif message.role == "tool" -%}
-    {{ "<|im_start|>" + "user\n"  + content + "<|im_end|>\n" }}
-    {%- endif -%}
-{%- endfor -%}
-{# ───── generation prompt ───── #}
-{%- if add_generation_prompt -%}
-    {{ "<|im_start|>assistant\n" }}
-{%- endif -%}
-""".strip()
 
 # ===== torch part =====
 def load_state_dict_from_safetensor(model_path) -> Dict:
