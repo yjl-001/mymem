@@ -20,6 +20,11 @@ SEAL-style vector 是第一版的注入接口。后续可在不改变经验生�
 本计划不宣称 zero-shot 或“无外部监督”：bank 构造使用训练期的、已验证的
 rollout；教师模型只在离线阶段参与反思、归类和质检。
 
+本计划中 MemGen、FlashMem、SEAL 和 MI 的精确机制、训练边界与项目映射，统一见
+[前置方法：MemGen、FlashMem、SEAL 与 Memory Inception](method_prerequisites_memgen_flashmem_seal_mi.md)。
+下文仅引用其接口职责：MemGen 提供控制框架，FlashMem 提供候选熵门控，SEAL 提供
+Phase 2 的 residual-vector MVP，MI 是 Phase 5 的 side-KV 升级路径。
+
 ## 2. 总体架构
 
 ```text
