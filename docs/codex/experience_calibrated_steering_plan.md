@@ -283,6 +283,12 @@ injection_applied, generation_length, final_reward, output_path
 ## 7. 实验纪律
 
 - 每个训练/评测实验使用一个反映核心变量的 bash 脚本和独立输出目录；
+- **每个 Phase 的编码完成后，必须先生成该 Phase 对应的一键服务器运行 `.sh` 脚本**。
+  脚本需加载 `scripts/experiments/.server.env`、使用能反映阶段与核心变量的运行目录名、
+  输出 artifact/trace 的明确路径，并可在服务器上通过一条 `bash <script>` 命令执行。
+  完成最小本地校验后，连同代码、配置和脚本一起 commit + push 到 `origin/main`；只有
+  推送完成后，才向用户交付服务器运行命令。不得要求用户手工拼接 Python 参数或修改
+  已跟踪脚本来完成某个阶段的正式实验；
 - 每次代码修改完成后，运行对应的最小校验，并 commit + push 到 `origin/main`；
 - `.server.env` 仅保存本机路径与 API key，不进入 Git；
 - 任何 bank artifact、split manifest 和结果必须带版本/hash；
