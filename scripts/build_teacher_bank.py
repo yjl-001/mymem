@@ -20,8 +20,9 @@ from pathlib import Path
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Iterable
-from urllib import error, request
+from typing import Any, Callable, Iterable
+
+import requests
 
 
 PROMPT_VERSION = "teacher-bank-v2-verified-contrast"
@@ -57,6 +58,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=900)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument(
+        "--proxy-retries",
+        type=int,
+        default=20,
+        help=(
+            "Additional retries for proxy tunnel/authentication failures. The default "
+            "long backoff covers roughly 90 minutes."
+        ),
+    )
+    parser.add_argument("--proxy-retry-initial-seconds", type=float, default=30.0)
+    parser.add_argument("--proxy-retry-max-seconds", type=float, default=300.0)
+    parser.add_argument("--connect-timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--read-timeout-seconds", type=float, default=180.0)
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -231,46 +245,232 @@ def parse_json_payload(content: str) -> dict[str, Any]:
     return payload
 
 
+class TeacherClient:
+    """Persistent and credential-safe teacher API client.
+
+    One ``requests.Session`` is shared by all bank records, allowing HTTPS and
+    proxy tunnels to be reused. Proxy failures use a separate long backoff
+    because an enterprise gateway may take minutes to refresh authentication.
+    Exception strings and proxy URLs are deliberately excluded from logs since
+    they may contain credentials.
+    """
+
+    TRANSIENT_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        retries: int,
+        proxy_retries: int,
+        proxy_retry_initial_seconds: float,
+        proxy_retry_max_seconds: float,
+        connect_timeout_seconds: float,
+        read_timeout_seconds: float,
+        thinking: str,
+        session: requests.Session | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if not api_key:
+            raise ValueError("Teacher API key must not be empty")
+        if retries <= 0:
+            raise ValueError("retries must be positive")
+        if proxy_retries < 0:
+            raise ValueError("proxy_retries must be non-negative")
+        if proxy_retry_initial_seconds <= 0 or proxy_retry_max_seconds <= 0:
+            raise ValueError("proxy retry delays must be positive")
+        if connect_timeout_seconds <= 0 or read_timeout_seconds <= 0:
+            raise ValueError("HTTP timeouts must be positive")
+
+        self.endpoint = base_url.rstrip("/") + "/chat/completions"
+        self.model = model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.retries = retries
+        self.proxy_retries = proxy_retries
+        self.proxy_retry_initial_seconds = proxy_retry_initial_seconds
+        self.proxy_retry_max_seconds = proxy_retry_max_seconds
+        self.timeout = (connect_timeout_seconds, read_timeout_seconds)
+        self.thinking = thinking
+        self.session = session or requests.Session()
+        # requests reads HTTP(S)_PROXY/NO_PROXY via trust_env. Credentials stay
+        # in memory and are never interpolated into our logs.
+        self.session.trust_env = True
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+        )
+        self._sleep = sleep
+
+    def close(self) -> None:
+        self.session.close()
+
+    def __enter__(self) -> "TeacherClient":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def _proxy_wait_seconds(self, failure_count: int) -> float:
+        return min(
+            self.proxy_retry_initial_seconds * (2 ** (failure_count - 1)),
+            self.proxy_retry_max_seconds,
+        )
+
+    def _wait_for_proxy(self, failure_count: int) -> None:
+        if failure_count > self.proxy_retries:
+            raise RuntimeError(
+                "Teacher proxy remained unavailable after the configured long-retry window; "
+                "rerun with the same output and --resume after proxy authentication recovers."
+            ) from None
+        delay = self._proxy_wait_seconds(failure_count)
+        print(
+            "[teacher-bank] proxy tunnel/authentication unavailable "
+            f"(retry {failure_count}/{self.proxy_retries}); waiting {delay:.0f}s...",
+            file=sys.stderr,
+            flush=True,
+        )
+        self._sleep(delay)
+
+    def call(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "response_format": {"type": "json_object"},
+            "thinking": {"type": self.thinking},
+        }
+        ordinary_failures = 0
+        proxy_failures = 0
+
+        while True:
+            try:
+                response = self.session.post(
+                    self.endpoint,
+                    json=body,
+                    timeout=self.timeout,
+                )
+            except requests.exceptions.ProxyError:
+                proxy_failures += 1
+                self._wait_for_proxy(proxy_failures)
+                continue
+            except (
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError,
+            ) as exc:
+                ordinary_failures += 1
+                if ordinary_failures >= self.retries:
+                    raise RuntimeError(
+                        "Teacher API network request failed after short retries "
+                        f"({type(exc).__name__}); no credentials were logged."
+                    ) from None
+                delay = 2 ** (ordinary_failures - 1)
+                print(
+                    "[teacher-bank] transient teacher network failure "
+                    f"({type(exc).__name__}, retry {ordinary_failures}/{self.retries - 1}); "
+                    f"waiting {delay}s...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._sleep(delay)
+                continue
+            except requests.exceptions.RequestException as exc:
+                raise RuntimeError(
+                    "Teacher HTTP client rejected the request configuration "
+                    f"({type(exc).__name__}); no credentials were logged."
+                ) from None
+
+            if response.status_code == 407:
+                response.close()
+                proxy_failures += 1
+                self._wait_for_proxy(proxy_failures)
+                continue
+
+            if response.status_code in self.TRANSIENT_HTTP_STATUS:
+                status = response.status_code
+                response.close()
+                ordinary_failures += 1
+                if ordinary_failures >= self.retries:
+                    raise RuntimeError(
+                        f"Teacher API returned transient HTTP {status} after short retries."
+                    )
+                delay = 2 ** (ordinary_failures - 1)
+                print(
+                    f"[teacher-bank] teacher API HTTP {status} "
+                    f"(retry {ordinary_failures}/{self.retries - 1}); waiting {delay}s...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._sleep(delay)
+                continue
+
+            if not response.ok:
+                status = response.status_code
+                response.close()
+                raise RuntimeError(
+                    f"Teacher API returned non-retryable HTTP {status}; check API key, "
+                    "balance, model name, and request parameters."
+                )
+
+            try:
+                payload = response.json()
+                content = payload["choices"][0]["message"]["content"]
+                return parse_json_payload(content)
+            except (requests.exceptions.JSONDecodeError, KeyError, IndexError, ValueError) as exc:
+                ordinary_failures += 1
+                if ordinary_failures >= self.retries:
+                    raise RuntimeError(
+                        "Teacher API returned an invalid JSON payload after short retries."
+                    ) from None
+                delay = 2 ** (ordinary_failures - 1)
+                print(
+                    "[teacher-bank] invalid teacher JSON payload "
+                    f"(retry {ordinary_failures}/{self.retries - 1}); waiting {delay}s...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._sleep(delay)
+            finally:
+                response.close()
+
+
 def call_teacher(
     *, base_url: str, api_key: str, model: str, messages: list[dict[str, str]],
     max_tokens: int, temperature: float, retries: int, thinking: str,
 ) -> dict[str, Any]:
-    endpoint = base_url.rstrip("/") + "/chat/completions"
-    body = json.dumps(
-        {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-            "thinking": {"type": thinking},
-        }
-    ).encode("utf-8")
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    """Compatibility wrapper for one-off callers; bulk builds use TeacherClient."""
 
-    for attempt in range(1, retries + 1):
-        try:
-            req = request.Request(endpoint, data=body, headers=headers, method="POST")
-            with request.urlopen(req, timeout=180) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            content = payload["choices"][0]["message"]["content"]
-            return parse_json_payload(content)
-        except (error.HTTPError, error.URLError, KeyError, IndexError, ValueError) as exc:
-            if attempt == retries:
-                raise RuntimeError(f"Teacher API failed after {retries} attempts: {exc}") from exc
-            print(
-                f"[teacher-bank] API attempt {attempt}/{retries} failed: {exc}; retrying...",
-                file=sys.stderr,
-                flush=True,
-            )
-            time.sleep(2 ** (attempt - 1))
-    raise AssertionError("unreachable")
+    with TeacherClient(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        retries=retries,
+        proxy_retries=20,
+        proxy_retry_initial_seconds=30.0,
+        proxy_retry_max_seconds=300.0,
+        connect_timeout_seconds=30.0,
+        read_timeout_seconds=180.0,
+        thinking=thinking,
+    ) as client:
+        return client.call(messages)
 
 
 def main() -> None:
     args = parse_args()
     if args.limit <= 0 or args.offset < 0:
         raise ValueError("--limit must be positive and --offset must be non-negative.")
+    if args.retries <= 0 or args.proxy_retries < 0:
+        raise ValueError("--retries must be positive and --proxy-retries non-negative")
     api_key = os.environ.get(args.api_key_env)
     if not api_key:
         raise RuntimeError(f"Set {args.api_key_env} in scripts/experiments/.server.env before running.")
@@ -291,21 +491,25 @@ def main() -> None:
                     completed_ids.add(str(record.get("experience_id") or record["episode_id"]))
     records_written = 0
     mode = "a" if args.resume else "w"
-    with output_path.open(mode, encoding="utf-8") as handle:
+    with TeacherClient(
+        base_url=args.base_url,
+        api_key=api_key,
+        model=args.model,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        retries=args.retries,
+        proxy_retries=args.proxy_retries,
+        proxy_retry_initial_seconds=args.proxy_retry_initial_seconds,
+        proxy_retry_max_seconds=args.proxy_retry_max_seconds,
+        connect_timeout_seconds=args.connect_timeout_seconds,
+        read_timeout_seconds=args.read_timeout_seconds,
+        thinking=args.thinking,
+    ) as client, output_path.open(mode, encoding="utf-8") as handle:
         for episode in episodes:
             if episode["id"] in completed_ids:
                 print(f"[teacher-bank] skip completed {episode['id']}", flush=True)
                 continue
-            bank = call_teacher(
-                base_url=args.base_url,
-                api_key=api_key,
-                model=args.model,
-                messages=teacher_messages(episode),
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                retries=args.retries,
-                thinking=args.thinking,
-            )
+            bank = client.call(teacher_messages(episode))
             record = {
                 "schema_version": "teacher-bank-record-v2",
                 "prompt_version": PROMPT_VERSION,

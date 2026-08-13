@@ -57,3 +57,21 @@ python scripts/finalize_phase1_human_review.py \
 
 Preview 脚本产生的 `teacher_inferred` reference 仍只用于 schema 检查，自动审计不会把它
 纳入正式 approved bank。
+
+## Teacher 代理恢复
+
+Teacher client 在整个 bank 构造期间复用同一个 HTTP session，减少企业代理的 HTTPS
+CONNECT 次数。代理隧道或认证返回 407 时，默认按 30、60、120、240 秒退避，随后每次
+最多等待 300 秒，共额外重试 20 次（约 90 分钟）。等待日志不会打印原始代理异常、
+代理 URL、API key 或可能嵌在 URL 中的代理凭据。
+
+这些参数可在未跟踪的 `.server.env` 中调整：
+
+```bash
+export MEMGEN_TEACHER_PROXY_RETRIES="20"
+export MEMGEN_TEACHER_PROXY_RETRY_INITIAL_SECONDS="30"
+export MEMGEN_TEACHER_PROXY_RETRY_MAX_SECONDS="300"
+```
+
+超过长退避窗口后任务仍会安全退出。每条 teacher record 已即时写盘；代理恢复后使用同一
+`MEMGEN_RUN_TAG` 重启，一键脚本会跳过已完成的 experience ID 并继续。

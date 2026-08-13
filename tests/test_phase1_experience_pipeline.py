@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import copy
+from contextlib import redirect_stderr
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+
+import requests
 
 from memgen.experience.phase1 import (
     EXPERIENCE_SCHEMA,
@@ -14,7 +18,86 @@ from memgen.experience.phase1 import (
     create_gsm8k_split_manifest,
     summarize_human_review,
 )
-from scripts.build_teacher_bank import jsonl_examples
+from scripts.build_teacher_bank import TeacherClient, jsonl_examples
+
+
+VALID_TEACHER_PAYLOAD = {
+    "target": {
+        "situation_signature": "supported situation",
+        "transferable_decision": "supported decision",
+        "verification_rule": "supported verification",
+        "applicability_boundary": "supported boundary",
+        "confidence": 0.9,
+    },
+    "reference": {
+        "competing_pattern": "failed competing pattern",
+        "failure_signal": "observed failure signal",
+        "failure_mechanism": "observed failure mechanism",
+        "non_reuse_boundary": "reference boundary",
+        "confidence": 0.9,
+    },
+    "quality": {
+        "target_supported": True,
+        "reference_supported": True,
+        "target_reference_distinct": True,
+        "contains_instance_specific_details": False,
+        "issues": [],
+    },
+}
+
+
+class FakeResponse:
+    def __init__(self, status_code: int, payload: dict | None = None):
+        self.status_code = status_code
+        self.ok = 200 <= status_code < 300
+        self._payload = payload
+        self.closed = False
+
+    def json(self) -> dict:
+        if self._payload is None:
+            raise ValueError("missing fixture payload")
+        return self._payload
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeSession:
+    def __init__(self, outcomes: list[object]):
+        self.outcomes = list(outcomes)
+        self.headers: dict[str, str] = {}
+        self.trust_env = False
+        self.post_calls = 0
+        self.closed = False
+
+    def post(self, *_args, **_kwargs):
+        self.post_calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def teacher_client(session: FakeSession, sleeps: list[float]) -> TeacherClient:
+    return TeacherClient(
+        base_url="https://api.example.test",
+        api_key="top-secret-api-key",
+        model="teacher-fixture",
+        max_tokens=100,
+        temperature=0.0,
+        retries=3,
+        proxy_retries=4,
+        proxy_retry_initial_seconds=30.0,
+        proxy_retry_max_seconds=300.0,
+        connect_timeout_seconds=5.0,
+        read_timeout_seconds=10.0,
+        thinking="disabled",
+        session=session,
+        sleep=sleeps.append,
+    )
 
 
 def rollout(*, episode_id: str, reward: float, trajectory: str) -> dict:
@@ -228,6 +311,87 @@ class HumanReviewTests(unittest.TestCase):
             required_agreement=0.9,
         )
         self.assertFalse(incomplete["passed"])
+
+
+class TeacherClientTests(unittest.TestCase):
+    def test_reuses_session_and_recovers_from_proxy_errors(self) -> None:
+        response_one = FakeResponse(
+            200,
+            {"choices": [{"message": {"content": json.dumps(VALID_TEACHER_PAYLOAD)}}]},
+        )
+        response_two = FakeResponse(
+            200,
+            {"choices": [{"message": {"content": json.dumps(VALID_TEACHER_PAYLOAD)}}]},
+        )
+        session = FakeSession(
+            [
+                requests.exceptions.ProxyError(
+                    "407 from http://proxy-user:proxy-secret@proxy.invalid"
+                ),
+                requests.exceptions.ProxyError("407 Proxy Authentication Required"),
+                response_one,
+                response_two,
+            ]
+        )
+        sleeps: list[float] = []
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), teacher_client(session, sleeps) as client:
+            self.assertEqual(client.call([]), VALID_TEACHER_PAYLOAD)
+            self.assertEqual(client.call([]), VALID_TEACHER_PAYLOAD)
+
+        self.assertEqual(session.post_calls, 4)
+        self.assertEqual(sleeps, [30.0, 60.0])
+        self.assertTrue(session.closed)
+        self.assertTrue(response_one.closed)
+        self.assertTrue(response_two.closed)
+        log = stderr.getvalue()
+        self.assertIn("proxy tunnel/authentication unavailable", log)
+        self.assertNotIn("proxy-secret", log)
+        self.assertNotIn("top-secret-api-key", log)
+
+    def test_http_407_uses_long_proxy_backoff(self) -> None:
+        proxy_response = FakeResponse(407)
+        success_response = FakeResponse(
+            200,
+            {"choices": [{"message": {"content": json.dumps(VALID_TEACHER_PAYLOAD)}}]},
+        )
+        session = FakeSession([proxy_response, success_response])
+        sleeps: list[float] = []
+        with teacher_client(session, sleeps) as client:
+            self.assertEqual(client.call([]), VALID_TEACHER_PAYLOAD)
+        self.assertEqual(sleeps, [30.0])
+        self.assertTrue(proxy_response.closed)
+
+    def test_non_retryable_http_error_is_sanitized(self) -> None:
+        session = FakeSession([FakeResponse(401)])
+        sleeps: list[float] = []
+        with teacher_client(session, sleeps) as client:
+            with self.assertRaisesRegex(RuntimeError, "non-retryable HTTP 401") as raised:
+                client.call([])
+        self.assertNotIn("top-secret-api-key", str(raised.exception))
+        self.assertEqual(sleeps, [])
+
+    def test_exhausted_proxy_retry_suppresses_sensitive_exception_context(self) -> None:
+        session = FakeSession(
+            [
+                requests.exceptions.ProxyError(
+                    "407 from http://proxy-user:proxy-secret@proxy.invalid"
+                ),
+                requests.exceptions.ProxyError(
+                    "407 from http://proxy-user:proxy-secret@proxy.invalid"
+                ),
+            ]
+        )
+        sleeps: list[float] = []
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), teacher_client(session, sleeps) as client:
+            client.proxy_retries = 1
+            with self.assertRaisesRegex(RuntimeError, "configured long-retry window") as raised:
+                client.call([])
+        self.assertEqual(sleeps, [30.0])
+        self.assertTrue(raised.exception.__suppress_context__)
+        self.assertNotIn("proxy-secret", stderr.getvalue())
+        self.assertNotIn("proxy-secret", str(raised.exception))
 
 
 if __name__ == "__main__":
