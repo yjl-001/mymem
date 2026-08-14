@@ -42,10 +42,11 @@ bash scripts/experiments/gsm8k/run_phase1_verified_bank.sh
 同题 contrast、调用 Flash teacher、执行确定性审计，再由 Pro reviewer 独立复核。
 确定性审计只对 provenance、verifier 绑定和 schema 等数据完整性负责；这类异常不参与
 内容优劣判断，而是单独进入 `quarantined_bank_records.jsonl` 等待修复或重建。关键词、
-相似度、格式描述和 teacher 自评等都只是语义警告，最终内容通过或拒绝由高置信 Pro
-决定。首轮 Pro uncertain 或低置信的记录进入 `deferred_bank_records.jsonl`，不进入正式
-bank，也不再触发第二轮 Pro 或人工裁决。报告同时按 `experience_type` 统计各路由数量与
-通过率，用于检查精度优先筛选是否造成类别覆盖偏差。
+相似度、格式描述和 teacher 自评等都只是语义警告，最终内容通过或拒绝由 Pro 的逐字段
+证据审核决定。八个 bank 字段和五个 pair 属性全部 supported 才进入正式 bank；
+存在 unsupported/contradicted 时拒绝，其余包含 partially supported 的记录进入
+`deferred_bank_records.jsonl`。Reviewer confidence 仅作诊断，不参与路由。报告同时按
+`experience_type` 统计各路由数量与通过率，用于检查精度优先筛选是否造成类别覆盖偏差。
 
 Phase 1 verifier 同时保存严格任务奖励和诊断字段。缺少或损坏 `\\boxed{}` 仍然是
 正式任务失败；若宽松诊断能确认自然语言中的最终数值正确，该 reference 会被归为

@@ -436,53 +436,80 @@ class HumanReviewTests(unittest.TestCase):
 
 
 class AIReviewRoutingTests(unittest.TestCase):
-    def review(self, decision: str, confidence: float, *, supported: bool) -> dict:
+    def review(
+        self,
+        status: str,
+        confidence: float = 0.95,
+        *,
+        decision: str | None = None,
+    ) -> dict:
+        assessment = {"status": status, "evidence": "grounded fixture evidence"}
+        if decision is None:
+            decision = {
+                "supported": "approve",
+                "partially_supported": "defer",
+                "unsupported_or_contradicted": "reject",
+            }[status]
         return {
             "decision": decision,
             "confidence": confidence,
-            "criteria": {
-                "target_supported": supported,
-                "reference_supported": supported,
-                "target_reference_distinct": supported,
-                "factually_consistent": supported,
-                "failure_type_aligned": supported,
-                "transferable_without_instance_leakage": supported,
+            "field_assessments": {
+                "target": {
+                    "situation_signature": dict(assessment),
+                    "transferable_decision": dict(assessment),
+                    "verification_rule": dict(assessment),
+                    "applicability_boundary": dict(assessment),
+                },
+                "reference": {
+                    "competing_pattern": dict(assessment),
+                    "failure_signal": dict(assessment),
+                    "failure_mechanism": dict(assessment),
+                    "non_reuse_boundary": dict(assessment),
+                },
             },
+            "pair_assessments": {
+                "target_reference_distinct": dict(assessment),
+                "factually_consistent": dict(assessment),
+                "causal_attribution": dict(assessment),
+                "failure_type_compatibility": dict(assessment),
+                "transferable_without_instance_leakage": dict(assessment),
+            },
+            "issues": [],
         }
 
-    def test_high_confidence_pro_decisions_are_automated(self) -> None:
+    def test_structured_pro_decisions_route_without_confidence_threshold(self) -> None:
         self.assertEqual(
-            route_ai_review([], self.review("approve", 0.95, supported=True)),
+            route_ai_review([], self.review("supported", 0.4)),
             "ai_approved",
         )
         self.assertEqual(
             route_ai_review(
                 ["teacher_marks_reference_unsupported"],
-                self.review("reject", 0.95, supported=False),
+                self.review("unsupported_or_contradicted", 0.4),
             ),
             "ai_rejected",
         )
 
-    def test_pro_owns_semantic_quality_and_uncertain_records_are_deferred(self) -> None:
+    def test_pro_owns_semantic_quality_and_partial_records_are_deferred(self) -> None:
         self.assertEqual(
-            route_ai_review([], self.review("reject", 0.95, supported=False)),
+            route_ai_review([], self.review("unsupported_or_contradicted")),
             "ai_rejected",
         )
         self.assertEqual(
             route_ai_review(
                 ["format_failure_not_described"],
-                self.review("approve", 0.95, supported=True),
+                self.review("supported"),
             ),
             "ai_approved",
         )
         self.assertEqual(
-            route_ai_review([], self.review("approve", 0.7, supported=True)),
+            route_ai_review([], self.review("partially_supported")),
             "deferred",
         )
         self.assertEqual(
             route_ai_review(
                 ["provenance_hash_mismatch"],
-                self.review("approve", 0.99, supported=True),
+                self.review("supported"),
             ),
             "quarantined",
         )
@@ -490,21 +517,16 @@ class AIReviewRoutingTests(unittest.TestCase):
         self.assertEqual(
             route_ai_review(
                 ["instance_specific_literal_detected"],
-                self.review("approve", 0.99, supported=True),
+                self.review("supported"),
             ),
             "ai_approved",
         )
 
-    def test_uncertain_or_low_confidence_decisions_never_enter_bank(self) -> None:
-        uncertain = self.review("uncertain", 0.95, supported=True)
-        self.assertEqual(
-            route_ai_review([], uncertain),
-            "deferred",
-        )
-        self.assertEqual(
-            route_ai_review([], self.review("reject", 0.7, supported=False)),
-            "deferred",
-        )
+    def test_decision_must_match_structured_assessments(self) -> None:
+        with self.assertRaisesRegex(ValueError, "conflicts with structured assessments"):
+            route_ai_review(
+                [], self.review("partially_supported", decision="approve")
+            )
 
     def test_audit_reasons_split_integrity_from_semantic_warnings(self) -> None:
         integrity, semantic = split_audit_reasons(
@@ -537,21 +559,7 @@ class AIReviewRoutingTests(unittest.TestCase):
         )
 
     def test_reviewer_payload_and_prompt_enforce_format_failure_grounding(self) -> None:
-        payload = {
-            "decision": "approve",
-            "confidence": 0.9,
-            "criteria": {
-                "target_supported": True,
-                "reference_supported": True,
-                "target_reference_distinct": True,
-                "factually_consistent": True,
-                "failure_type_aligned": True,
-                "transferable_without_instance_leakage": True,
-            },
-            "evidence": {"target": "supported", "reference": "supported"},
-            "issues": [],
-            "uncertainty_reason": "",
-        }
+        payload = self.review("supported", 0.9)
         parsed = parse_review_payload(json.dumps(payload))
         self.assertEqual(parsed, payload)
 
@@ -565,6 +573,8 @@ class AIReviewRoutingTests(unittest.TestCase):
         messages = reviewer_messages(experience, teacher_record(experience))
         self.assertIn("format-only reference", messages[0]["content"])
         self.assertIn("must not invent a reasoning error", messages[0]["content"])
+        self.assertIn("less specific than the instance", messages[0]["content"])
+        self.assertIn("outcomes, not cognitive root", messages[0]["content"])
         self.assertIn("intentionally hidden", messages[0]["content"])
         self.assertNotIn("automatic_gate_reasons", messages[1]["content"])
         self.assertNotIn('"quality"', messages[1]["content"])

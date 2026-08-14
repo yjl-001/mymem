@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from memgen.experience.phase1 import (
-    AI_REVIEW_CRITERIA_FIELDS,
+    ai_review_assessment_statuses,
     audit_teacher_record,
     canonical_json_sha256,
     file_sha256,
@@ -31,8 +31,8 @@ from memgen.experience.phase1 import (
 from scripts.build_teacher_bank import TeacherClient
 
 
-PROMPT_VERSION = "phase1-ai-review-v1-independent-evidence"
-REVIEW_SCHEMA = "phase1-ai-review-record-v1"
+PROMPT_VERSION = "phase1-ai-review-v2-field-evidence-rubric"
+REVIEW_SCHEMA = "phase1-ai-review-record-v2"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-pro"
 
@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=os.environ.get("DEEPSEEK_REVIEW_MODEL", DEFAULT_MODEL))
     parser.add_argument("--base-url", default=os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL))
     parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
-    parser.add_argument("--max-tokens", type=int, default=1000)
+    parser.add_argument("--max-tokens", type=int, default=2200)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--proxy-retries", type=int, default=20)
@@ -58,7 +58,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proxy-retry-max-seconds", type=float, default=300.0)
     parser.add_argument("--connect-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--read-timeout-seconds", type=float, default=180.0)
-    parser.add_argument("--confidence-threshold", type=float, default=0.85)
     parser.add_argument("--thinking", choices=("enabled", "disabled"), default="disabled")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -86,7 +85,8 @@ def reviewer_messages(
         teacher_bank = {
             key: value for key, value in teacher_bank.items() if key != "quality"
         }
-    system = """You are the independent second-pass auditor for an experience bank.
+    system = """You are the independent second-pass auditor for a precision-first
+experience bank.
 The first-pass curator was a different, cheaper model. Judge its abstraction
 only from the supplied raw trajectories and verifier records. Return JSON only.
 
@@ -102,13 +102,30 @@ Authority and scope:
   reject lucky, contradictory, or unsupported target abstractions.
 - Bank text must be transferable and must not preserve instance-specific names,
   numbers, final answers, or equations.
+- Verifier failure_types describe observable task outcomes, not cognitive root
+  causes. A bank mechanism is compatible when it does not contradict those
+  outcomes; it need not literally restate labels such as boxed_answer_mismatch.
+
+Support rubric for every field and pair-level assessment:
+- supported: directly grounded in the trajectory, or a faithful transferable
+  generalization/conservative boundary that introduces no unsupported claim.
+- partially_supported: plausible and not contradicted, but materially vague,
+  overbroad, incomplete, or dependent on unresolved interpretation.
+- unsupported_or_contradicted: absent from evidence, invented, factually wrong,
+  or contradicted by the trajectory/verifier.
+
+Do not reject merely because an abstraction omits other errors in the same
+trajectory or is less specific than the instance. Any visibly present,
+causally relevant failure may be abstracted unless the bank falsely calls it
+the sole or primary cause. Treat a valid generalization as supported, not
+unsupported. Use partially_supported for real residual ambiguity.
 
 Evaluate independently. The automatic gate result is intentionally hidden from
-you to prevent anchoring. Use decision=approve only when every criterion is true.
-Use reject when at least one criterion is definitely false. Use uncertain only
-when the supplied evidence cannot resolve the issue. Confidence measures
-confidence in your whole decision, not fluency. Keep evidence summaries concise
-and factual."""
+you to prevent anchoring. Assess all eight bank fields and all five pair-level
+properties. Decision is derived mechanically: approve only when every status is
+supported; reject when any status is unsupported_or_contradicted; otherwise
+defer. Confidence is diagnostic only and must not change that decision. Keep
+assessment evidence concise, specific, and factual."""
     payload = {
         "context": experience.get("context"),
         "target_trajectory": experience.get("trajectory"),
@@ -124,22 +141,30 @@ and factual."""
 
 Return exactly this JSON shape:
 {{
-  "decision": "approve|reject|uncertain",
+  "decision": "approve|reject|defer",
   "confidence": 0.0,
-  "criteria": {{
-    "target_supported": true,
-    "reference_supported": true,
-    "target_reference_distinct": true,
-    "factually_consistent": true,
-    "failure_type_aligned": true,
-    "transferable_without_instance_leakage": true
+  "field_assessments": {{
+    "target": {{
+      "situation_signature": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}},
+      "transferable_decision": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}},
+      "verification_rule": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}},
+      "applicability_boundary": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}}
+    }},
+    "reference": {{
+      "competing_pattern": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}},
+      "failure_signal": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}},
+      "failure_mechanism": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}},
+      "non_reuse_boundary": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}}
+    }}
   }},
-  "evidence": {{
-    "target": "brief evidence-based observation",
-    "reference": "brief evidence-based observation"
+  "pair_assessments": {{
+    "target_reference_distinct": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}},
+    "factually_consistent": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}},
+    "causal_attribution": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}},
+    "failure_type_compatibility": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}},
+    "transferable_without_instance_leakage": {{"status": "supported|partially_supported|unsupported_or_contradicted", "evidence": "..."}}
   }},
-  "issues": [],
-  "uncertainty_reason": ""
+  "issues": []
 }}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -152,28 +177,7 @@ def parse_review_payload(content: str) -> dict[str, Any]:
         cleaned = cleaned.split("\n", 1)[1]
         cleaned = cleaned.rsplit("```", 1)[0].strip()
     payload = json.loads(cleaned)
-    if payload.get("decision") not in {"approve", "reject", "uncertain"}:
-        raise ValueError("Reviewer returned invalid decision")
-    confidence = payload.get("confidence")
-    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
-        raise ValueError("Reviewer returned invalid confidence")
-    if not 0.0 <= float(confidence) <= 1.0:
-        raise ValueError("Reviewer confidence is outside [0, 1]")
-    criteria = payload.get("criteria")
-    if not isinstance(criteria, dict) or any(
-        not isinstance(criteria.get(field), bool) for field in AI_REVIEW_CRITERIA_FIELDS
-    ):
-        raise ValueError("Reviewer returned invalid criteria")
-    evidence = payload.get("evidence")
-    if not isinstance(evidence, dict) or any(
-        not isinstance(evidence.get(field), str) or not evidence[field].strip()
-        for field in ("target", "reference")
-    ):
-        raise ValueError("Reviewer returned invalid evidence")
-    if not isinstance(payload.get("issues"), list):
-        raise ValueError("Reviewer returned invalid issues")
-    if not isinstance(payload.get("uncertainty_reason"), str):
-        raise ValueError("Reviewer returned invalid uncertainty_reason")
+    route_ai_review([], payload)
     return payload
 
 
@@ -228,8 +232,6 @@ def deterministic_audit(record: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
-    if not 0.0 <= args.confidence_threshold <= 1.0:
-        raise ValueError("--confidence-threshold must be in [0, 1]")
     api_key = os.environ.get(args.api_key_env)
     if not api_key:
         raise RuntimeError(f"Set {args.api_key_env} before running AI review")
@@ -299,7 +301,6 @@ def main() -> None:
                 route = route_ai_review(
                     automatic_reasons,
                     review,
-                    confidence_threshold=args.confidence_threshold,
                 )
             record = {
                 "schema_version": REVIEW_SCHEMA,
@@ -354,7 +355,6 @@ def main() -> None:
                 initial_route = route_ai_review(
                     automatic_reasons,
                     first_review,
-                    confidence_threshold=args.confidence_threshold,
                 )
             review_record["initial_route"] = initial_route
             review_record["integrity_reasons"] = integrity_reasons
@@ -375,7 +375,6 @@ def main() -> None:
             initial_route = route_ai_review(
                 audit["reasons"],
                 review_record["ai_review"],
-                confidence_threshold=args.confidence_threshold,
             )
         review_record["initial_route"] = initial_route
         integrity_reasons = audit["integrity_reasons"]
@@ -384,7 +383,7 @@ def main() -> None:
         review_record["semantic_warnings"] = semantic_warnings
         review_record.pop("adjudication", None)
         review_record["route"] = initial_route
-        review_record["routing_confidence_threshold"] = args.confidence_threshold
+        review_record.pop("routing_confidence_threshold", None)
         review_record.pop("adjudication_confidence_threshold", None)
         completed[experience_id] = review_record
         ordered_reviews.append(review_record)
@@ -421,19 +420,27 @@ def main() -> None:
     semantic_warning_counts = Counter(
         reason for item in ordered_reviews for reason in item["semantic_warnings"]
     )
-    deferred_reason_counts = Counter()
-    deferred_criterion_false_counts = Counter()
+    assessment_status_counts: dict[str, Counter[str]] = {}
+    deferred_partial_assessment_counts = Counter()
+    rejected_assessment_counts = Counter()
     for item in ordered_reviews:
-        if item["route"] != "deferred":
+        if not isinstance(item.get("ai_review"), dict):
             continue
-        first_review = item["ai_review"]
-        if first_review["decision"] == "uncertain":
-            deferred_reason_counts["reviewer_uncertain"] += 1
-        if first_review["confidence"] < args.confidence_threshold:
-            deferred_reason_counts["reviewer_low_confidence"] += 1
-        for criterion, passed in first_review["criteria"].items():
-            if not passed:
-                deferred_criterion_false_counts[criterion] += 1
+        statuses = ai_review_assessment_statuses(item["ai_review"])
+        for assessment, status in statuses.items():
+            counts = assessment_status_counts.setdefault(assessment, Counter())
+            counts[status] += 1
+            if item["route"] == "deferred" and status == "partially_supported":
+                deferred_partial_assessment_counts[assessment] += 1
+            if (
+                item["route"] == "ai_rejected"
+                and status == "unsupported_or_contradicted"
+            ):
+                rejected_assessment_counts[assessment] += 1
+    assessment_status_report = {
+        assessment: dict(sorted(counts.items()))
+        for assessment, counts in sorted(assessment_status_counts.items())
+    }
 
     review_decision_counts = Counter(
         item["ai_review"]["decision"]
@@ -475,7 +482,9 @@ def main() -> None:
         for experience_type, counts in sorted(experience_type_route_counts.items())
     }
     report = {
-        "schema_version": "phase1-ai-review-report-v4",
+        "schema_version": "phase1-ai-review-report-v5",
+        "review_schema_version": REVIEW_SCHEMA,
+        "review_prompt_version": PROMPT_VERSION,
         "created_at": created_at,
         "teacher_record_count": len(teacher_records),
         "reviewed_count": len(ordered_reviews),
@@ -490,21 +499,24 @@ def main() -> None:
         "initial_route_counts": dict(sorted(initial_route_counts.items())),
         "quarantine_reason_counts": dict(sorted(quarantine_reason_counts.items())),
         "semantic_warning_counts": dict(sorted(semantic_warning_counts.items())),
-        "deferred_reason_counts": dict(sorted(deferred_reason_counts.items())),
-        "deferred_criterion_false_counts": dict(
-            sorted(deferred_criterion_false_counts.items())
+        "assessment_status_counts": assessment_status_report,
+        "deferred_partial_assessment_counts": dict(
+            sorted(deferred_partial_assessment_counts.items())
+        ),
+        "rejected_assessment_counts": dict(
+            sorted(rejected_assessment_counts.items())
         ),
         "review_decision_counts": dict(sorted(review_decision_counts.items())),
         "confidence_by_route": confidence_by_route,
         "experience_type_route_counts": type_route_report,
         "approved_rate_by_experience_type": approved_rate_by_experience_type,
-        "confidence_threshold": args.confidence_threshold,
         "deferred_count": len(deferred),
         "selection_policy": (
             "Integrity/provenance/schema failures are quarantined outside quality "
-            "judgment; only first-pass Pro approvals at or above the confidence "
-            "threshold enter the bank; uncertain or low-confidence records are "
-            "deferred without adjudication or human review."
+            "judgment; structured field and pair assessments determine semantic "
+            "routing. All supported enters the bank, any unsupported or contradicted "
+            "assessment is rejected, and remaining partial support is deferred. "
+            "Reviewer confidence is diagnostic only."
         ),
         "artifacts": {
             "experiences_sha256": file_sha256(args.experiences),

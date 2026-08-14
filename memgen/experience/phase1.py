@@ -38,13 +38,15 @@ TEACHER_BANK_REQUIRED_FIELDS = {
         "confidence",
     ),
 }
-AI_REVIEW_CRITERIA_FIELDS = (
-    "target_supported",
-    "reference_supported",
+AI_REVIEW_PAIR_ASSESSMENTS = (
     "target_reference_distinct",
     "factually_consistent",
-    "failure_type_aligned",
+    "causal_attribution",
+    "failure_type_compatibility",
     "transferable_without_instance_leakage",
+)
+AI_REVIEW_ASSESSMENT_STATUSES = frozenset(
+    {"supported", "partially_supported", "unsupported_or_contradicted"}
 )
 INTEGRITY_AUDIT_REASONS = frozenset(
     {
@@ -653,45 +655,84 @@ def audit_teacher_record(
     return sorted(set(reasons))
 
 
+def ai_review_assessment_statuses(review: Mapping[str, Any]) -> dict[str, str]:
+    """Validate and flatten evidence-linked field and pair assessments."""
+
+    statuses: dict[str, str] = {}
+    field_assessments = review.get("field_assessments")
+    if not isinstance(field_assessments, Mapping):
+        raise ValueError("AI review has invalid field_assessments")
+    for section, fields in TEACHER_BANK_REQUIRED_FIELDS.items():
+        section_assessments = field_assessments.get(section)
+        if not isinstance(section_assessments, Mapping):
+            raise ValueError(f"AI review is missing {section} field assessments")
+        for field in fields:
+            if field == "confidence":
+                continue
+            assessment = section_assessments.get(field)
+            if not isinstance(assessment, Mapping):
+                raise ValueError(f"AI review is missing {section}.{field} assessment")
+            status = assessment.get("status")
+            evidence = assessment.get("evidence")
+            if status not in AI_REVIEW_ASSESSMENT_STATUSES:
+                raise ValueError(f"AI review has invalid {section}.{field} status")
+            if not isinstance(evidence, str) or not evidence.strip():
+                raise ValueError(f"AI review is missing {section}.{field} evidence")
+            statuses[f"{section}.{field}"] = str(status)
+
+    pair_assessments = review.get("pair_assessments")
+    if not isinstance(pair_assessments, Mapping):
+        raise ValueError("AI review has invalid pair_assessments")
+    for field in AI_REVIEW_PAIR_ASSESSMENTS:
+        assessment = pair_assessments.get(field)
+        if not isinstance(assessment, Mapping):
+            raise ValueError(f"AI review is missing pair assessment: {field}")
+        status = assessment.get("status")
+        evidence = assessment.get("evidence")
+        if status not in AI_REVIEW_ASSESSMENT_STATUSES:
+            raise ValueError(f"AI review has invalid pair status: {field}")
+        if not isinstance(evidence, str) or not evidence.strip():
+            raise ValueError(f"AI review is missing pair evidence: {field}")
+        statuses[f"pair.{field}"] = str(status)
+    return statuses
+
+
 def route_ai_review(
     automatic_reasons: Sequence[str],
     review: Mapping[str, Any],
-    *,
-    confidence_threshold: float = 0.85,
 ) -> str:
-    """Quarantine integrity failures and defer uncertain semantic decisions."""
+    """Route from structured support assessments; confidence is diagnostic only."""
 
-    if not 0.0 <= confidence_threshold <= 1.0:
-        raise ValueError("confidence_threshold must be in [0, 1]")
     decision = review.get("decision")
-    if decision not in {"approve", "reject", "uncertain"}:
+    if decision not in {"approve", "reject", "defer"}:
         raise ValueError("AI review has invalid decision")
     confidence = review.get("confidence")
     if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
         raise ValueError("AI review has invalid confidence")
-    criteria = review.get("criteria")
-    if not isinstance(criteria, Mapping) or any(
-        not isinstance(criteria.get(field), bool) for field in AI_REVIEW_CRITERIA_FIELDS
-    ):
-        raise ValueError("AI review has invalid criteria")
+    if not 0.0 <= float(confidence) <= 1.0:
+        raise ValueError("AI review confidence is outside [0, 1]")
+    if not isinstance(review.get("issues"), list):
+        raise ValueError("AI review has invalid issues")
 
-    all_supported = all(criteria[field] for field in AI_REVIEW_CRITERIA_FIELDS)
-    any_unsupported = any(not criteria[field] for field in AI_REVIEW_CRITERIA_FIELDS)
-    if decision == "approve" and not all_supported:
-        raise ValueError("AI approve decision conflicts with criteria")
-    if decision == "reject" and not any_unsupported:
-        raise ValueError("AI reject decision conflicts with criteria")
+    statuses = ai_review_assessment_statuses(review)
+    if "unsupported_or_contradicted" in statuses.values():
+        expected_decision = "reject"
+        semantic_route = "ai_rejected"
+    elif "partially_supported" in statuses.values():
+        expected_decision = "defer"
+        semantic_route = "deferred"
+    else:
+        expected_decision = "approve"
+        semantic_route = "ai_approved"
+    if decision != expected_decision:
+        raise ValueError(
+            f"AI review decision {decision!r} conflicts with structured assessments"
+        )
 
     integrity_reasons, _ = split_audit_reasons(automatic_reasons)
     if integrity_reasons:
         return "quarantined"
-    if decision == "uncertain" or float(confidence) < confidence_threshold:
-        return "deferred"
-    if decision == "approve":
-        return "ai_approved"
-    if decision == "reject":
-        return "ai_rejected"
-    return "deferred"
+    return semantic_route
 
 
 def split_audit_reasons(reasons: Sequence[str]) -> tuple[list[str], list[str]]:
