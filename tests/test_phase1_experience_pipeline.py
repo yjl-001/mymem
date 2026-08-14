@@ -24,7 +24,11 @@ from memgen.experience.phase1 import (
 from scripts.build_teacher_bank import TeacherClient, jsonl_examples
 from scripts.build_teacher_bank import teacher_messages
 from data.utils.math_utils import diagnose_gsm8k_completion
-from scripts.review_experience_bank import parse_review_payload, reviewer_messages
+from scripts.review_experience_bank import (
+    load_human_resolutions,
+    parse_review_payload,
+    reviewer_messages,
+)
 
 
 VALID_TEACHER_PAYLOAD = {
@@ -563,6 +567,28 @@ class AIReviewRoutingTests(unittest.TestCase):
             ]
             self.assertEqual(len(approved_records), 2)
             self.assertTrue(json.loads(report.read_text())["passed"])
+
+    def test_completed_dispute_resolution_can_survive_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "disputes.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "experience_id": "fixture",
+                        "review_provenance_sha256": "stable-review",
+                        "human_resolution": {
+                            "decision": "reject",
+                            "reviewer_notes": "clear contradiction",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            loaded = load_human_resolutions(path)
+        self.assertEqual(
+            loaded["fixture"]["human_resolution"]["decision"], "reject"
+        )
 
 
 class TeacherClientTests(unittest.TestCase):

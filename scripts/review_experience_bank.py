@@ -205,6 +205,26 @@ def _backup_and_filter_resume(
     return compatible
 
 
+def load_human_resolutions(path: Path) -> dict[str, dict[str, Any]]:
+    """Load completed dispute decisions so bounded pilots survive full continuation."""
+
+    resolutions: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return resolutions
+    for record in iter_jsonl(path):
+        resolution = record.get("human_resolution")
+        if (
+            isinstance(resolution, dict)
+            and resolution.get("decision") in {"approve", "reject"}
+            and isinstance(record.get("review_provenance_sha256"), str)
+        ):
+            resolutions[str(record.get("experience_id", ""))] = {
+                "review_provenance_sha256": record["review_provenance_sha256"],
+                "human_resolution": resolution,
+            }
+    return resolutions
+
+
 def main() -> None:
     args = parse_args()
     if not 0.0 <= args.confidence_threshold <= 1.0:
@@ -310,6 +330,7 @@ def main() -> None:
     approved: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     human: list[dict[str, Any]] = []
+    prior_human_resolutions = load_human_resolutions(args.human_review_output)
     for review_record in ordered_reviews:
         experience_id = review_record["experience_id"]
         teacher_record = teacher_records[experience_id]
@@ -321,9 +342,21 @@ def main() -> None:
             rejected.append(gated_record)
         else:
             experience = experiences[experience_id]
+            prior_resolution = prior_human_resolutions.get(experience_id)
+            if (
+                prior_resolution
+                and prior_resolution["review_provenance_sha256"]
+                == review_record["review_provenance_sha256"]
+            ):
+                human_resolution = prior_resolution["human_resolution"]
+            else:
+                human_resolution = {"decision": None, "reviewer_notes": ""}
             human.append(
                 {
                     "experience_id": experience_id,
+                    "review_provenance_sha256": review_record[
+                        "review_provenance_sha256"
+                    ],
                     "context": experience["context"],
                     "target_trajectory": experience["trajectory"],
                     "reference_trajectory": experience["reference_trajectory"],
@@ -333,7 +366,7 @@ def main() -> None:
                     "automatic_gate": review_record["automatic_gate"],
                     "ai_review": review_record["ai_review"],
                     "teacher_record": teacher_record,
-                    "human_resolution": {"decision": None, "reviewer_notes": ""},
+                    "human_resolution": human_resolution,
                 }
             )
 
