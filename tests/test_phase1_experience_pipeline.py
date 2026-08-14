@@ -5,6 +5,8 @@ from contextlib import redirect_stderr
 import io
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -427,6 +429,19 @@ class HumanReviewTests(unittest.TestCase):
 
 
 class TeacherClientTests(unittest.TestCase):
+    def test_teacher_script_can_start_outside_repository(self) -> None:
+        script = Path(__file__).resolve().parents[1] / "scripts" / "build_teacher_bank.py"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = subprocess.run(
+                [sys.executable, str(script), "--help"],
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Construct inspectable target/reference", result.stdout)
+
     def test_reuses_session_and_recovers_from_proxy_errors(self) -> None:
         response_one = FakeResponse(
             200,
