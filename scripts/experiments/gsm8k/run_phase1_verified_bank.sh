@@ -6,11 +6,25 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SERVER_ENV="$REPO_ROOT/scripts/experiments/.server.env"
 cd "$REPO_ROOT"
 
+# Preserve explicit one-off CLI overrides; .server.env supplies defaults for
+# normal runs but must not turn a bounded retry into an accidental full build.
+CALLER_RUN_TAG_SET="${MEMGEN_RUN_TAG+x}"
+CALLER_RUN_TAG="${MEMGEN_RUN_TAG:-}"
+CALLER_TEACHER_LIMIT_SET="${MEMGEN_PHASE1_TEACHER_LIMIT+x}"
+CALLER_TEACHER_LIMIT="${MEMGEN_PHASE1_TEACHER_LIMIT:-}"
+
 if [[ ! -f "$SERVER_ENV" ]]; then
   echo "Missing $SERVER_ENV. Copy scripts/experiments/server.env.example and fill it in." >&2
   exit 1
 fi
 source "$SERVER_ENV"
+
+if [[ -n "$CALLER_RUN_TAG_SET" ]]; then
+  export MEMGEN_RUN_TAG="$CALLER_RUN_TAG"
+fi
+if [[ -n "$CALLER_TEACHER_LIMIT_SET" ]]; then
+  export MEMGEN_PHASE1_TEACHER_LIMIT="$CALLER_TEACHER_LIMIT"
+fi
 
 : "${MEMGEN_OUTPUT_ROOT:?MEMGEN_OUTPUT_ROOT must be set in .server.env}"
 : "${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY must be set in .server.env}"
