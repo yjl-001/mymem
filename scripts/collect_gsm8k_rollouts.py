@@ -23,10 +23,7 @@ from memgen.experience.phase1 import (
 )
 from memgen.chat_templates import CONVERSATION_TEMPLATE
 from data.utils.math_utils import (
-    compute_score,
-    first_boxed_only_string,
-    last_boxed_only_string,
-    remove_boxed,
+    diagnose_gsm8k_completion,
 )
 
 
@@ -72,16 +69,6 @@ def _processed_solution(answer: str) -> str:
     rationale = parts[0]
     clean_answer = parts[-1].strip()
     return (rationale + "\\boxed{" + clean_answer + "}").strip()
-
-
-def _extracted_boxed_answer(text: str, *, first: bool) -> str | None:
-    boxed = first_boxed_only_string(text) if first else last_boxed_only_string(text)
-    if boxed is None:
-        return None
-    try:
-        return remove_boxed(boxed)
-    except (AssertionError, IndexError):
-        return None
 
 
 def _resolve_model_revision(model: Any, requested_revision: str) -> str:
@@ -249,16 +236,15 @@ def main() -> None:
             ):
                 completion = completion.strip()
                 solution = _processed_solution(str(source["answer"]).strip())
-                reward = float(compute_score(completion=completion, ground_truth=solution))
+                diagnosis = diagnose_gsm8k_completion(completion, solution)
+                reward = diagnosis["reward"]
                 outcome = "verified_success" if reward == 1.0 else "verified_failure"
                 success_count += int(reward == 1.0)
                 failure_count += int(reward == 0.0)
-                predicted = _extracted_boxed_answer(completion, first=True)
-                expected = _extracted_boxed_answer(solution, first=False)
                 feedback = (
-                    "GSM8K deterministic verifier accepted the first boxed answer."
+                    "GSM8K strict verifier accepted the required boxed final answer."
                     if reward == 1.0
-                    else "GSM8K deterministic verifier rejected the first boxed answer."
+                    else "GSM8K strict verifier rejected the task response; see failure_types."
                 )
                 episode_id = f"{sample['sample_id']}-rollout-{rollout_index}"
                 record = {
@@ -280,10 +266,7 @@ def main() -> None:
                     "reward": reward,
                     "verifier": {
                         "name": "data.utils.math_utils.compute_score",
-                        "version": "gsm8k-first-boxed-v1",
-                        "reward": reward,
-                        "predicted_answer": predicted,
-                        "expected_answer": expected,
+                        **diagnosis,
                         "feedback": feedback,
                     },
                     "student": student,

@@ -13,6 +13,16 @@
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
 
+import re
+
+
+GSM8K_VERIFIER_VERSION = "gsm8k-first-boxed-v2-diagnostic"
+
+
+_NUMERIC_ANSWER_RE = re.compile(
+    r"(?<![\w.])[-+]?\$?\d[\d,]*(?:\.\d+)?(?:%|\\%)?(?!\w)"
+)
+
 
 def compute_score(completion, ground_truth) -> float:
     retval = 0.0
@@ -29,6 +39,72 @@ def compute_score(completion, ground_truth) -> float:
         print(e)
 
     return retval
+
+
+def extract_last_numeric_answer(text):
+    """Best-effort diagnostic extraction; never changes the official reward.
+
+    GSM8K's task contract requires a boxed answer, so ``compute_score`` remains
+    strict.  This extractor only helps distinguish a format-only failure from a
+    likely answer failure when a rollout omitted or malformed the box.
+    """
+
+    matches = _NUMERIC_ANSWER_RE.findall(str(text))
+    if not matches:
+        return None
+    return matches[-1].replace(",", "").replace("$", "")
+
+
+def diagnose_gsm8k_completion(completion, ground_truth):
+    """Return a structured diagnosis alongside the strict GSM8K reward."""
+
+    reward = float(compute_score(completion, ground_truth))
+    predicted_box = first_boxed_only_string(completion)
+    expected_box = last_boxed_only_string(ground_truth)
+    predicted_answer = remove_boxed(predicted_box) if predicted_box is not None else None
+    expected_answer = remove_boxed(expected_box) if expected_box is not None else None
+    box_marker_present = "\\boxed" in completion or "\\fbox" in completion
+    format_valid = predicted_box is not None
+
+    if predicted_answer is not None:
+        diagnostic_answer = predicted_answer
+        diagnostic_source = "first_boxed_answer"
+    else:
+        diagnostic_answer = extract_last_numeric_answer(completion)
+        diagnostic_source = (
+            "last_numeric_candidate" if diagnostic_answer is not None else "unavailable"
+        )
+
+    diagnostic_answer_correct = None
+    if diagnostic_answer is not None and expected_answer is not None:
+        diagnostic_answer_correct = bool(is_equiv(diagnostic_answer, expected_answer))
+
+    failure_types = []
+    if reward == 0.0:
+        if not format_valid:
+            failure_types.append(
+                "malformed_boxed" if box_marker_present else "missing_boxed"
+            )
+            if diagnostic_answer_correct is False:
+                failure_types.append("answer_mismatch")
+            elif diagnostic_answer_correct is None:
+                failure_types.append("answer_unverified")
+        else:
+            failure_types.append("boxed_answer_mismatch")
+
+    return {
+        "version": GSM8K_VERIFIER_VERSION,
+        "reward": reward,
+        "task_success": reward == 1.0,
+        "format_required": True,
+        "format_valid": format_valid,
+        "predicted_answer": predicted_answer,
+        "expected_answer": expected_answer,
+        "diagnostic_answer": diagnostic_answer,
+        "diagnostic_answer_source": diagnostic_source,
+        "diagnostic_answer_correct": diagnostic_answer_correct,
+        "failure_types": failure_types,
+    }
 
 
 # string normalization from https://github.com/EleutherAI/lm-evaluation-harness/blob/master/lm_eval/tasks/hendrycks_math.py
@@ -211,15 +287,17 @@ def strip_string(string):
     string = string.replace("^{\\circ}", "")
     string = string.replace("^\\circ", "")
 
-    # remove dollar signs
+    # remove escaped or raw currency delimiters inside a valid answer box
     string = string.replace("\\$", "")
+    string = string.replace("$", "")
+    string = string.replace(",", "")
 
     # remove units (on the right)
     string = remove_right_units(string)
 
     # remove percentage
     string = string.replace("\\%", "")
-    string = string.replace("\%", "")  # noqa: W605
+    string = string.replace(r"\%", "")
 
     # " 0." equivalent to " ." and "{0." equivalent to "{." Alternatively, add "0" if "." is the start of the string
     string = string.replace(" .", " 0.")

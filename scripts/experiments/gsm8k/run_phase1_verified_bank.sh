@@ -84,15 +84,13 @@ else
   echo "[phase1] reuse completed rollout artifact: $ROLLOUTS"
 fi
 
-if [[ ! -s "$EXPERIENCES" || ! -s "$EXPERIENCE_REPORT" ]]; then
-  python scripts/build_verified_experiences.py \
-    --rollouts "$ROLLOUTS" \
-    --output "$EXPERIENCES" \
-    --report-output "$EXPERIENCE_REPORT" \
-    --max-pairs-per-sample 1
-else
-  echo "[phase1] reuse completed verified contrasts: $EXPERIENCES"
-fi
+# This step is deterministic and cheap. Always rebuild it so legacy v1 rollout
+# verifier records are re-diagnosed under the current strict+diagnostic policy.
+python scripts/build_verified_experiences.py \
+  --rollouts "$ROLLOUTS" \
+  --output "$EXPERIENCES" \
+  --report-output "$EXPERIENCE_REPORT" \
+  --max-pairs-per-sample 1
 
 PAIR_COUNT="$(wc -l < "$EXPERIENCES" | tr -d ' ')"
 if [[ "$TEACHER_LIMIT" -eq 0 || "$TEACHER_LIMIT" -gt "$PAIR_COUNT" ]]; then

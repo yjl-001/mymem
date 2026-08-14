@@ -19,9 +19,13 @@ from memgen.experience.phase1 import (
     summarize_human_review,
 )
 from scripts.build_teacher_bank import TeacherClient, jsonl_examples
+from scripts.build_teacher_bank import teacher_messages
+from data.utils.math_utils import diagnose_gsm8k_completion
 
 
 VALID_TEACHER_PAYLOAD = {
+    "experience_type": "answer_correctness",
+    "failure_types": ["boxed_answer_mismatch"],
     "target": {
         "situation_signature": "supported situation",
         "transferable_decision": "supported decision",
@@ -36,11 +40,18 @@ VALID_TEACHER_PAYLOAD = {
         "non_reuse_boundary": "reference boundary",
         "confidence": 0.9,
     },
+    "evidence": {
+        "target_observation": "The successful response satisfies the task contract.",
+        "reference_observation": "The failed response emits an incorrect final answer.",
+    },
     "quality": {
         "target_supported": True,
         "reference_supported": True,
         "target_reference_distinct": True,
+        "failure_type_aligned": True,
+        "evidence_grounded": True,
         "contains_instance_specific_details": False,
+        "reject_pair": False,
         "issues": [],
     },
 }
@@ -122,6 +133,7 @@ def rollout(*, episode_id: str, reward: float, trajectory: str) -> dict:
         "verifier": {
             "name": "fixture",
             "reward": reward,
+            "expected_answer": "4",
             "feedback": f"fixture {outcome}",
         },
         "student": {"model_name": "fixture", "model_revision": "rev", "frozen": True},
@@ -131,7 +143,7 @@ def rollout(*, episode_id: str, reward: float, trajectory: str) -> dict:
 
 def teacher_record(experience: dict) -> dict:
     return {
-        "schema_version": "teacher-bank-record-v2",
+        "schema_version": "teacher-bank-record-v3",
         "experience_id": experience["experience_id"],
         "reference_evidence": "verified_failure",
         "source_episode_ids": {
@@ -144,7 +156,11 @@ def teacher_record(experience: dict) -> dict:
         "rollout_configuration": copy.deepcopy(experience["rollout_configuration"]),
         "target_verifier": copy.deepcopy(experience["target_verifier"]),
         "reference_verifier": copy.deepcopy(experience["reference_verifier"]),
+        "reference_failure_types": copy.deepcopy(experience["reference_failure_types"]),
+        "experience_type": experience["experience_type"],
         "bank": {
+            "experience_type": experience["experience_type"],
+            "failure_types": copy.deepcopy(experience["reference_failure_types"]),
             "target": {
                 "situation_signature": "A direct plan remains consistent with the task constraints.",
                 "transferable_decision": "Continue the supported calculation without changing goals.",
@@ -159,11 +175,18 @@ def teacher_record(experience: dict) -> dict:
                 "non_reuse_boundary": "Do not reuse when new evidence genuinely invalidates the plan.",
                 "confidence": 0.9,
             },
+            "evidence": {
+                "target_observation": "The accepted response follows a supported plan.",
+                "reference_observation": "The failed response emits a wrong boxed answer.",
+            },
             "quality": {
                 "target_supported": True,
                 "reference_supported": True,
                 "target_reference_distinct": True,
+                "failure_type_aligned": True,
+                "evidence_grounded": True,
                 "contains_instance_specific_details": False,
+                "reject_pair": False,
                 "issues": [],
             },
         },
@@ -226,7 +249,37 @@ class VerifiedExperienceTests(unittest.TestCase):
         self.assertEqual(experience["target_episode_id"], "success")
         self.assertEqual(experience["reference_episode_id"], "failure")
         self.assertEqual(experience["reference_evidence"], "verified_failure")
+        self.assertEqual(experience["experience_type"], "answer_correctness")
+        self.assertEqual(
+            experience["reference_failure_types"], ["boxed_answer_mismatch"]
+        )
         self.assertEqual(report["verified_experience_count"], 1)
+
+    def test_format_only_failure_remains_a_valid_reference(self) -> None:
+        records = [
+            rollout(episode_id="success", reward=1.0, trajectory="valid \\boxed{4}"),
+            rollout(episode_id="format-failure", reward=0.0, trajectory="The answer is 4."),
+        ]
+        experiences, _ = build_verified_experiences(records)
+        self.assertEqual(len(experiences), 1)
+        self.assertEqual(experiences[0]["experience_type"], "format_compliance")
+        self.assertEqual(experiences[0]["reference_failure_types"], ["missing_boxed"])
+        self.assertTrue(
+            experiences[0]["reference_verifier"]["diagnostic_answer_correct"]
+        )
+
+    def test_teacher_prompt_receives_reference_verifier_diagnosis(self) -> None:
+        experiences, _ = build_verified_experiences(
+            [
+                rollout(episode_id="success", reward=1.0, trajectory="valid \\boxed{4}"),
+                rollout(episode_id="failure", reward=0.0, trajectory="The answer is 4."),
+            ]
+        )
+        messages = teacher_messages(experiences[0])
+        prompt = messages[1]["content"]
+        self.assertIn("Reference verifier record", prompt)
+        self.assertIn("missing_boxed", prompt)
+        self.assertIn("format_compliance", prompt)
 
     def test_rejects_non_bank_source_rollout(self) -> None:
         record = rollout(episode_id="bad-split", reward=0.0, trajectory="wrong")
@@ -281,6 +334,60 @@ class TeacherAuditTests(unittest.TestCase):
         reasons = audit_teacher_record(record, self.experience)
         self.assertIn("instance_specific_literal_detected", reasons)
         self.assertIn("teacher_marks_target_reference_equivalent", reasons)
+
+    def test_mismatched_teacher_failure_type_is_rejected(self) -> None:
+        record = teacher_record(self.experience)
+        record["bank"]["failure_types"] = ["missing_boxed"]
+        reasons = audit_teacher_record(record, self.experience)
+        self.assertIn("teacher_failure_types_mismatch", reasons)
+
+    def test_format_pair_requires_format_specific_abstraction(self) -> None:
+        experiences, _ = build_verified_experiences(
+            [
+                rollout(episode_id="success", reward=1.0, trajectory="valid \\boxed{4}"),
+                rollout(episode_id="failure", reward=0.0, trajectory="The answer is 4."),
+            ]
+        )
+        experience = experiences[0]
+        record = teacher_record(experience)
+        record["bank"]["reference"]["failure_signal"] = (
+            "The reasoning follows an unsupported numerical relation."
+        )
+        record["bank"]["reference"]["failure_mechanism"] = (
+            "An arithmetic mistake produces an incorrect result."
+        )
+        reasons = audit_teacher_record(record, experience)
+        self.assertIn("format_reference_failure_signal_not_aligned", reasons)
+        self.assertIn("format_reference_failure_mechanism_not_aligned", reasons)
+
+
+class VerifierDiagnosticTests(unittest.TestCase):
+    def test_missing_box_with_correct_answer_is_format_only_failure(self) -> None:
+        diagnosis = diagnose_gsm8k_completion("Therefore the answer is 14.", "\\boxed{14}")
+        self.assertEqual(diagnosis["reward"], 0.0)
+        self.assertEqual(diagnosis["failure_types"], ["missing_boxed"])
+        self.assertTrue(diagnosis["diagnostic_answer_correct"])
+
+    def test_currency_inside_valid_box_is_normalized(self) -> None:
+        diagnosis = diagnose_gsm8k_completion("Therefore \\boxed{$30}", "\\boxed{30}")
+        self.assertEqual(diagnosis["reward"], 1.0)
+        self.assertEqual(diagnosis["failure_types"], [])
+
+    def test_legacy_currency_false_negative_is_rescored_without_new_rollout(self) -> None:
+        legacy_success = rollout(
+            episode_id="legacy-currency", reward=0.0, trajectory="Therefore \\boxed{$4}"
+        )
+        legacy_success["verifier"]["version"] = "gsm8k-first-boxed-v1"
+        actual_failure = rollout(
+            episode_id="actual-failure", reward=0.0, trajectory="Therefore \\boxed{5}"
+        )
+        experiences, report = build_verified_experiences(
+            [legacy_success, actual_failure]
+        )
+        self.assertEqual(len(experiences), 1)
+        self.assertEqual(experiences[0]["target_episode_id"], "legacy-currency")
+        self.assertEqual(experiences[0]["reference_episode_id"], "actual-failure")
+        self.assertEqual(report["verified_success_rollouts"], 1)
 
 
 class HumanReviewTests(unittest.TestCase):

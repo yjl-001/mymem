@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -24,8 +25,11 @@ from typing import Any, Callable, Iterable
 
 import requests
 
+from memgen.experience.phase1 import upgrade_verified_experience
 
-PROMPT_VERSION = "teacher-bank-v2-verified-contrast"
+
+PROMPT_VERSION = "teacher-bank-v3-typed-verifier-contrast"
+TEACHER_RECORD_SCHEMA = "teacher-bank-record-v3"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-pro"
 
@@ -124,6 +128,7 @@ def jsonl_examples(path: Path, offset: int, limit: int) -> Iterable[dict[str, An
             "verified_failure" if item.get("reference_trajectory") else "teacher_inferred",
         )
         if reference_evidence == "verified_failure":
+            item = upgrade_verified_experience(item)
             if item.get("outcome") != "verified_success" or item.get("reward") != 1.0:
                 raise ValueError(
                     f"Episode {index} claims verified contrast but target is not verified_success"
@@ -138,6 +143,17 @@ def jsonl_examples(path: Path, offset: int, limit: int) -> Iterable[dict[str, An
                 raise ValueError(
                     f"Episode {index} claims verified failure without a zero-reward verifier record"
                 )
+            for label, verifier in (
+                ("target", target_verifier),
+                ("reference", reference_verifier),
+            ):
+                if (
+                    "legacy_reward" in verifier
+                    and verifier.get("legacy_version") != "gsm8k-first-boxed-v1"
+                ):
+                    raise ValueError(
+                        f"Episode {index} {label} verifier reward disagrees with recomputation"
+                    )
             if not item.get("target_episode_id") or not item.get("reference_episode_id"):
                 raise ValueError(
                     f"Episode {index} claims verified contrast without source episode IDs"
@@ -165,6 +181,8 @@ def jsonl_examples(path: Path, offset: int, limit: int) -> Iterable[dict[str, An
             "reference_episode_id": item.get("reference_episode_id"),
             "target_verifier": item.get("target_verifier"),
             "reference_verifier": item.get("reference_verifier"),
+            "reference_failure_types": item.get("reference_failure_types", []),
+            "experience_type": item.get("experience_type", "unclassified_task_failure"),
             "student": item.get("student"),
             "rollout_configuration": item.get("rollout_configuration"),
             "provenance_sha256": item.get("provenance_sha256"),
@@ -174,6 +192,15 @@ def jsonl_examples(path: Path, offset: int, limit: int) -> Iterable[dict[str, An
 
 def teacher_messages(episode: dict[str, Any]) -> list[dict[str, str]]:
     reference = episode.get("reference_trajectory") or "No verified failed trajectory is available."
+    target_verifier = json.dumps(
+        episode.get("target_verifier"), ensure_ascii=False, sort_keys=True
+    )
+    reference_verifier = json.dumps(
+        episode.get("reference_verifier"), ensure_ascii=False, sort_keys=True
+    )
+    experience_type = episode.get("experience_type", "unclassified_task_failure")
+    failure_types = episode.get("reference_failure_types", [])
+    failure_types_json = json.dumps(failure_types, ensure_ascii=False)
     system = """You are an offline experience-bank curator for a frozen LLM agent.
 Return JSON only, with exactly the schema requested. Your task is abstraction,
 not problem solving. Never copy names, numbers, final answers, code literals,
@@ -181,7 +208,15 @@ or instance-specific equations from the episode. Never invent a false fact.
 Write concise English text that can transfer across math, coding, retrieval, or
 tool-use tasks. The target record describes a reusable successful decision
 pattern. The reference record describes a competing, inapplicable, or failed
-decision pattern; it must not contain a detailed wrong solution."""
+decision pattern; it must not contain a detailed wrong solution.
+
+The verifier owns the task-success label and failure_types. Copy experience_type
+and failure_types exactly; do not relabel them. A missing or malformed required
+box is a real task failure. When diagnostic_answer_correct is true, describe it
+as format compliance only and do not invent arithmetic, logical, or relational
+errors. When answer correctness is false or unavailable, describe only errors
+actually visible in the trajectory. If a grounded contrast cannot be stated,
+set reject_pair to true instead of inventing a mechanism."""
     user = f"""Create one target and one reference experience record.
 
 Episode context:
@@ -193,12 +228,22 @@ Successful trajectory:
 Outcome: {episode['outcome']}
 Verifier reward: {episode.get('reward')}
 Verifier feedback: {episode.get('feedback', '')}
+Target verifier record:
+{target_verifier}
 
 Optional verified failed trajectory:
 {reference}
 
+Reference verifier record:
+{reference_verifier}
+
+Required experience_type: {experience_type}
+Required failure_types: {failure_types_json}
+
 Return this JSON object exactly:
 {{
+  "experience_type": "{experience_type}",
+  "failure_types": {failure_types_json},
   "target": {{
     "situation_signature": "...",
     "transferable_decision": "...",
@@ -213,11 +258,18 @@ Return this JSON object exactly:
     "non_reuse_boundary": "...",
     "confidence": 0.0
   }},
+  "evidence": {{
+    "target_observation": "...",
+    "reference_observation": "..."
+  }},
   "quality": {{
     "target_supported": true,
     "reference_supported": true,
     "target_reference_distinct": true,
+    "failure_type_aligned": true,
+    "evidence_grounded": true,
     "contains_instance_specific_details": false,
+    "reject_pair": false,
     "issues": []
   }}
 }}
@@ -242,6 +294,12 @@ def parse_json_payload(content: str) -> dict[str, Any]:
             raise ValueError(f"Teacher response missing object: {section}")
     if not isinstance(payload.get("quality"), dict):
         raise ValueError("Teacher response missing object: quality")
+    if not isinstance(payload.get("evidence"), dict):
+        raise ValueError("Teacher response missing object: evidence")
+    if not isinstance(payload.get("experience_type"), str):
+        raise ValueError("Teacher response missing string: experience_type")
+    if not isinstance(payload.get("failure_types"), list):
+        raise ValueError("Teacher response missing array: failure_types")
     return payload
 
 
@@ -476,19 +534,58 @@ def main() -> None:
         raise RuntimeError(f"Set {args.api_key_env} in scripts/experiments/.server.env before running.")
 
     if args.dataset == "gsm8k":
-        episodes = gsm8k_examples(args.split, args.offset, args.limit)
+        episodes = list(gsm8k_examples(args.split, args.offset, args.limit))
     else:
-        episodes = jsonl_examples(args.input_jsonl, args.offset, args.limit)
+        episodes = list(jsonl_examples(args.input_jsonl, args.offset, args.limit))
+
+    expected_provenance = {
+        episode["id"]: episode.get("provenance_sha256") for episode in episodes
+    }
 
     output_path = args.output.expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     completed_ids: set[str] = set()
+    compatible_existing: list[dict[str, Any]] = []
+    existing_record_count = 0
     if args.resume and output_path.exists():
         with output_path.open(encoding="utf-8") as existing:
             for line in existing:
                 if line.strip():
+                    existing_record_count += 1
                     record = json.loads(line)
-                    completed_ids.add(str(record.get("experience_id") or record["episode_id"]))
+                    if (
+                        record.get("schema_version") == TEACHER_RECORD_SCHEMA
+                        and record.get("prompt_version") == PROMPT_VERSION
+                        and record.get("provenance_sha256")
+                        == expected_provenance.get(
+                            str(record.get("experience_id") or record.get("episode_id"))
+                        )
+                    ):
+                        compatible_existing.append(record)
+                        completed_ids.add(
+                            str(record.get("experience_id") or record["episode_id"])
+                        )
+        stale_record_count = existing_record_count - len(compatible_existing)
+        if stale_record_count:
+            backup_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            backup_path = output_path.with_name(
+                f"{output_path.name}.stale-{backup_stamp}.bak"
+            )
+            shutil.copy2(output_path, backup_path)
+            print(
+                f"[teacher-bank] backed up {stale_record_count} stale records to "
+                f"{backup_path}",
+                flush=True,
+            )
+        if output_path.exists():
+            with output_path.open("w", encoding="utf-8") as existing:
+                for record in compatible_existing:
+                    existing.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(
+            f"[teacher-bank] resume kept {len(compatible_existing)} compatible "
+            "v3 records; stale prompt/provenance records will be regenerated",
+            flush=True,
+        )
     records_written = 0
     mode = "a" if args.resume else "w"
     with TeacherClient(
@@ -511,7 +608,7 @@ def main() -> None:
                 continue
             bank = client.call(teacher_messages(episode))
             record = {
-                "schema_version": "teacher-bank-record-v2",
+                "schema_version": TEACHER_RECORD_SCHEMA,
                 "prompt_version": PROMPT_VERSION,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "teacher": {"model": args.model, "base_url": args.base_url},
@@ -527,6 +624,8 @@ def main() -> None:
                 },
                 "target_verifier": episode.get("target_verifier"),
                 "reference_verifier": episode.get("reference_verifier"),
+                "reference_failure_types": episode.get("reference_failure_types", []),
+                "experience_type": episode.get("experience_type"),
                 "student": episode.get("student"),
                 "rollout_configuration": episode.get("rollout_configuration"),
                 "provenance_sha256": episode.get("provenance_sha256"),

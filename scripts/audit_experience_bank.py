@@ -18,6 +18,7 @@ from memgen.experience.phase1 import (
     audit_teacher_record,
     file_sha256,
     iter_jsonl,
+    upgrade_verified_experience,
     write_jsonl,
 )
 
@@ -38,7 +39,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     experiences = {
-        str(item["experience_id"]): item for item in iter_jsonl(args.experiences)
+        str(item["experience_id"]): upgrade_verified_experience(item)
+        for item in iter_jsonl(args.experiences)
     }
     teacher_records = list(iter_jsonl(args.teacher_records))
     approved: list[dict] = []
@@ -79,6 +81,10 @@ def main() -> None:
                 "context": experience["context"],
                 "target_trajectory": experience["trajectory"],
                 "reference_trajectory": experience["reference_trajectory"],
+                "experience_type": experience["experience_type"],
+                "reference_failure_types": experience["reference_failure_types"],
+                "target_verifier": experience["target_verifier"],
+                "reference_verifier": experience["reference_verifier"],
                 "teacher_bank": record["bank"],
                 "human_review": {
                     "target_supported": None,
@@ -93,7 +99,7 @@ def main() -> None:
 
     missing_teacher_records = sorted(set(experiences) - seen_ids)
     report = {
-        "schema_version": "phase1-experience-bank-audit-v1",
+        "schema_version": "phase1-experience-bank-audit-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "experience_count": len(experiences),
         "teacher_record_count": len(teacher_records),

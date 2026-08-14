@@ -7,7 +7,7 @@ network access, or API credentials.
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -16,10 +16,12 @@ import random
 import re
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from data.utils.math_utils import diagnose_gsm8k_completion
+
 
 SPLIT_MANIFEST_SCHEMA = "gsm8k-split-manifest-v1"
 ROLLOUT_SCHEMA = "verified-student-rollout-v1"
-EXPERIENCE_SCHEMA = "verified-contrastive-experience-v1"
+EXPERIENCE_SCHEMA = "verified-contrastive-experience-v2"
 TEACHER_BANK_REQUIRED_FIELDS = {
     "target": (
         "situation_signature",
@@ -215,6 +217,82 @@ def _normalize_trajectory(value: str) -> str:
     return " ".join(value.lower().split())
 
 
+def _experience_type(reference_verifier: Mapping[str, Any]) -> str:
+    failure_types = set(reference_verifier.get("failure_types") or [])
+    diagnostic_correct = reference_verifier.get("diagnostic_answer_correct")
+    format_failures = {"missing_boxed", "malformed_boxed"}
+    if failure_types & format_failures:
+        if diagnostic_correct is True and not failure_types & {
+            "answer_mismatch",
+            "answer_unverified",
+        }:
+            return "format_compliance"
+        return "mixed_or_unclassified_task_failure"
+    if failure_types & {"boxed_answer_mismatch", "answer_mismatch"}:
+        return "answer_correctness"
+    return "unclassified_task_failure"
+
+
+def enrich_verifier_diagnostics(
+    verifier: Mapping[str, Any],
+    *,
+    trajectory: str,
+) -> dict[str, Any]:
+    """Add diagnostics and rescore known v1 normalization false negatives."""
+
+    enriched = dict(verifier)
+    if isinstance(enriched.get("failure_types"), list) and "format_valid" in enriched:
+        return enriched
+    expected_answer = enriched.get("expected_answer")
+    if expected_answer is None:
+        if enriched.get("reward") == 0.0:
+            enriched.setdefault("failure_types", ["unclassified_failure"])
+        else:
+            enriched.setdefault("failure_types", [])
+        enriched.setdefault("task_success", enriched.get("reward") == 1.0)
+        return enriched
+
+    ground_truth = f"\\boxed{{{expected_answer}}}"
+    diagnosis = diagnose_gsm8k_completion(trajectory, ground_truth)
+    recorded_reward = enriched.get("reward")
+    if recorded_reward in {0.0, 1.0} and diagnosis["reward"] != recorded_reward:
+        diagnosis["diagnostic_warnings"] = ["legacy_reward_disagrees_with_v2_verifier"]
+        diagnosis["legacy_reward"] = float(recorded_reward)
+        diagnosis["legacy_version"] = enriched.get("version")
+    enriched.update(diagnosis)
+    enriched.setdefault("name", "data.utils.math_utils.compute_score")
+    enriched["feedback"] = (
+        "GSM8K strict verifier accepted the required boxed final answer."
+        if enriched.get("reward") == 1.0
+        else "GSM8K strict verifier rejected the task response; see failure_types."
+    )
+    return enriched
+
+
+def upgrade_verified_experience(experience: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a v2 typed experience, including when its source file is legacy v1."""
+
+    upgraded = dict(experience)
+    target_verifier = enrich_verifier_diagnostics(
+        experience.get("target_verifier", {}),
+        trajectory=str(experience.get("trajectory", "")),
+    )
+    reference_verifier = enrich_verifier_diagnostics(
+        experience.get("reference_verifier", {}),
+        trajectory=str(experience.get("reference_trajectory", "")),
+    )
+    upgraded.update(
+        {
+            "schema_version": EXPERIENCE_SCHEMA,
+            "target_verifier": target_verifier,
+            "reference_verifier": reference_verifier,
+            "reference_failure_types": list(reference_verifier.get("failure_types") or []),
+            "experience_type": _experience_type(reference_verifier),
+        }
+    )
+    return upgraded
+
+
 def build_verified_experiences(
     rollout_records: Iterable[Mapping[str, Any]],
     *,
@@ -239,8 +317,30 @@ def build_verified_experiences(
         source = record.get("source", {})
         if source.get("logical_split") != "bank-source":
             raise ValueError(f"Rollout {episode_id} is not from bank-source")
-        reward = record.get("reward")
-        outcome = record.get("outcome")
+        recorded_reward = record.get("reward")
+        recorded_outcome = record.get("outcome")
+        if isinstance(recorded_reward, bool) or recorded_reward not in {0.0, 1.0}:
+            raise ValueError(f"Rollout {episode_id} has non-binary recorded reward")
+        if (recorded_reward == 1.0) != (recorded_outcome == "verified_success"):
+            raise ValueError(f"Rollout {episode_id} has inconsistent recorded outcome")
+        if record.get("verifier", {}).get("reward") != recorded_reward:
+            raise ValueError(f"Rollout {episode_id} has inconsistent verifier reward")
+        upgraded_record = dict(record)
+        upgraded_verifier = enrich_verifier_diagnostics(
+            record.get("verifier", {}), trajectory=str(record.get("trajectory", ""))
+        )
+        if (
+            "legacy_reward" in upgraded_verifier
+            and upgraded_verifier.get("legacy_version") != "gsm8k-first-boxed-v1"
+        ):
+            raise ValueError(
+                f"Rollout {episode_id} verifier reward disagrees with recomputation"
+            )
+        reward = upgraded_verifier.get("reward")
+        outcome = "verified_success" if reward == 1.0 else "verified_failure"
+        upgraded_record.update(
+            {"reward": reward, "outcome": outcome, "verifier": upgraded_verifier}
+        )
         if isinstance(reward, bool) or reward not in {0.0, 1.0}:
             raise ValueError(f"Rollout {episode_id} has non-binary verifier reward")
         if outcome not in {"verified_success", "verified_failure"}:
@@ -249,7 +349,7 @@ def build_verified_experiences(
             raise ValueError(f"Rollout {episode_id} has inconsistent success label")
         if (reward == 0.0) != (outcome == "verified_failure"):
             raise ValueError(f"Rollout {episode_id} has inconsistent failure label")
-        grouped[str(record["sample_id"])].append(record)
+        grouped[str(record["sample_id"])].append(upgraded_record)
 
     experiences: list[dict[str, Any]] = []
     samples_without_contrast = 0
@@ -280,6 +380,12 @@ def build_verified_experiences(
             ):
                 continue
             experience_id = f"{sample_id}-contrast-{pair_index}"
+            target_verifier = enrich_verifier_diagnostics(
+                target["verifier"], trajectory=str(target["trajectory"])
+            )
+            reference_verifier = enrich_verifier_diagnostics(
+                reference["verifier"], trajectory=str(reference["trajectory"])
+            )
             experience = {
                 "schema_version": EXPERIENCE_SCHEMA,
                 "experience_id": experience_id,
@@ -290,12 +396,16 @@ def build_verified_experiences(
                 "reference_trajectory": reference["trajectory"],
                 "outcome": "verified_success",
                 "reward": 1.0,
-                "feedback": target["verifier"]["feedback"],
+                "feedback": target_verifier["feedback"],
                 "reference_evidence": "verified_failure",
+                "reference_failure_types": list(
+                    reference_verifier.get("failure_types") or []
+                ),
+                "experience_type": _experience_type(reference_verifier),
                 "target_episode_id": target["episode_id"],
                 "reference_episode_id": reference["episode_id"],
-                "target_verifier": dict(target["verifier"]),
-                "reference_verifier": dict(reference["verifier"]),
+                "target_verifier": target_verifier,
+                "reference_verifier": reference_verifier,
                 "student": dict(target["student"]),
                 "rollout_configuration": {
                     "target": dict(target["rollout_configuration"]),
@@ -319,7 +429,7 @@ def build_verified_experiences(
             experiences.append(experience)
 
     report = {
-        "schema_version": "verified-experience-build-report-v1",
+        "schema_version": "verified-experience-build-report-v2",
         "created_at": utc_now(),
         "total_rollouts": total_rollouts,
         "verified_success_rollouts": success_count,
@@ -327,6 +437,9 @@ def build_verified_experiences(
         "sample_count": len(grouped),
         "samples_without_success_failure_contrast": samples_without_contrast,
         "verified_experience_count": len(experiences),
+        "experience_type_counts": dict(
+            sorted(Counter(item["experience_type"] for item in experiences).items())
+        ),
         "max_pairs_per_sample": max_pairs_per_sample,
     }
     return experiences, report
@@ -334,6 +447,10 @@ def build_verified_experiences(
 
 _WORD_RE = re.compile(r"[a-z]+")
 _INSTANCE_LITERAL_RE = re.compile(r"(?:\\boxed|\\frac|\d)")
+_FORMAT_DESCRIPTION_RE = re.compile(
+    r"\b(?:format|box|boxed|boxing|serialize|serialization|emit|output contract|final answer)\b",
+    re.IGNORECASE,
+)
 
 
 def _word_set(value: str) -> set[str]:
@@ -391,9 +508,23 @@ def audit_teacher_record(
         if record.get(field) != experience.get(field):
             reasons.append(f"{field}_mismatch")
 
+    expected_failure_types = list(experience.get("reference_failure_types") or [])
+    expected_experience_type = experience.get("experience_type")
+    if record.get("reference_failure_types") != expected_failure_types:
+        reasons.append("reference_failure_types_mismatch")
+    if record.get("experience_type") != expected_experience_type:
+        reasons.append("experience_type_mismatch")
+    reference_verifier = experience.get("reference_verifier", {})
+    if list(reference_verifier.get("failure_types") or []) != expected_failure_types:
+        reasons.append("experience_failure_types_inconsistent")
+
     bank = record.get("bank")
     if not isinstance(bank, Mapping):
         return reasons + ["missing_bank_object"]
+    if bank.get("experience_type") != expected_experience_type:
+        reasons.append("teacher_experience_type_mismatch")
+    if bank.get("failure_types") != expected_failure_types:
+        reasons.append("teacher_failure_types_mismatch")
     for section, fields in TEACHER_BANK_REQUIRED_FIELDS.items():
         value = bank.get(section)
         if not isinstance(value, Mapping):
@@ -417,7 +548,10 @@ def audit_teacher_record(
             "target_supported",
             "reference_supported",
             "target_reference_distinct",
+            "failure_type_aligned",
+            "evidence_grounded",
             "contains_instance_specific_details",
+            "reject_pair",
         ):
             if not isinstance(quality.get(field), bool):
                 reasons.append(f"invalid_quality_{field}")
@@ -427,8 +561,14 @@ def audit_teacher_record(
             reasons.append("teacher_marks_reference_unsupported")
         if quality.get("target_reference_distinct") is not True:
             reasons.append("teacher_marks_target_reference_equivalent")
+        if quality.get("failure_type_aligned") is not True:
+            reasons.append("teacher_marks_failure_type_misaligned")
+        if quality.get("evidence_grounded") is not True:
+            reasons.append("teacher_marks_evidence_ungrounded")
         if quality.get("contains_instance_specific_details") is not False:
             reasons.append("teacher_marks_instance_specific_details")
+        if quality.get("reject_pair") is not False:
+            reasons.append("teacher_rejects_pair")
         issues = quality.get("issues")
         if not isinstance(issues, list):
             reasons.append("invalid_quality_issues")
@@ -445,9 +585,42 @@ def audit_teacher_record(
         for field in TEACHER_BANK_REQUIRED_FIELDS["reference"]
         if field != "confidence"
     )
+    evidence = bank.get("evidence")
+    if not isinstance(evidence, Mapping):
+        reasons.append("missing_evidence_object")
+        evidence_text = ""
+    else:
+        evidence_values = []
+        for field in ("target_observation", "reference_observation"):
+            value = evidence.get(field)
+            if not isinstance(value, str) or not value.strip():
+                reasons.append(f"missing_evidence_{field}")
+            else:
+                evidence_values.append(value)
+        evidence_text = " ".join(evidence_values)
+    if expected_experience_type == "format_compliance" and not _FORMAT_DESCRIPTION_RE.search(
+        reference_text + " " + evidence_text
+    ):
+        reasons.append("format_failure_not_described")
+    if expected_experience_type == "format_compliance":
+        target_section = bank.get("target", {})
+        reference_section = bank.get("reference", {})
+        target_format_fields = " ".join(
+            str(target_section.get(field, ""))
+            for field in ("transferable_decision", "verification_rule")
+        )
+        if not _FORMAT_DESCRIPTION_RE.search(target_format_fields):
+            reasons.append("format_target_not_aligned")
+        for field in ("failure_signal", "failure_mechanism"):
+            if not _FORMAT_DESCRIPTION_RE.search(str(reference_section.get(field, ""))):
+                reasons.append(f"format_reference_{field}_not_aligned")
     if _jaccard(target_text, reference_text) >= 0.8:
         reasons.append("target_reference_text_too_similar")
-    if _INSTANCE_LITERAL_RE.search(target_text) or _INSTANCE_LITERAL_RE.search(reference_text):
+    if (
+        _INSTANCE_LITERAL_RE.search(target_text)
+        or _INSTANCE_LITERAL_RE.search(reference_text)
+        or _INSTANCE_LITERAL_RE.search(evidence_text)
+    ):
         reasons.append("instance_specific_literal_detected")
     return sorted(set(reasons))
 

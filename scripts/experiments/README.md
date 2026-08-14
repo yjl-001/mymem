@@ -41,3 +41,14 @@ bash scripts/experiments/gsm8k/run_phase1_verified_bank.sh
 它会依次冻结 split、采样 student rollout、用 GSM8K verifier 标记成功/失败、形成
 同题 contrast、调用离线 teacher、执行自动 quality gate，并生成 30 条人工复核清单。
 `approved_bank_records.jsonl` 只包含绑定了真实 `verified_failure` episode 的记录。
+
+Phase 1 verifier 同时保存严格任务奖励和诊断字段。缺少或损坏 `\\boxed{}` 仍然是
+正式任务失败；若宽松诊断能确认自然语言中的最终数值正确，该 reference 会被归为
+`format_compliance`，而不是被误写为推理失败。答案错误和混合/无法判定失败使用独立
+experience type，供后续分簇编译。Teacher prompt 会收到 target/reference 两侧的完整
+verifier 记录，自动质量门会检查失败类型一致性和 format-specific 描述。
+
+脚本会复用已经完成的 student rollout，但每次都会廉价重建 typed experiences。旧版
+Teacher 记录或 provenance 已变化的记录会在 `--resume` 时自动丢弃并重新生成，因此升级
+后无需重新执行 GPU rollout，但需要重新调用 Teacher 并重新完成 30 条人工复核。被淘汰
+的旧 Teacher JSONL 会先保存为同目录下带 `.stale-<UTC>.bak` 后缀的备份。
