@@ -164,7 +164,9 @@ next-token logits；不插入 token，也不重建既有 KV cache。
 - 在 `bank-source` 上以固定采样配置运行 student rollout；
 - 用 GSM8K answer verifier 标记每条 rollout；
 - 保留成功、失败、奖励、完整 CoT、随机种子及 generation config；
-- 用强教师仅做跨 episode 经验抽象、失败原因分析、经验簇建议和质量标记；
+- 用低成本 Flash teacher 做跨 episode 经验抽象、失败原因分析、经验簇建议和质量标记；
+- 用独立 Pro reviewer 对照原始轨迹、verifier 和 teacher bank 做第二票审核；
+- 确定性质量门与 Pro 高置信一致时自动分流，只有冲突、低置信和证据含混记录交给人工；
 - 每个正式 reference 均绑定至少一个 `verified_failure` rollout。
 
 **产物**：原始 rollout JSONL、verified experience JSONL、教师反思 JSONL、审计报告。
@@ -173,7 +175,8 @@ next-token logits；不插入 token，也不重建既有 KV cache。
 
 - 所有正式 vector evidence 都能追溯到 verifier 结果；
 - `teacher_inferred` 与 `verified_failure` 在 schema 和下游过滤中严格区分；
-- 随机抽样人工审阅 30 条：target/reference 与来源轨迹一致率至少 90%；
+- 全部 teacher records 都有独立 Pro review 和可追溯的审核结论；
+- 自动门与 Pro 的冲突、低置信及 uncertain 记录全部完成人工裁决，不遗留 pending dispute；
 - 出现自相矛盾、事实错误或 target/reference 等价的记录必须可被 quality gate 拦截。
 
 ### Phase 2：全局 SEAL-style vector 可行性
@@ -307,11 +310,11 @@ injection_applied, generation_length, final_reward, output_path
 - DeepSeek 离线 teacher-bank MVP，能产生可审计的 target/reference schema；
 - 原始 MemGen 与 entropy gate 的基础实验工作流。
 - Phase 1 verifier-backed bank 流水线代码：固定 split manifest、冻结 student rollout、
-  success/failure 配对、teacher quality mark、自动审计与 30 条人工复核清单；
+  success/failure 配对、Flash teacher、确定性审计、Pro reviewer 与人工争议分流；
 
 尚未完成：
 
-- 在服务器上运行完整 Phase 1 rollout/teacher 流水线，并完成人工复核验收；
+- 在服务器上运行完整 Phase 1 rollout/teacher/reviewer 流水线，并完成争议裁决；
 - 经验聚类；
 - vector compiler、layer hook、soft-gated residual integrator；
 - Phase 2–4 的对照评测；

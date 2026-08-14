@@ -35,7 +35,7 @@ from memgen.experience.phase1 import upgrade_verified_experience
 PROMPT_VERSION = "teacher-bank-v3-typed-verifier-contrast"
 TEACHER_RECORD_SCHEMA = "teacher-bank-record-v3"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-v4-pro"
+DEFAULT_MODEL = "deepseek-v4-flash"
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,7 +60,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL))
+    parser.add_argument(
+        "--model",
+        default=os.environ.get(
+            "DEEPSEEK_TEACHER_MODEL",
+            os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL),
+        ),
+    )
     parser.add_argument("--base-url", default=os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL))
     parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
     parser.add_argument("--max-tokens", type=int, default=900)
@@ -400,7 +406,12 @@ class TeacherClient:
         )
         self._sleep(delay)
 
-    def call(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+    def call(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        response_parser: Callable[[str], dict[str, Any]] = parse_json_payload,
+    ) -> dict[str, Any]:
         body = {
             "model": self.model,
             "messages": messages,
@@ -485,7 +496,7 @@ class TeacherClient:
             try:
                 payload = response.json()
                 content = payload["choices"][0]["message"]["content"]
-                return parse_json_payload(content)
+                return response_parser(content)
             except (requests.exceptions.JSONDecodeError, KeyError, IndexError, ValueError) as exc:
                 ordinary_failures += 1
                 if ordinary_failures >= self.retries:
@@ -560,6 +571,7 @@ def main() -> None:
                     if (
                         record.get("schema_version") == TEACHER_RECORD_SCHEMA
                         and record.get("prompt_version") == PROMPT_VERSION
+                        and record.get("teacher", {}).get("model") == args.model
                         and record.get("provenance_sha256")
                         == expected_provenance.get(
                             str(record.get("experience_id") or record.get("episode_id"))

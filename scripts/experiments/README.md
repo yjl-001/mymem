@@ -39,8 +39,9 @@ bash scripts/experiments/gsm8k/run_phase1_verified_bank.sh
 ```
 
 它会依次冻结 split、采样 student rollout、用 GSM8K verifier 标记成功/失败、形成
-同题 contrast、调用离线 teacher、执行自动 quality gate，并生成 30 条人工复核清单。
-`approved_bank_records.jsonl` 只包含绑定了真实 `verified_failure` episode 的记录。
+同题 contrast、调用 Flash teacher、执行确定性 quality gate，再由 Pro reviewer 独立
+复核。确定性门与 Pro 高置信一致的记录自动通过或拒绝；只有结论冲突、证据含混或低置信
+记录进入 `human_controversy_review.jsonl`。
 
 Phase 1 verifier 同时保存严格任务奖励和诊断字段。缺少或损坏 `\\boxed{}` 仍然是
 正式任务失败；若宽松诊断能确认自然语言中的最终数值正确，该 reference 会被归为
@@ -49,6 +50,21 @@ experience type，供后续分簇编译。Teacher prompt 会收到 target/refere
 verifier 记录，自动质量门会检查失败类型一致性和 format-specific 描述。
 
 脚本会复用已经完成的 student rollout，但每次都会廉价重建 typed experiences。旧版
-Teacher 记录或 provenance 已变化的记录会在 `--resume` 时自动丢弃并重新生成，因此升级
-后无需重新执行 GPU rollout，但需要重新调用 Teacher 并重新完成 30 条人工复核。被淘汰
-的旧 Teacher JSONL 会先保存为同目录下带 `.stale-<UTC>.bak` 后缀的备份。
+Teacher/Reviewer 记录、模型或 provenance 已变化的记录会在 `--resume` 时自动丢弃并重新
+生成，因此升级后无需重新执行 GPU rollout。被淘汰的旧 JSONL 会先保存为同目录下带
+`.stale-<UTC>.bak` 后缀的备份。
+
+争议记录完成最小人工裁决后合并最终 bank：
+
+```bash
+python scripts/finalize_phase1_disputes.py \
+  --ai-approved "$RUN_DIR/ai_approved_bank_records.jsonl" \
+  --ai-rejected "$RUN_DIR/ai_rejected_bank_records.jsonl" \
+  --human-review "$RUN_DIR/human_controversy_review_reviewed.jsonl" \
+  --final-approved "$RUN_DIR/final_approved_bank_records.jsonl" \
+  --final-rejected "$RUN_DIR/final_rejected_bank_records.jsonl" \
+  --report-output "$RUN_DIR/phase1_final_review_report.json"
+```
+
+这里的 `AI review` 不得在论文或实验报告中表述为人工审核；人工只负责争议分流中的最终
+裁决。

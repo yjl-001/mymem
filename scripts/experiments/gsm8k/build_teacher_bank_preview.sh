@@ -16,7 +16,7 @@ source "$SERVER_ENV"
 : "${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY must be set in .server.env}"
 
 RUN_TAG="${MEMGEN_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
-RUN_ID="gsm8k_teacher-reflection_deepseek-v4-pro_target-reference_preview_${RUN_TAG}"
+RUN_ID="gsm8k_teacher-reflection_flash_target-reference_preview_${RUN_TAG}"
 OUTPUT_DIR="$MEMGEN_OUTPUT_ROOT/banks/gsm8k/$RUN_ID"
 OUTPUT_PATH="$OUTPUT_DIR/bank_records.jsonl"
 
@@ -24,7 +24,7 @@ python scripts/build_teacher_bank.py \
   --dataset gsm8k \
   --split train \
   --limit 5 \
-  --model "${DEEPSEEK_MODEL:-deepseek-v4-pro}" \
+  --model "${DEEPSEEK_TEACHER_MODEL:-deepseek-v4-flash}" \
   --thinking "${DEEPSEEK_THINKING:-disabled}" \
   --output "$OUTPUT_PATH"
 

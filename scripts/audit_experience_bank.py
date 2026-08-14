@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--human-review-output", type=Path, required=True)
     parser.add_argument("--human-review-size", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--allow-no-approved",
+        action="store_true",
+        help="Continue so an independent downstream reviewer can adjudicate all failures.",
+    )
     return parser.parse_args()
 
 
@@ -132,7 +137,7 @@ def main() -> None:
         f"[experience-audit] approved={len(approved)} rejected={len(rejected)} "
         f"manual_review={len(review_rows)} report={args.report_output}"
     )
-    if not approved:
+    if not approved and not args.allow_no_approved:
         raise RuntimeError("No teacher records passed the automatic Phase 1 quality gate")
 
 

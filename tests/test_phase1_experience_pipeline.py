@@ -18,11 +18,13 @@ from memgen.experience.phase1 import (
     audit_teacher_record,
     build_verified_experiences,
     create_gsm8k_split_manifest,
+    route_ai_review,
     summarize_human_review,
 )
 from scripts.build_teacher_bank import TeacherClient, jsonl_examples
 from scripts.build_teacher_bank import teacher_messages
 from data.utils.math_utils import diagnose_gsm8k_completion
+from scripts.review_experience_bank import parse_review_payload, reviewer_messages
 
 
 VALID_TEACHER_PAYLOAD = {
@@ -428,6 +430,141 @@ class HumanReviewTests(unittest.TestCase):
         self.assertFalse(incomplete["passed"])
 
 
+class AIReviewRoutingTests(unittest.TestCase):
+    def review(self, decision: str, confidence: float, *, supported: bool) -> dict:
+        return {
+            "decision": decision,
+            "confidence": confidence,
+            "criteria": {
+                "target_supported": supported,
+                "reference_supported": supported,
+                "target_reference_distinct": supported,
+                "factually_consistent": supported,
+                "failure_type_aligned": supported,
+                "transferable_without_instance_leakage": supported,
+            },
+        }
+
+    def test_two_high_confidence_votes_are_automated(self) -> None:
+        self.assertEqual(
+            route_ai_review([], self.review("approve", 0.95, supported=True)),
+            "ai_approved",
+        )
+        self.assertEqual(
+            route_ai_review(
+                ["teacher_marks_reference_unsupported"],
+                self.review("reject", 0.95, supported=False),
+            ),
+            "ai_rejected",
+        )
+
+    def test_disagreement_or_low_confidence_goes_to_human(self) -> None:
+        self.assertEqual(
+            route_ai_review([], self.review("reject", 0.95, supported=False)),
+            "human_review",
+        )
+        self.assertEqual(
+            route_ai_review(
+                ["format_failure_not_described"],
+                self.review("approve", 0.95, supported=True),
+            ),
+            "human_review",
+        )
+        self.assertEqual(
+            route_ai_review([], self.review("approve", 0.7, supported=True)),
+            "human_review",
+        )
+
+    def test_reviewer_payload_and_prompt_enforce_format_failure_grounding(self) -> None:
+        payload = {
+            "decision": "approve",
+            "confidence": 0.9,
+            "criteria": {
+                "target_supported": True,
+                "reference_supported": True,
+                "target_reference_distinct": True,
+                "factually_consistent": True,
+                "failure_type_aligned": True,
+                "transferable_without_instance_leakage": True,
+            },
+            "evidence": {"target": "supported", "reference": "supported"},
+            "issues": [],
+            "uncertainty_reason": "",
+        }
+        parsed = parse_review_payload(json.dumps(payload))
+        self.assertEqual(parsed, payload)
+
+        experiences, _ = build_verified_experiences(
+            [
+                rollout(episode_id="success", reward=1.0, trajectory="valid \\boxed{4}"),
+                rollout(episode_id="failure", reward=0.0, trajectory="The answer is 4."),
+            ]
+        )
+        experience = experiences[0]
+        messages = reviewer_messages(experience, teacher_record(experience))
+        self.assertIn("format-only reference", messages[0]["content"])
+        self.assertIn("must not invent a reasoning error", messages[0]["content"])
+        self.assertIn("intentionally hidden", messages[0]["content"])
+        self.assertNotIn("automatic_gate_reasons", messages[1]["content"])
+        self.assertNotIn('"quality"', messages[1]["content"])
+
+    def test_dispute_finalizer_merges_only_completed_human_decisions(self) -> None:
+        script = Path(__file__).resolve().parents[1] / "scripts" / "finalize_phase1_disputes.py"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ai_approved = root / "ai-approved.jsonl"
+            ai_rejected = root / "ai-rejected.jsonl"
+            disputes = root / "disputes.jsonl"
+            final_approved = root / "final-approved.jsonl"
+            final_rejected = root / "final-rejected.jsonl"
+            report = root / "report.json"
+            ai_approved.write_text('{"experience_id":"auto"}\n', encoding="utf-8")
+            ai_rejected.write_text("", encoding="utf-8")
+            disputes.write_text(
+                json.dumps(
+                    {
+                        "experience_id": "disputed",
+                        "automatic_gate": {"passed": True, "reasons": []},
+                        "ai_review": {"decision": "reject"},
+                        "teacher_record": {"experience_id": "disputed"},
+                        "human_resolution": {
+                            "decision": "approve",
+                            "reviewer_notes": "resolved from source evidence",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--ai-approved",
+                    str(ai_approved),
+                    "--ai-rejected",
+                    str(ai_rejected),
+                    "--human-review",
+                    str(disputes),
+                    "--final-approved",
+                    str(final_approved),
+                    "--final-rejected",
+                    str(final_rejected),
+                    "--report-output",
+                    str(report),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            approved_records = [
+                json.loads(line) for line in final_approved.read_text().splitlines()
+            ]
+            self.assertEqual(len(approved_records), 2)
+            self.assertTrue(json.loads(report.read_text())["passed"])
+
+
 class TeacherClientTests(unittest.TestCase):
     def test_teacher_script_can_start_outside_repository(self) -> None:
         script = Path(__file__).resolve().parents[1] / "scripts" / "build_teacher_bank.py"
@@ -476,6 +613,18 @@ class TeacherClientTests(unittest.TestCase):
         self.assertIn("proxy tunnel/authentication unavailable", log)
         self.assertNotIn("proxy-secret", log)
         self.assertNotIn("top-secret-api-key", log)
+
+    def test_client_accepts_independent_reviewer_parser(self) -> None:
+        response = FakeResponse(
+            200,
+            {"choices": [{"message": {"content": '{"decision":"approve"}'}}]},
+        )
+        session = FakeSession([response])
+        with teacher_client(session, []) as client:
+            parsed = client.call(
+                [], response_parser=lambda content: {"raw": json.loads(content)}
+            )
+        self.assertEqual(parsed, {"raw": {"decision": "approve"}})
 
     def test_http_407_uses_long_proxy_backoff(self) -> None:
         proxy_response = FakeResponse(407)

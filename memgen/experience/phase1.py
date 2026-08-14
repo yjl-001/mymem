@@ -38,6 +38,14 @@ TEACHER_BANK_REQUIRED_FIELDS = {
         "confidence",
     ),
 }
+AI_REVIEW_CRITERIA_FIELDS = (
+    "target_supported",
+    "reference_supported",
+    "target_reference_distinct",
+    "factually_consistent",
+    "failure_type_aligned",
+    "transferable_without_instance_leakage",
+)
 
 
 def utc_now() -> str:
@@ -623,6 +631,45 @@ def audit_teacher_record(
     ):
         reasons.append("instance_specific_literal_detected")
     return sorted(set(reasons))
+
+
+def route_ai_review(
+    automatic_reasons: Sequence[str],
+    review: Mapping[str, Any],
+    *,
+    confidence_threshold: float = 0.85,
+) -> str:
+    """Route two-vote agreement automatically and reserve conflicts for humans."""
+
+    if not 0.0 <= confidence_threshold <= 1.0:
+        raise ValueError("confidence_threshold must be in [0, 1]")
+    decision = review.get("decision")
+    if decision not in {"approve", "reject", "uncertain"}:
+        raise ValueError("AI review has invalid decision")
+    confidence = review.get("confidence")
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+        raise ValueError("AI review has invalid confidence")
+    criteria = review.get("criteria")
+    if not isinstance(criteria, Mapping) or any(
+        not isinstance(criteria.get(field), bool) for field in AI_REVIEW_CRITERIA_FIELDS
+    ):
+        raise ValueError("AI review has invalid criteria")
+
+    all_supported = all(criteria[field] for field in AI_REVIEW_CRITERIA_FIELDS)
+    any_unsupported = any(not criteria[field] for field in AI_REVIEW_CRITERIA_FIELDS)
+    if decision == "approve" and not all_supported:
+        raise ValueError("AI approve decision conflicts with criteria")
+    if decision == "reject" and not any_unsupported:
+        raise ValueError("AI reject decision conflicts with criteria")
+
+    if decision == "uncertain" or float(confidence) < confidence_threshold:
+        return "human_review"
+    automatic_passed = not automatic_reasons
+    if automatic_passed and decision == "approve":
+        return "ai_approved"
+    if not automatic_passed and decision == "reject":
+        return "ai_rejected"
+    return "human_review"
 
 
 def summarize_human_review(
