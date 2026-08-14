@@ -61,10 +61,18 @@ def diagnose_gsm8k_completion(completion, ground_truth):
     reward = float(compute_score(completion, ground_truth))
     predicted_box = first_boxed_only_string(completion)
     expected_box = last_boxed_only_string(ground_truth)
-    predicted_answer = remove_boxed(predicted_box) if predicted_box is not None else None
-    expected_answer = remove_boxed(expected_box) if expected_box is not None else None
+    try:
+        predicted_answer = (
+            remove_boxed(predicted_box) if predicted_box is not None else None
+        )
+    except (TypeError, ValueError):
+        predicted_answer = None
+    try:
+        expected_answer = remove_boxed(expected_box) if expected_box is not None else None
+    except (TypeError, ValueError):
+        expected_answer = None
     box_marker_present = "\\boxed" in completion or "\\fbox" in completion
-    format_valid = predicted_box is not None
+    format_valid = predicted_box is not None and predicted_answer is not None
 
     if predicted_answer is not None:
         diagnostic_answer = predicted_answer
@@ -126,17 +134,17 @@ def is_equiv(str1, str2, verbose=False):
 
 
 def remove_boxed(s):
-    if "\\boxed " in s:
-        left = "\\boxed "
-        assert s[: len(left)] == left
-        return s[len(left) :]
+    if not isinstance(s, str):
+        raise TypeError("boxed expression must be a string")
+    for command in ("\\boxed", "\\fbox"):
+        spaced_prefix = command + " "
+        if s.startswith(spaced_prefix):
+            return s[len(spaced_prefix) :]
+        braced_prefix = command + "{"
+        if s.startswith(braced_prefix) and s.endswith("}"):
+            return s[len(braced_prefix) : -1]
+    raise ValueError("unsupported or malformed boxed expression")
 
-    left = "\\boxed{"
-
-    assert s[: len(left)] == left
-    assert s[-1] == "}"
-
-    return s[len(left) : -1]
 
 def first_boxed_only_string(string):
     if "\\boxed " in string:

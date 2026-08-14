@@ -373,6 +373,12 @@ class VerifierDiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnosis["reward"], 1.0)
         self.assertEqual(diagnosis["failure_types"], [])
 
+    def test_fbox_is_parsed_without_crashing_legacy_upgrade(self) -> None:
+        diagnosis = diagnose_gsm8k_completion("Therefore \\fbox{30}", "\\boxed{30}")
+        self.assertEqual(diagnosis["reward"], 1.0)
+        self.assertTrue(diagnosis["format_valid"])
+        self.assertEqual(diagnosis["predicted_answer"], "30")
+
     def test_legacy_currency_false_negative_is_rescored_without_new_rollout(self) -> None:
         legacy_success = rollout(
             episode_id="legacy-currency", reward=0.0, trajectory="Therefore \\boxed{$4}"
