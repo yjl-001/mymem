@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--review-records-output", type=Path, required=True)
     parser.add_argument("--approved-output", type=Path, required=True)
     parser.add_argument("--rejected-output", type=Path, required=True)
+    parser.add_argument("--quarantined-output", type=Path, required=True)
     parser.add_argument("--human-review-output", type=Path, required=True)
     parser.add_argument("--report-output", type=Path, required=True)
     parser.add_argument("--model", default=os.environ.get("DEEPSEEK_REVIEW_MODEL", DEFAULT_MODEL))
@@ -150,7 +151,7 @@ def adjudicator_messages(
     experience: dict[str, Any],
     teacher_record: dict[str, Any],
     first_review: dict[str, Any],
-    soft_gate_warnings: list[str],
+    semantic_warnings: list[str],
 ) -> list[dict[str, str]]:
     teacher_bank = teacher_record.get("bank")
     if isinstance(teacher_bank, dict):
@@ -159,11 +160,11 @@ def adjudicator_messages(
         }
     system = """You are the senior adjudicator for a small set of difficult
 experience-bank reviews. Structural integrity, provenance, verifier binding,
-schema validity, and literal-leakage hard gates have already passed. Resolve the
-remaining semantic uncertainty from the source evidence.
+and schema validity have already passed. Resolve the remaining semantic
+uncertainty from the source evidence.
 
 The first reviewer was independent; its conclusion is evidence but not authority.
-Soft gate warnings are heuristic signals and may be false positives. Re-evaluate
+Semantic warnings are heuristic signals and may be false positives. Re-evaluate
 the target and reference against the trajectories and verifier diagnostics. A
 format-only failure is valid, but it must not be described as an unsupported
 reasoning error. Prefer a decisive approve or reject when evidence supports one;
@@ -179,7 +180,7 @@ comparison. Return JSON only in the requested schema."""
         "reference_verifier": experience.get("reference_verifier"),
         "teacher_bank": teacher_bank,
         "first_review": first_review,
-        "soft_gate_warnings": soft_gate_warnings,
+        "semantic_warnings": semantic_warnings,
     }
     user = f"""Adjudicate this difficult record:
 {json.dumps(payload, ensure_ascii=False, sort_keys=True)}
@@ -289,6 +290,25 @@ def load_human_resolutions(path: Path) -> dict[str, dict[str, Any]]:
     return resolutions
 
 
+def deterministic_audit(record: dict[str, Any]) -> dict[str, Any]:
+    """Read the current audit field while accepting pre-migration review records."""
+
+    audit = record.get("deterministic_audit")
+    if not isinstance(audit, dict):
+        audit = record.get("automatic_gate")
+    if not isinstance(audit, dict) or not isinstance(audit.get("reasons"), list):
+        raise ValueError(
+            f"Review record {record.get('experience_id')} has no deterministic audit"
+        )
+    integrity_reasons, semantic_warnings = split_audit_reasons(audit["reasons"])
+    return {
+        "integrity_passed": not integrity_reasons,
+        "reasons": audit["reasons"],
+        "integrity_reasons": integrity_reasons,
+        "semantic_warnings": semantic_warnings,
+    }
+
+
 def main() -> None:
     args = parse_args()
     if not 0.0 <= args.confidence_threshold <= 1.0:
@@ -350,15 +370,22 @@ def main() -> None:
                 continue
             experience = experiences[experience_id]
             automatic_reasons = audit_teacher_record(teacher_record, experience)
-            review = client.call(
-                reviewer_messages(experience, teacher_record),
-                response_parser=parse_review_payload,
+            integrity_reasons, semantic_warnings = split_audit_reasons(
+                automatic_reasons
             )
-            route = route_ai_review(
-                automatic_reasons,
-                review,
-                confidence_threshold=args.confidence_threshold,
-            )
+            if integrity_reasons:
+                review = None
+                route = "quarantined"
+            else:
+                review = client.call(
+                    reviewer_messages(experience, teacher_record),
+                    response_parser=parse_review_payload,
+                )
+                route = route_ai_review(
+                    automatic_reasons,
+                    review,
+                    confidence_threshold=args.confidence_threshold,
+                )
             record = {
                 "schema_version": REVIEW_SCHEMA,
                 "prompt_version": PROMPT_VERSION,
@@ -366,9 +393,11 @@ def main() -> None:
                 "experience_id": experience_id,
                 "reviewer": {"model": args.model, "base_url": args.base_url},
                 "review_provenance_sha256": expected_provenance[experience_id],
-                "automatic_gate": {
-                    "passed": not automatic_reasons,
+                "deterministic_audit": {
+                    "integrity_passed": not integrity_reasons,
                     "reasons": automatic_reasons,
+                    "integrity_reasons": integrity_reasons,
+                    "semantic_warnings": semantic_warnings,
                 },
                 "ai_review": review,
                 "route": route,
@@ -383,16 +412,38 @@ def main() -> None:
 
         for index, experience_id in enumerate(teacher_records, start=1):
             review_record = dict(completed[experience_id])
-            automatic_reasons = review_record["automatic_gate"]["reasons"]
-            hard_reasons, soft_warnings = split_audit_reasons(automatic_reasons)
-            initial_route = route_ai_review(
-                automatic_reasons,
-                review_record["ai_review"],
-                confidence_threshold=args.confidence_threshold,
-            )
+            audit = deterministic_audit(review_record)
+            review_record.pop("automatic_gate", None)
+            review_record["deterministic_audit"] = audit
+            automatic_reasons = audit["reasons"]
+            integrity_reasons = audit["integrity_reasons"]
+            semantic_warnings = audit["semantic_warnings"]
+            if integrity_reasons:
+                initial_route = "quarantined"
+            else:
+                first_review = review_record.get("ai_review")
+                if not isinstance(first_review, dict):
+                    first_review = client.call(
+                        reviewer_messages(
+                            experiences[experience_id],
+                            teacher_records[experience_id],
+                        ),
+                        response_parser=parse_review_payload,
+                    )
+                    review_record["ai_review"] = first_review
+                    handle.write(
+                        json.dumps(review_record, ensure_ascii=False, sort_keys=True)
+                        + "\n"
+                    )
+                    handle.flush()
+                initial_route = route_ai_review(
+                    automatic_reasons,
+                    first_review,
+                    confidence_threshold=args.confidence_threshold,
+                )
             review_record["initial_route"] = initial_route
-            review_record["hard_gate_reasons"] = hard_reasons
-            review_record["soft_gate_warnings"] = soft_warnings
+            review_record["integrity_reasons"] = integrity_reasons
+            review_record["semantic_warnings"] = semantic_warnings
             if initial_route == "ai_adjudication":
                 adjudication = review_record.get("adjudication")
                 if not (
@@ -407,7 +458,7 @@ def main() -> None:
                             experiences[experience_id],
                             teacher_records[experience_id],
                             review_record["ai_review"],
-                            soft_warnings,
+                            semantic_warnings,
                         ),
                         response_parser=parse_review_payload,
                     )
@@ -438,17 +489,22 @@ def main() -> None:
     ordered_reviews = []
     for experience_id in teacher_records:
         review_record = dict(completed[experience_id])
-        initial_route = route_ai_review(
-            review_record["automatic_gate"]["reasons"],
-            review_record["ai_review"],
-            confidence_threshold=args.confidence_threshold,
-        )
+        audit = deterministic_audit(review_record)
+        review_record.pop("automatic_gate", None)
+        review_record["deterministic_audit"] = audit
+        if audit["integrity_reasons"]:
+            initial_route = "quarantined"
+        else:
+            initial_route = route_ai_review(
+                audit["reasons"],
+                review_record["ai_review"],
+                confidence_threshold=args.confidence_threshold,
+            )
         review_record["initial_route"] = initial_route
-        hard_reasons, soft_warnings = split_audit_reasons(
-            review_record["automatic_gate"]["reasons"]
-        )
-        review_record["hard_gate_reasons"] = hard_reasons
-        review_record["soft_gate_warnings"] = soft_warnings
+        integrity_reasons = audit["integrity_reasons"]
+        semantic_warnings = audit["semantic_warnings"]
+        review_record["integrity_reasons"] = integrity_reasons
+        review_record["semantic_warnings"] = semantic_warnings
         if initial_route == "ai_adjudication":
             adjudication = review_record.get("adjudication")
             if not isinstance(adjudication, dict):
@@ -468,6 +524,7 @@ def main() -> None:
     write_jsonl(args.review_records_output, ordered_reviews)
     approved: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
+    quarantined: list[dict[str, Any]] = []
     human: list[dict[str, Any]] = []
     prior_human_resolutions = load_human_resolutions(args.human_review_output)
     for review_record in ordered_reviews:
@@ -477,8 +534,10 @@ def main() -> None:
         gated_record = {**teacher_record, "ai_review_gate": review_record}
         if route == "ai_approved":
             approved.append(gated_record)
-        elif route in {"ai_rejected", "gate_rejected"}:
+        elif route == "ai_rejected":
             rejected.append(gated_record)
+        elif route == "quarantined":
+            quarantined.append(gated_record)
         else:
             experience = experiences[experience_id]
             prior_resolution = prior_human_resolutions.get(experience_id)
@@ -502,7 +561,7 @@ def main() -> None:
                     "target_verifier": experience["target_verifier"],
                     "reference_verifier": experience["reference_verifier"],
                     "teacher_bank": teacher_record["bank"],
-                    "automatic_gate": review_record["automatic_gate"],
+                    "deterministic_audit": review_record["deterministic_audit"],
                     "ai_review": review_record["ai_review"],
                     "adjudication": review_record.get("adjudication"),
                     "teacher_record": teacher_record,
@@ -512,14 +571,15 @@ def main() -> None:
 
     write_jsonl(args.approved_output, approved)
     write_jsonl(args.rejected_output, rejected)
+    write_jsonl(args.quarantined_output, quarantined)
     write_jsonl(args.human_review_output, human)
     route_counts = Counter(item["route"] for item in ordered_reviews)
     initial_route_counts = Counter(item["initial_route"] for item in ordered_reviews)
-    hard_reason_counts = Counter(
-        reason for item in ordered_reviews for reason in item["hard_gate_reasons"]
+    quarantine_reason_counts = Counter(
+        reason for item in ordered_reviews for reason in item["integrity_reasons"]
     )
-    soft_warning_counts = Counter(
-        reason for item in ordered_reviews for reason in item["soft_gate_warnings"]
+    semantic_warning_counts = Counter(
+        reason for item in ordered_reviews for reason in item["semantic_warnings"]
     )
     human_escalation_counts = Counter()
     for item in ordered_reviews:
@@ -531,14 +591,21 @@ def main() -> None:
         if adjudication_review["confidence"] < args.adjudication_confidence_threshold:
             human_escalation_counts["adjudicator_low_confidence"] += 1
     report = {
-        "schema_version": "phase1-ai-review-report-v2",
+        "schema_version": "phase1-ai-review-report-v3",
         "created_at": created_at,
         "teacher_record_count": len(teacher_records),
         "reviewed_count": len(ordered_reviews),
+        "pro_reviewed_count": sum(
+            isinstance(item.get("ai_review"), dict) for item in ordered_reviews
+        ),
+        "quarantined_before_pro_count": sum(
+            item["route"] == "quarantined" and item.get("ai_review") is None
+            for item in ordered_reviews
+        ),
         "route_counts": dict(sorted(route_counts.items())),
         "initial_route_counts": dict(sorted(initial_route_counts.items())),
-        "hard_gate_reason_counts": dict(sorted(hard_reason_counts.items())),
-        "soft_gate_warning_counts": dict(sorted(soft_warning_counts.items())),
+        "quarantine_reason_counts": dict(sorted(quarantine_reason_counts.items())),
+        "semantic_warning_counts": dict(sorted(semantic_warning_counts.items())),
         "human_escalation_reason_counts": dict(
             sorted(human_escalation_counts.items())
         ),
@@ -547,9 +614,9 @@ def main() -> None:
         "adjudication_count": initial_route_counts.get("ai_adjudication", 0),
         "human_review_required_count": len(human),
         "human_review_policy": (
-            "Hard integrity failures are rejected deterministically; high-confidence "
-            "semantic reviews decide despite soft warnings; only unresolved second-pass "
-            "adjudicator uncertainty requires human resolution."
+            "Integrity/provenance/schema failures are quarantined outside quality "
+            "judgment; Pro review owns semantic approval/rejection; only unresolved "
+            "second-pass adjudicator uncertainty requires human resolution."
         ),
         "artifacts": {
             "experiences_sha256": file_sha256(args.experiences),
@@ -557,6 +624,7 @@ def main() -> None:
             "review_records_sha256": file_sha256(args.review_records_output),
             "approved_sha256": file_sha256(args.approved_output),
             "rejected_sha256": file_sha256(args.rejected_output),
+            "quarantined_sha256": file_sha256(args.quarantined_output),
             "human_review_sha256": file_sha256(args.human_review_output),
         },
     }
@@ -566,7 +634,8 @@ def main() -> None:
         handle.write("\n")
     print(
         f"[ai-review] approved={len(approved)} rejected={len(rejected)} "
-        f"human={len(human)} report={args.report_output}",
+        f"quarantined={len(quarantined)} human={len(human)} "
+        f"report={args.report_output}",
         flush=True,
     )
 

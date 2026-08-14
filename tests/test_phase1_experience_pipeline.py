@@ -28,6 +28,7 @@ from scripts.build_teacher_bank import teacher_messages
 from data.utils.math_utils import diagnose_gsm8k_completion
 from scripts.review_experience_bank import (
     adjudicator_messages,
+    deterministic_audit,
     load_human_resolutions,
     parse_review_payload,
     reviewer_messages,
@@ -465,7 +466,7 @@ class AIReviewRoutingTests(unittest.TestCase):
             "ai_rejected",
         )
 
-    def test_high_confidence_pro_overrides_soft_gate_and_low_confidence_is_adjudicated(self) -> None:
+    def test_pro_owns_semantic_quality_and_low_confidence_is_adjudicated(self) -> None:
         self.assertEqual(
             route_ai_review([], self.review("reject", 0.95, supported=False)),
             "ai_rejected",
@@ -486,7 +487,15 @@ class AIReviewRoutingTests(unittest.TestCase):
                 ["provenance_hash_mismatch"],
                 self.review("approve", 0.99, supported=True),
             ),
-            "gate_rejected",
+            "quarantined",
+        )
+
+        self.assertEqual(
+            route_ai_review(
+                ["instance_specific_literal_detected"],
+                self.review("approve", 0.99, supported=True),
+            ),
+            "ai_approved",
         )
 
     def test_only_unresolved_adjudication_goes_to_human(self) -> None:
@@ -501,12 +510,35 @@ class AIReviewRoutingTests(unittest.TestCase):
             "human_review",
         )
 
-    def test_audit_reasons_are_split_into_hard_and_soft_authority(self) -> None:
-        hard, soft = split_audit_reasons(
-            ["provenance_hash_mismatch", "format_failure_not_described"]
+    def test_audit_reasons_split_integrity_from_semantic_warnings(self) -> None:
+        integrity, semantic = split_audit_reasons(
+            [
+                "provenance_hash_mismatch",
+                "format_failure_not_described",
+                "instance_specific_literal_detected",
+            ]
         )
-        self.assertEqual(hard, ["provenance_hash_mismatch"])
-        self.assertEqual(soft, ["format_failure_not_described"])
+        self.assertEqual(integrity, ["provenance_hash_mismatch"])
+        self.assertEqual(
+            semantic,
+            ["format_failure_not_described", "instance_specific_literal_detected"],
+        )
+
+    def test_legacy_gate_record_is_migrated_without_changing_first_review(self) -> None:
+        audit = deterministic_audit(
+            {
+                "experience_id": "fixture",
+                "automatic_gate": {
+                    "passed": False,
+                    "reasons": ["instance_specific_literal_detected"],
+                },
+            }
+        )
+        self.assertTrue(audit["integrity_passed"])
+        self.assertEqual(audit["integrity_reasons"], [])
+        self.assertEqual(
+            audit["semantic_warnings"], ["instance_specific_literal_detected"]
+        )
 
     def test_reviewer_payload_and_prompt_enforce_format_failure_grounding(self) -> None:
         payload = {
@@ -546,7 +578,7 @@ class AIReviewRoutingTests(unittest.TestCase):
             parsed,
             ["format_failure_not_described"],
         )
-        self.assertIn("Soft gate warnings", adjudication[0]["content"])
+        self.assertIn("Semantic warnings", adjudication[0]["content"])
         self.assertIn("first_review", adjudication[1]["content"])
 
     def test_dispute_finalizer_merges_only_completed_human_decisions(self) -> None:

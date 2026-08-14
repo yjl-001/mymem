@@ -29,7 +29,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from memgen.experience.phase1 import upgrade_verified_experience
+from memgen.experience.phase1 import (
+    TEACHER_BANK_REQUIRED_FIELDS,
+    upgrade_verified_experience,
+)
 
 
 PROMPT_VERSION = "teacher-bank-v3-typed-verifier-contrast"
@@ -302,10 +305,38 @@ def parse_json_payload(content: str) -> dict[str, Any]:
     for section in ("target", "reference"):
         if not isinstance(payload.get(section), dict):
             raise ValueError(f"Teacher response missing object: {section}")
+        for field in TEACHER_BANK_REQUIRED_FIELDS[section]:
+            value = payload[section].get(field)
+            if field == "confidence":
+                if (
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not 0.0 <= float(value) <= 1.0
+                ):
+                    raise ValueError(f"Teacher response has invalid {section}.{field}")
+            elif not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Teacher response missing {section}.{field}")
     if not isinstance(payload.get("quality"), dict):
         raise ValueError("Teacher response missing object: quality")
     if not isinstance(payload.get("evidence"), dict):
         raise ValueError("Teacher response missing object: evidence")
+    for field in ("target_observation", "reference_observation"):
+        value = payload["evidence"].get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Teacher response missing evidence.{field}")
+    for field in (
+        "target_supported",
+        "reference_supported",
+        "target_reference_distinct",
+        "failure_type_aligned",
+        "evidence_grounded",
+        "contains_instance_specific_details",
+        "reject_pair",
+    ):
+        if not isinstance(payload["quality"].get(field), bool):
+            raise ValueError(f"Teacher response has invalid quality.{field}")
+    if not isinstance(payload["quality"].get("issues"), list):
+        raise ValueError("Teacher response has invalid quality.issues")
     if not isinstance(payload.get("experience_type"), str):
         raise ValueError("Teacher response missing string: experience_type")
     if not isinstance(payload.get("failure_types"), list):
@@ -556,6 +587,13 @@ def main() -> None:
     expected_provenance = {
         episode["id"]: episode.get("provenance_sha256") for episode in episodes
     }
+    expected_bank_metadata = {
+        episode["id"]: {
+            "experience_type": episode.get("experience_type"),
+            "failure_types": episode.get("reference_failure_types", []),
+        }
+        for episode in episodes
+    }
 
     output_path = args.output.expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -574,6 +612,17 @@ def main() -> None:
                         and record.get("teacher", {}).get("model") == args.model
                         and record.get("provenance_sha256")
                         == expected_provenance.get(
+                            str(record.get("experience_id") or record.get("episode_id"))
+                        )
+                        and {
+                            "experience_type": record.get("bank", {}).get(
+                                "experience_type"
+                            ),
+                            "failure_types": record.get("bank", {}).get(
+                                "failure_types"
+                            ),
+                        }
+                        == expected_bank_metadata.get(
                             str(record.get("experience_id") or record.get("episode_id"))
                         )
                     ):
@@ -623,6 +672,10 @@ def main() -> None:
                 print(f"[teacher-bank] skip completed {episode['id']}", flush=True)
                 continue
             bank = client.call(teacher_messages(episode))
+            # These fields are deterministic verifier metadata, not a teacher
+            # judgment. Never allow a generative copy error to change them.
+            bank["experience_type"] = episode.get("experience_type")
+            bank["failure_types"] = episode.get("reference_failure_types", [])
             record = {
                 "schema_version": TEACHER_RECORD_SCHEMA,
                 "prompt_version": PROMPT_VERSION,

@@ -51,7 +51,9 @@ def main() -> None:
             **teacher_record,
             "final_review_gate": {
                 "route": "human_approved" if decision == "approve" else "human_rejected",
-                "automatic_gate": dispute.get("automatic_gate"),
+                "deterministic_audit": dispute.get(
+                    "deterministic_audit", dispute.get("automatic_gate")
+                ),
                 "ai_review": dispute.get("ai_review"),
                 "human_resolution": resolution,
             },

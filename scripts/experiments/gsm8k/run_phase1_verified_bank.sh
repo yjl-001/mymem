@@ -66,13 +66,10 @@ ROLLOUT_SUMMARY="$RUN_DIR/rollout_summary.json"
 EXPERIENCES="$RUN_DIR/verified_experiences.jsonl"
 EXPERIENCE_REPORT="$RUN_DIR/experience_build_report.json"
 TEACHER_RECORDS="$RUN_DIR/teacher_reflections.jsonl"
-APPROVED_BANK="$RUN_DIR/approved_bank_records.jsonl"
-REJECTED_BANK="$RUN_DIR/rejected_bank_records.jsonl"
-AUDIT_REPORT="$RUN_DIR/audit_report.json"
-HUMAN_REVIEW="$RUN_DIR/human_review_sample_30.jsonl"
 AI_REVIEW_RECORDS="$RUN_DIR/ai_review_records.jsonl"
 AI_APPROVED_BANK="$RUN_DIR/ai_approved_bank_records.jsonl"
 AI_REJECTED_BANK="$RUN_DIR/ai_rejected_bank_records.jsonl"
+QUARANTINED_BANK="$RUN_DIR/quarantined_bank_records.jsonl"
 HUMAN_DISPUTES="$RUN_DIR/human_controversy_review.jsonl"
 AI_REVIEW_REPORT="$RUN_DIR/ai_review_report.json"
 
@@ -134,23 +131,13 @@ python scripts/build_teacher_bank.py \
   --output "$TEACHER_RECORDS" \
   --resume
 
-python scripts/audit_experience_bank.py \
-  --experiences "$EXPERIENCES" \
-  --teacher-records "$TEACHER_RECORDS" \
-  --approved-output "$APPROVED_BANK" \
-  --rejected-output "$REJECTED_BANK" \
-  --report-output "$AUDIT_REPORT" \
-  --human-review-output "$HUMAN_REVIEW" \
-  --human-review-size 0 \
-  --allow-no-approved \
-  --seed "$SEED"
-
 python scripts/review_experience_bank.py \
   --experiences "$EXPERIENCES" \
   --teacher-records "$TEACHER_RECORDS" \
   --review-records-output "$AI_REVIEW_RECORDS" \
   --approved-output "$AI_APPROVED_BANK" \
   --rejected-output "$AI_REJECTED_BANK" \
+  --quarantined-output "$QUARANTINED_BANK" \
   --human-review-output "$HUMAN_DISPUTES" \
   --report-output "$AI_REVIEW_REPORT" \
   --model "$REVIEW_MODEL" \
@@ -167,5 +154,6 @@ python scripts/review_experience_bank.py \
 
 echo "Phase 1 artifacts: $RUN_DIR"
 echo "AI-approved bank: $AI_APPROVED_BANK"
+echo "Integrity quarantine: $QUARANTINED_BANK"
 echo "AI review report: $AI_REVIEW_REPORT"
 echo "Human-only controversy worksheet: $HUMAN_DISPUTES"

@@ -46,21 +46,24 @@ AI_REVIEW_CRITERIA_FIELDS = (
     "failure_type_aligned",
     "transferable_without_instance_leakage",
 )
-SOFT_AUDIT_REASONS = frozenset(
+INTEGRITY_AUDIT_REASONS = frozenset(
     {
-        "teacher_marks_target_unsupported",
-        "teacher_marks_reference_unsupported",
-        "teacher_marks_target_reference_equivalent",
-        "teacher_marks_failure_type_misaligned",
-        "teacher_marks_evidence_ungrounded",
-        "teacher_marks_instance_specific_details",
-        "teacher_rejects_pair",
-        "teacher_reports_quality_issues",
-        "target_reference_text_too_similar",
-        "format_failure_not_described",
-        "format_target_not_aligned",
-        "format_reference_failure_signal_not_aligned",
-        "format_reference_failure_mechanism_not_aligned",
+        "reference_not_verified_failure",
+        "source_not_bank_source",
+        "source_episode_ids_mismatch",
+        "experience_id_mismatch",
+        "provenance_hash_mismatch",
+        "experience_provenance_hash_invalid",
+        "source_mismatch",
+        "student_mismatch",
+        "rollout_configuration_mismatch",
+        "target_verifier_mismatch",
+        "reference_verifier_mismatch",
+        "reference_failure_types_mismatch",
+        "experience_type_mismatch",
+        "experience_failure_types_inconsistent",
+        "teacher_experience_type_mismatch",
+        "teacher_failure_types_mismatch",
     }
 )
 
@@ -494,7 +497,7 @@ def audit_teacher_record(
     record: Mapping[str, Any],
     experience: Mapping[str, Any],
 ) -> list[str]:
-    """Return machine-checkable quality-gate rejection reasons."""
+    """Return integrity failures and semantic warnings for independent routing."""
 
     reasons: list[str] = []
     if record.get("reference_evidence") != "verified_failure":
@@ -656,7 +659,7 @@ def route_ai_review(
     *,
     confidence_threshold: float = 0.85,
 ) -> str:
-    """Apply hard gates, then let high-confidence semantic review decide."""
+    """Quarantine integrity failures, then let semantic review decide quality."""
 
     if not 0.0 <= confidence_threshold <= 1.0:
         raise ValueError("confidence_threshold must be in [0, 1]")
@@ -679,9 +682,9 @@ def route_ai_review(
     if decision == "reject" and not any_unsupported:
         raise ValueError("AI reject decision conflicts with criteria")
 
-    hard_reasons, _ = split_audit_reasons(automatic_reasons)
-    if hard_reasons:
-        return "gate_rejected"
+    integrity_reasons, _ = split_audit_reasons(automatic_reasons)
+    if integrity_reasons:
+        return "quarantined"
     if decision == "uncertain" or float(confidence) < confidence_threshold:
         return "ai_adjudication"
     if decision == "approve":
@@ -692,13 +695,18 @@ def route_ai_review(
 
 
 def split_audit_reasons(reasons: Sequence[str]) -> tuple[list[str], list[str]]:
-    """Separate integrity/schema failures from heuristic semantic warnings."""
+    """Separate non-negotiable data integrity failures from semantic warnings."""
 
-    hard: list[str] = []
-    soft: list[str] = []
+    integrity: list[str] = []
+    semantic: list[str] = []
     for reason in reasons:
-        (soft if reason in SOFT_AUDIT_REASONS else hard).append(reason)
-    return sorted(set(hard)), sorted(set(soft))
+        is_integrity = (
+            reason in INTEGRITY_AUDIT_REASONS
+            or reason.startswith("missing_")
+            or reason.startswith("invalid_")
+        )
+        (integrity if is_integrity else semantic).append(reason)
+    return sorted(set(integrity)), sorted(set(semantic))
 
 
 def route_ai_adjudication(

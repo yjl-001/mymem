@@ -39,21 +39,24 @@ bash scripts/experiments/gsm8k/run_phase1_verified_bank.sh
 ```
 
 它会依次冻结 split、采样 student rollout、用 GSM8K verifier 标记成功/失败、形成
-同题 contrast、调用 Flash teacher、执行确定性 quality gate，再由 Pro reviewer 独立
-复核。确定性门与 Pro 高置信一致的记录自动通过或拒绝；只有结论冲突、证据含混或低置信
-记录先进入第二轮 Pro adjudication；只有第二轮仍然 uncertain 或低置信的极少数记录进入
-`human_controversy_review.jsonl`。provenance/verifier/schema 等硬失败直接拒绝，关键词和
-相似度等软警告可由高置信 Pro 语义判断覆盖。
+同题 contrast、调用 Flash teacher、执行确定性审计，再由 Pro reviewer 独立复核。
+确定性审计只对 provenance、verifier 绑定和 schema 等数据完整性负责；这类异常不参与
+内容优劣判断，而是单独进入 `quarantined_bank_records.jsonl` 等待修复或重建。关键词、
+相似度、格式描述和 teacher 自评等都只是语义警告，最终内容通过或拒绝由高置信 Pro
+决定。首轮 Pro uncertain 或低置信的记录进入第二轮 Pro adjudication；只有第二轮仍然
+uncertain 或低置信的极少数记录进入 `human_controversy_review.jsonl`。
 
 Phase 1 verifier 同时保存严格任务奖励和诊断字段。缺少或损坏 `\\boxed{}` 仍然是
 正式任务失败；若宽松诊断能确认自然语言中的最终数值正确，该 reference 会被归为
 `format_compliance`，而不是被误写为推理失败。答案错误和混合/无法判定失败使用独立
 experience type，供后续分簇编译。Teacher prompt 会收到 target/reference 两侧的完整
-verifier 记录，自动质量门会检查失败类型一致性和 format-specific 描述。
+verifier 记录。确定性审计会检查失败类型一致性，并把 format-specific 描述问题作为
+语义警告交给 Pro 判断。
 
 脚本会复用已经完成的 student rollout，但每次都会廉价重建 typed experiences。旧版
 Teacher/Reviewer 记录、模型或 provenance 已变化的记录会在 `--resume` 时自动丢弃并重新
-生成，因此升级后无需重新执行 GPU rollout。被淘汰的旧 JSONL 会先保存为同目录下带
+生成，因此升级后无需重新执行 GPU rollout。审核路由规则变化时，来源与模型未变化的
+首轮 Pro 结果会复用并重新路由。被淘汰的旧 JSONL 会先保存为同目录下带
 `.stale-<UTC>.bak` 后缀的备份。
 
 争议记录完成最小人工裁决后合并最终 bank：
