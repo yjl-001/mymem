@@ -56,6 +56,7 @@ TEACHER_READ_TIMEOUT_SECONDS="${MEMGEN_TEACHER_READ_TIMEOUT_SECONDS:-180}"
 TEACHER_MODEL="${DEEPSEEK_TEACHER_MODEL:-deepseek-v4-flash}"
 REVIEW_MODEL="${DEEPSEEK_REVIEW_MODEL:-deepseek-v4-pro}"
 AI_REVIEW_CONFIDENCE="${MEMGEN_AI_REVIEW_CONFIDENCE_THRESHOLD:-0.85}"
+AI_ADJUDICATION_CONFIDENCE="${MEMGEN_AI_ADJUDICATION_CONFIDENCE_THRESHOLD:-0.80}"
 
 mkdir -p "$RUN_DIR"
 
@@ -156,6 +157,7 @@ python scripts/review_experience_bank.py \
   --base-url "${DEEPSEEK_BASE_URL:-https://api.deepseek.com}" \
   --thinking "${DEEPSEEK_REVIEW_THINKING:-disabled}" \
   --confidence-threshold "$AI_REVIEW_CONFIDENCE" \
+  --adjudication-confidence-threshold "$AI_ADJUDICATION_CONFIDENCE" \
   --proxy-retries "$TEACHER_PROXY_RETRIES" \
   --proxy-retry-initial-seconds "$TEACHER_PROXY_RETRY_INITIAL_SECONDS" \
   --proxy-retry-max-seconds "$TEACHER_PROXY_RETRY_MAX_SECONDS" \

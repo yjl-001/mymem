@@ -18,13 +18,16 @@ from memgen.experience.phase1 import (
     audit_teacher_record,
     build_verified_experiences,
     create_gsm8k_split_manifest,
+    route_ai_adjudication,
     route_ai_review,
+    split_audit_reasons,
     summarize_human_review,
 )
 from scripts.build_teacher_bank import TeacherClient, jsonl_examples
 from scripts.build_teacher_bank import teacher_messages
 from data.utils.math_utils import diagnose_gsm8k_completion
 from scripts.review_experience_bank import (
+    adjudicator_messages,
     load_human_resolutions,
     parse_review_payload,
     reviewer_messages,
@@ -462,22 +465,48 @@ class AIReviewRoutingTests(unittest.TestCase):
             "ai_rejected",
         )
 
-    def test_disagreement_or_low_confidence_goes_to_human(self) -> None:
+    def test_high_confidence_pro_overrides_soft_gate_and_low_confidence_is_adjudicated(self) -> None:
         self.assertEqual(
             route_ai_review([], self.review("reject", 0.95, supported=False)),
-            "human_review",
+            "ai_rejected",
         )
         self.assertEqual(
             route_ai_review(
                 ["format_failure_not_described"],
                 self.review("approve", 0.95, supported=True),
             ),
-            "human_review",
+            "ai_approved",
         )
         self.assertEqual(
             route_ai_review([], self.review("approve", 0.7, supported=True)),
+            "ai_adjudication",
+        )
+        self.assertEqual(
+            route_ai_review(
+                ["provenance_hash_mismatch"],
+                self.review("approve", 0.99, supported=True),
+            ),
+            "gate_rejected",
+        )
+
+    def test_only_unresolved_adjudication_goes_to_human(self) -> None:
+        self.assertEqual(
+            route_ai_adjudication(self.review("approve", 0.82, supported=True)),
+            "ai_approved",
+        )
+        uncertain = self.review("uncertain", 0.9, supported=True)
+        self.assertEqual(route_ai_adjudication(uncertain), "human_review")
+        self.assertEqual(
+            route_ai_adjudication(self.review("reject", 0.7, supported=False)),
             "human_review",
         )
+
+    def test_audit_reasons_are_split_into_hard_and_soft_authority(self) -> None:
+        hard, soft = split_audit_reasons(
+            ["provenance_hash_mismatch", "format_failure_not_described"]
+        )
+        self.assertEqual(hard, ["provenance_hash_mismatch"])
+        self.assertEqual(soft, ["format_failure_not_described"])
 
     def test_reviewer_payload_and_prompt_enforce_format_failure_grounding(self) -> None:
         payload = {
@@ -511,6 +540,14 @@ class AIReviewRoutingTests(unittest.TestCase):
         self.assertIn("intentionally hidden", messages[0]["content"])
         self.assertNotIn("automatic_gate_reasons", messages[1]["content"])
         self.assertNotIn('"quality"', messages[1]["content"])
+        adjudication = adjudicator_messages(
+            experience,
+            teacher_record(experience),
+            parsed,
+            ["format_failure_not_described"],
+        )
+        self.assertIn("Soft gate warnings", adjudication[0]["content"])
+        self.assertIn("first_review", adjudication[1]["content"])
 
     def test_dispute_finalizer_merges_only_completed_human_decisions(self) -> None:
         script = Path(__file__).resolve().parents[1] / "scripts" / "finalize_phase1_disputes.py"

@@ -46,6 +46,23 @@ AI_REVIEW_CRITERIA_FIELDS = (
     "failure_type_aligned",
     "transferable_without_instance_leakage",
 )
+SOFT_AUDIT_REASONS = frozenset(
+    {
+        "teacher_marks_target_unsupported",
+        "teacher_marks_reference_unsupported",
+        "teacher_marks_target_reference_equivalent",
+        "teacher_marks_failure_type_misaligned",
+        "teacher_marks_evidence_ungrounded",
+        "teacher_marks_instance_specific_details",
+        "teacher_rejects_pair",
+        "teacher_reports_quality_issues",
+        "target_reference_text_too_similar",
+        "format_failure_not_described",
+        "format_target_not_aligned",
+        "format_reference_failure_signal_not_aligned",
+        "format_reference_failure_mechanism_not_aligned",
+    }
+)
 
 
 def utc_now() -> str:
@@ -639,7 +656,7 @@ def route_ai_review(
     *,
     confidence_threshold: float = 0.85,
 ) -> str:
-    """Route two-vote agreement automatically and reserve conflicts for humans."""
+    """Apply hard gates, then let high-confidence semantic review decide."""
 
     if not 0.0 <= confidence_threshold <= 1.0:
         raise ValueError("confidence_threshold must be in [0, 1]")
@@ -662,14 +679,41 @@ def route_ai_review(
     if decision == "reject" and not any_unsupported:
         raise ValueError("AI reject decision conflicts with criteria")
 
+    hard_reasons, _ = split_audit_reasons(automatic_reasons)
+    if hard_reasons:
+        return "gate_rejected"
     if decision == "uncertain" or float(confidence) < confidence_threshold:
-        return "human_review"
-    automatic_passed = not automatic_reasons
-    if automatic_passed and decision == "approve":
+        return "ai_adjudication"
+    if decision == "approve":
         return "ai_approved"
-    if not automatic_passed and decision == "reject":
+    if decision == "reject":
         return "ai_rejected"
-    return "human_review"
+    return "ai_adjudication"
+
+
+def split_audit_reasons(reasons: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Separate integrity/schema failures from heuristic semantic warnings."""
+
+    hard: list[str] = []
+    soft: list[str] = []
+    for reason in reasons:
+        (soft if reason in SOFT_AUDIT_REASONS else hard).append(reason)
+    return sorted(set(hard)), sorted(set(soft))
+
+
+def route_ai_adjudication(
+    review: Mapping[str, Any],
+    *,
+    confidence_threshold: float = 0.8,
+) -> str:
+    """Escalate only unresolved second-pass uncertainty to a human."""
+
+    provisional = route_ai_review(
+        [], review, confidence_threshold=confidence_threshold
+    )
+    if provisional == "ai_adjudication":
+        return "human_review"
+    return provisional
 
 
 def summarize_human_review(

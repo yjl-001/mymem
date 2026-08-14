@@ -23,7 +23,9 @@ from memgen.experience.phase1 import (
     canonical_json_sha256,
     file_sha256,
     iter_jsonl,
+    route_ai_adjudication,
     route_ai_review,
+    split_audit_reasons,
     upgrade_verified_experience,
     write_jsonl,
 )
@@ -31,6 +33,7 @@ from scripts.build_teacher_bank import TeacherClient
 
 
 PROMPT_VERSION = "phase1-ai-review-v1-independent-evidence"
+ADJUDICATION_PROMPT_VERSION = "phase1-ai-adjudication-v1-focused-resolution"
 REVIEW_SCHEMA = "phase1-ai-review-record-v1"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-pro"
@@ -57,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--connect-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--read-timeout-seconds", type=float, default=180.0)
     parser.add_argument("--confidence-threshold", type=float, default=0.85)
+    parser.add_argument("--adjudication-confidence-threshold", type=float, default=0.8)
     parser.add_argument("--thinking", choices=("enabled", "disabled"), default="disabled")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -135,6 +139,66 @@ Return exactly this JSON shape:
   "evidence": {{
     "target": "brief evidence-based observation",
     "reference": "brief evidence-based observation"
+  }},
+  "issues": [],
+  "uncertainty_reason": ""
+}}"""
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def adjudicator_messages(
+    experience: dict[str, Any],
+    teacher_record: dict[str, Any],
+    first_review: dict[str, Any],
+    soft_gate_warnings: list[str],
+) -> list[dict[str, str]]:
+    teacher_bank = teacher_record.get("bank")
+    if isinstance(teacher_bank, dict):
+        teacher_bank = {
+            key: value for key, value in teacher_bank.items() if key != "quality"
+        }
+    system = """You are the senior adjudicator for a small set of difficult
+experience-bank reviews. Structural integrity, provenance, verifier binding,
+schema validity, and literal-leakage hard gates have already passed. Resolve the
+remaining semantic uncertainty from the source evidence.
+
+The first reviewer was independent; its conclusion is evidence but not authority.
+Soft gate warnings are heuristic signals and may be false positives. Re-evaluate
+the target and reference against the trajectories and verifier diagnostics. A
+format-only failure is valid, but it must not be described as an unsupported
+reasoning error. Prefer a decisive approve or reject when evidence supports one;
+use uncertain only when the record remains genuinely ambiguous after careful
+comparison. Return JSON only in the requested schema."""
+    payload = {
+        "context": experience.get("context"),
+        "target_trajectory": experience.get("trajectory"),
+        "reference_trajectory": experience.get("reference_trajectory"),
+        "experience_type": experience.get("experience_type"),
+        "reference_failure_types": experience.get("reference_failure_types"),
+        "target_verifier": experience.get("target_verifier"),
+        "reference_verifier": experience.get("reference_verifier"),
+        "teacher_bank": teacher_bank,
+        "first_review": first_review,
+        "soft_gate_warnings": soft_gate_warnings,
+    }
+    user = f"""Adjudicate this difficult record:
+{json.dumps(payload, ensure_ascii=False, sort_keys=True)}
+
+Return exactly this JSON shape:
+{{
+  "decision": "approve|reject|uncertain",
+  "confidence": 0.0,
+  "criteria": {{
+    "target_supported": true,
+    "reference_supported": true,
+    "target_reference_distinct": true,
+    "factually_consistent": true,
+    "failure_type_aligned": true,
+    "transferable_without_instance_leakage": true
+  }},
+  "evidence": {{
+    "target": "brief decisive observation",
+    "reference": "brief decisive observation"
   }},
   "issues": [],
   "uncertainty_reason": ""
@@ -229,6 +293,8 @@ def main() -> None:
     args = parse_args()
     if not 0.0 <= args.confidence_threshold <= 1.0:
         raise ValueError("--confidence-threshold must be in [0, 1]")
+    if not 0.0 <= args.adjudication_confidence_threshold <= 1.0:
+        raise ValueError("--adjudication-confidence-threshold must be in [0, 1]")
     api_key = os.environ.get(args.api_key_env)
     if not api_key:
         raise RuntimeError(f"Set {args.api_key_env} before running AI review")
@@ -315,15 +381,88 @@ def main() -> None:
                 flush=True,
             )
 
+        for index, experience_id in enumerate(teacher_records, start=1):
+            review_record = dict(completed[experience_id])
+            automatic_reasons = review_record["automatic_gate"]["reasons"]
+            hard_reasons, soft_warnings = split_audit_reasons(automatic_reasons)
+            initial_route = route_ai_review(
+                automatic_reasons,
+                review_record["ai_review"],
+                confidence_threshold=args.confidence_threshold,
+            )
+            review_record["initial_route"] = initial_route
+            review_record["hard_gate_reasons"] = hard_reasons
+            review_record["soft_gate_warnings"] = soft_warnings
+            if initial_route == "ai_adjudication":
+                adjudication = review_record.get("adjudication")
+                if not (
+                    isinstance(adjudication, dict)
+                    and adjudication.get("prompt_version")
+                    == ADJUDICATION_PROMPT_VERSION
+                    and adjudication.get("reviewer", {}).get("model") == args.model
+                    and isinstance(adjudication.get("ai_review"), dict)
+                ):
+                    adjudication_review = client.call(
+                        adjudicator_messages(
+                            experiences[experience_id],
+                            teacher_records[experience_id],
+                            review_record["ai_review"],
+                            soft_warnings,
+                        ),
+                        response_parser=parse_review_payload,
+                    )
+                    adjudication = {
+                        "prompt_version": ADJUDICATION_PROMPT_VERSION,
+                        "reviewer": {"model": args.model, "base_url": args.base_url},
+                        "ai_review": adjudication_review,
+                    }
+                    review_record["adjudication"] = adjudication
+                    handle.write(
+                        json.dumps(review_record, ensure_ascii=False, sort_keys=True)
+                        + "\n"
+                    )
+                    handle.flush()
+                    print(
+                        f"[ai-adjudication] {index}/{len(teacher_records)} "
+                        f"{experience_id} -> {adjudication_review['decision']}",
+                        flush=True,
+                    )
+                review_record["route"] = route_ai_adjudication(
+                    adjudication["ai_review"],
+                    confidence_threshold=args.adjudication_confidence_threshold,
+                )
+            else:
+                review_record["route"] = initial_route
+            completed[experience_id] = review_record
+
     ordered_reviews = []
     for experience_id in teacher_records:
         review_record = dict(completed[experience_id])
-        review_record["route"] = route_ai_review(
+        initial_route = route_ai_review(
             review_record["automatic_gate"]["reasons"],
             review_record["ai_review"],
             confidence_threshold=args.confidence_threshold,
         )
+        review_record["initial_route"] = initial_route
+        hard_reasons, soft_warnings = split_audit_reasons(
+            review_record["automatic_gate"]["reasons"]
+        )
+        review_record["hard_gate_reasons"] = hard_reasons
+        review_record["soft_gate_warnings"] = soft_warnings
+        if initial_route == "ai_adjudication":
+            adjudication = review_record.get("adjudication")
+            if not isinstance(adjudication, dict):
+                raise RuntimeError(f"Missing adjudication for {experience_id}")
+            review_record["route"] = route_ai_adjudication(
+                adjudication["ai_review"],
+                confidence_threshold=args.adjudication_confidence_threshold,
+            )
+        else:
+            review_record["route"] = initial_route
         review_record["routing_confidence_threshold"] = args.confidence_threshold
+        review_record["adjudication_confidence_threshold"] = (
+            args.adjudication_confidence_threshold
+        )
         completed[experience_id] = review_record
         ordered_reviews.append(review_record)
     write_jsonl(args.review_records_output, ordered_reviews)
@@ -338,7 +477,7 @@ def main() -> None:
         gated_record = {**teacher_record, "ai_review_gate": review_record}
         if route == "ai_approved":
             approved.append(gated_record)
-        elif route == "ai_rejected":
+        elif route in {"ai_rejected", "gate_rejected"}:
             rejected.append(gated_record)
         else:
             experience = experiences[experience_id]
@@ -365,6 +504,7 @@ def main() -> None:
                     "teacher_bank": teacher_record["bank"],
                     "automatic_gate": review_record["automatic_gate"],
                     "ai_review": review_record["ai_review"],
+                    "adjudication": review_record.get("adjudication"),
                     "teacher_record": teacher_record,
                     "human_resolution": human_resolution,
                 }
@@ -374,17 +514,42 @@ def main() -> None:
     write_jsonl(args.rejected_output, rejected)
     write_jsonl(args.human_review_output, human)
     route_counts = Counter(item["route"] for item in ordered_reviews)
+    initial_route_counts = Counter(item["initial_route"] for item in ordered_reviews)
+    hard_reason_counts = Counter(
+        reason for item in ordered_reviews for reason in item["hard_gate_reasons"]
+    )
+    soft_warning_counts = Counter(
+        reason for item in ordered_reviews for reason in item["soft_gate_warnings"]
+    )
+    human_escalation_counts = Counter()
+    for item in ordered_reviews:
+        if item["route"] != "human_review":
+            continue
+        adjudication_review = item["adjudication"]["ai_review"]
+        if adjudication_review["decision"] == "uncertain":
+            human_escalation_counts["adjudicator_uncertain"] += 1
+        if adjudication_review["confidence"] < args.adjudication_confidence_threshold:
+            human_escalation_counts["adjudicator_low_confidence"] += 1
     report = {
-        "schema_version": "phase1-ai-review-report-v1",
+        "schema_version": "phase1-ai-review-report-v2",
         "created_at": created_at,
         "teacher_record_count": len(teacher_records),
         "reviewed_count": len(ordered_reviews),
         "route_counts": dict(sorted(route_counts.items())),
+        "initial_route_counts": dict(sorted(initial_route_counts.items())),
+        "hard_gate_reason_counts": dict(sorted(hard_reason_counts.items())),
+        "soft_gate_warning_counts": dict(sorted(soft_warning_counts.items())),
+        "human_escalation_reason_counts": dict(
+            sorted(human_escalation_counts.items())
+        ),
         "confidence_threshold": args.confidence_threshold,
+        "adjudication_confidence_threshold": args.adjudication_confidence_threshold,
+        "adjudication_count": initial_route_counts.get("ai_adjudication", 0),
         "human_review_required_count": len(human),
         "human_review_policy": (
-            "Only automatic-gate/AI-review disagreements, uncertain decisions, "
-            "or reviews below the confidence threshold require human resolution."
+            "Hard integrity failures are rejected deterministically; high-confidence "
+            "semantic reviews decide despite soft warnings; only unresolved second-pass "
+            "adjudicator uncertainty requires human resolution."
         ),
         "artifacts": {
             "experiences_sha256": file_sha256(args.experiences),

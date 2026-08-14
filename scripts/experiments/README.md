@@ -41,7 +41,9 @@ bash scripts/experiments/gsm8k/run_phase1_verified_bank.sh
 它会依次冻结 split、采样 student rollout、用 GSM8K verifier 标记成功/失败、形成
 同题 contrast、调用 Flash teacher、执行确定性 quality gate，再由 Pro reviewer 独立
 复核。确定性门与 Pro 高置信一致的记录自动通过或拒绝；只有结论冲突、证据含混或低置信
-记录进入 `human_controversy_review.jsonl`。
+记录先进入第二轮 Pro adjudication；只有第二轮仍然 uncertain 或低置信的极少数记录进入
+`human_controversy_review.jsonl`。provenance/verifier/schema 等硬失败直接拒绝，关键词和
+相似度等软警告可由高置信 Pro 语义判断覆盖。
 
 Phase 1 verifier 同时保存严格任务奖励和诊断字段。缺少或损坏 `\\boxed{}` 仍然是
 正式任务失败；若宽松诊断能确认自然语言中的最终数值正确，该 reference 会被归为

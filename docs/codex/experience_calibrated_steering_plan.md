@@ -166,7 +166,8 @@ next-token logits；不插入 token，也不重建既有 KV cache。
 - 保留成功、失败、奖励、完整 CoT、随机种子及 generation config；
 - 用低成本 Flash teacher 做跨 episode 经验抽象、失败原因分析、经验簇建议和质量标记；
 - 用独立 Pro reviewer 对照原始轨迹、verifier 和 teacher bank 做第二票审核；
-- 确定性质量门与 Pro 高置信一致时自动分流，只有冲突、低置信和证据含混记录交给人工；
+- provenance/verifier/schema 硬失败直接拒绝，软启发式由高置信 Pro 语义判断覆盖；
+- 首轮 Pro 低置信或 uncertain 时执行聚焦的第二轮 Pro adjudication，只有仍未解决者交人工；
 - 每个正式 reference 均绑定至少一个 `verified_failure` rollout。
 
 **产物**：原始 rollout JSONL、verified experience JSONL、教师反思 JSONL、审计报告。
