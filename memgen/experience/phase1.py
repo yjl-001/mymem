@@ -659,7 +659,7 @@ def route_ai_review(
     *,
     confidence_threshold: float = 0.85,
 ) -> str:
-    """Quarantine integrity failures, then let semantic review decide quality."""
+    """Quarantine integrity failures and defer uncertain semantic decisions."""
 
     if not 0.0 <= confidence_threshold <= 1.0:
         raise ValueError("confidence_threshold must be in [0, 1]")
@@ -686,12 +686,12 @@ def route_ai_review(
     if integrity_reasons:
         return "quarantined"
     if decision == "uncertain" or float(confidence) < confidence_threshold:
-        return "ai_adjudication"
+        return "deferred"
     if decision == "approve":
         return "ai_approved"
     if decision == "reject":
         return "ai_rejected"
-    return "ai_adjudication"
+    return "deferred"
 
 
 def split_audit_reasons(reasons: Sequence[str]) -> tuple[list[str], list[str]]:
@@ -707,21 +707,6 @@ def split_audit_reasons(reasons: Sequence[str]) -> tuple[list[str], list[str]]:
         )
         (integrity if is_integrity else semantic).append(reason)
     return sorted(set(integrity)), sorted(set(semantic))
-
-
-def route_ai_adjudication(
-    review: Mapping[str, Any],
-    *,
-    confidence_threshold: float = 0.8,
-) -> str:
-    """Escalate only unresolved second-pass uncertainty to a human."""
-
-    provisional = route_ai_review(
-        [], review, confidence_threshold=confidence_threshold
-    )
-    if provisional == "ai_adjudication":
-        return "human_review"
-    return provisional
 
 
 def summarize_human_review(

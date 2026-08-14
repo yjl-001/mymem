@@ -167,7 +167,7 @@ next-token logits；不插入 token，也不重建既有 KV cache。
 - 用低成本 Flash teacher 做跨 episode 经验抽象、失败原因分析、经验簇建议和质量标记；
 - 用独立 Pro reviewer 对照原始轨迹、verifier 和 teacher bank 做第二票审核；
 - provenance/verifier/schema 异常只进入独立 quarantine，不作为内容拒绝；所有语义启发式仅作警告，由高置信 Pro 决定内容通过或拒绝；
-- 首轮 Pro 低置信或 uncertain 时执行聚焦的第二轮 Pro adjudication，只有仍未解决者交人工；
+- 首轮 Pro 低置信或 uncertain 的记录进入 deferred，不进入正式 bank，也不执行第二轮 Pro 或人工裁决；
 - 每个正式 reference 均绑定至少一个 `verified_failure` rollout。
 
 **产物**：原始 rollout JSONL、verified experience JSONL、教师反思 JSONL、审计报告。
@@ -177,7 +177,7 @@ next-token logits；不插入 token，也不重建既有 KV cache。
 - 所有正式 vector evidence 都能追溯到 verifier 结果；
 - `teacher_inferred` 与 `verified_failure` 在 schema 和下游过滤中严格区分；
 - 全部 teacher records 都有独立 Pro review 和可追溯的审核结论；
-- 首轮 Pro 低置信或 uncertain 的记录经第二轮 Pro adjudication 后，仍低置信或 uncertain 的记录完成人工裁决，不遗留 pending dispute；
+- 正式 bank 只包含首轮 Pro 高置信通过的记录；deferred、rejected 与 quarantined 均保留可追溯证据但不参与 vector 编译；
 - 出现自相矛盾、事实错误或 target/reference 等价的记录必须可被 Pro 审核拒绝并保留证据。
 
 ### Phase 2：全局 SEAL-style vector 可行性

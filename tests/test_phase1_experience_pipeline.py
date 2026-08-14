@@ -18,7 +18,6 @@ from memgen.experience.phase1 import (
     audit_teacher_record,
     build_verified_experiences,
     create_gsm8k_split_manifest,
-    route_ai_adjudication,
     route_ai_review,
     split_audit_reasons,
     summarize_human_review,
@@ -27,9 +26,7 @@ from scripts.build_teacher_bank import TeacherClient, jsonl_examples
 from scripts.build_teacher_bank import teacher_messages
 from data.utils.math_utils import diagnose_gsm8k_completion
 from scripts.review_experience_bank import (
-    adjudicator_messages,
     deterministic_audit,
-    load_human_resolutions,
     parse_review_payload,
     reviewer_messages,
 )
@@ -453,7 +450,7 @@ class AIReviewRoutingTests(unittest.TestCase):
             },
         }
 
-    def test_two_high_confidence_votes_are_automated(self) -> None:
+    def test_high_confidence_pro_decisions_are_automated(self) -> None:
         self.assertEqual(
             route_ai_review([], self.review("approve", 0.95, supported=True)),
             "ai_approved",
@@ -466,7 +463,7 @@ class AIReviewRoutingTests(unittest.TestCase):
             "ai_rejected",
         )
 
-    def test_pro_owns_semantic_quality_and_low_confidence_is_adjudicated(self) -> None:
+    def test_pro_owns_semantic_quality_and_uncertain_records_are_deferred(self) -> None:
         self.assertEqual(
             route_ai_review([], self.review("reject", 0.95, supported=False)),
             "ai_rejected",
@@ -480,7 +477,7 @@ class AIReviewRoutingTests(unittest.TestCase):
         )
         self.assertEqual(
             route_ai_review([], self.review("approve", 0.7, supported=True)),
-            "ai_adjudication",
+            "deferred",
         )
         self.assertEqual(
             route_ai_review(
@@ -498,16 +495,15 @@ class AIReviewRoutingTests(unittest.TestCase):
             "ai_approved",
         )
 
-    def test_only_unresolved_adjudication_goes_to_human(self) -> None:
+    def test_uncertain_or_low_confidence_decisions_never_enter_bank(self) -> None:
+        uncertain = self.review("uncertain", 0.95, supported=True)
         self.assertEqual(
-            route_ai_adjudication(self.review("approve", 0.82, supported=True)),
-            "ai_approved",
+            route_ai_review([], uncertain),
+            "deferred",
         )
-        uncertain = self.review("uncertain", 0.9, supported=True)
-        self.assertEqual(route_ai_adjudication(uncertain), "human_review")
         self.assertEqual(
-            route_ai_adjudication(self.review("reject", 0.7, supported=False)),
-            "human_review",
+            route_ai_review([], self.review("reject", 0.7, supported=False)),
+            "deferred",
         )
 
     def test_audit_reasons_split_integrity_from_semantic_warnings(self) -> None:
@@ -572,14 +568,6 @@ class AIReviewRoutingTests(unittest.TestCase):
         self.assertIn("intentionally hidden", messages[0]["content"])
         self.assertNotIn("automatic_gate_reasons", messages[1]["content"])
         self.assertNotIn('"quality"', messages[1]["content"])
-        adjudication = adjudicator_messages(
-            experience,
-            teacher_record(experience),
-            parsed,
-            ["format_failure_not_described"],
-        )
-        self.assertIn("Semantic warnings", adjudication[0]["content"])
-        self.assertIn("first_review", adjudication[1]["content"])
 
     def test_dispute_finalizer_merges_only_completed_human_decisions(self) -> None:
         script = Path(__file__).resolve().parents[1] / "scripts" / "finalize_phase1_disputes.py"
@@ -636,28 +624,6 @@ class AIReviewRoutingTests(unittest.TestCase):
             ]
             self.assertEqual(len(approved_records), 2)
             self.assertTrue(json.loads(report.read_text())["passed"])
-
-    def test_completed_dispute_resolution_can_survive_resume(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "disputes.jsonl"
-            path.write_text(
-                json.dumps(
-                    {
-                        "experience_id": "fixture",
-                        "review_provenance_sha256": "stable-review",
-                        "human_resolution": {
-                            "decision": "reject",
-                            "reviewer_notes": "clear contradiction",
-                        },
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            loaded = load_human_resolutions(path)
-        self.assertEqual(
-            loaded["fixture"]["human_resolution"]["decision"], "reject"
-        )
 
 
 class TeacherClientTests(unittest.TestCase):

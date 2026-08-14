@@ -43,8 +43,9 @@ bash scripts/experiments/gsm8k/run_phase1_verified_bank.sh
 确定性审计只对 provenance、verifier 绑定和 schema 等数据完整性负责；这类异常不参与
 内容优劣判断，而是单独进入 `quarantined_bank_records.jsonl` 等待修复或重建。关键词、
 相似度、格式描述和 teacher 自评等都只是语义警告，最终内容通过或拒绝由高置信 Pro
-决定。首轮 Pro uncertain 或低置信的记录进入第二轮 Pro adjudication；只有第二轮仍然
-uncertain 或低置信的极少数记录进入 `human_controversy_review.jsonl`。
+决定。首轮 Pro uncertain 或低置信的记录进入 `deferred_bank_records.jsonl`，不进入正式
+bank，也不再触发第二轮 Pro 或人工裁决。报告同时按 `experience_type` 统计各路由数量与
+通过率，用于检查精度优先筛选是否造成类别覆盖偏差。
 
 Phase 1 verifier 同时保存严格任务奖励和诊断字段。缺少或损坏 `\\boxed{}` 仍然是
 正式任务失败；若宽松诊断能确认自然语言中的最终数值正确，该 reference 会被归为
@@ -59,17 +60,6 @@ Teacher/Reviewer 记录、模型或 provenance 已变化的记录会在 `--resum
 首轮 Pro 结果会复用并重新路由。被淘汰的旧 JSONL 会先保存为同目录下带
 `.stale-<UTC>.bak` 后缀的备份。
 
-争议记录完成最小人工裁决后合并最终 bank：
-
-```bash
-python scripts/finalize_phase1_disputes.py \
-  --ai-approved "$RUN_DIR/ai_approved_bank_records.jsonl" \
-  --ai-rejected "$RUN_DIR/ai_rejected_bank_records.jsonl" \
-  --human-review "$RUN_DIR/human_controversy_review_reviewed.jsonl" \
-  --final-approved "$RUN_DIR/final_approved_bank_records.jsonl" \
-  --final-rejected "$RUN_DIR/final_rejected_bank_records.jsonl" \
-  --report-output "$RUN_DIR/phase1_final_review_report.json"
-```
-
-这里的 `AI review` 不得在论文或实验报告中表述为人工审核；人工只负责争议分流中的最终
-裁决。
+`ai_approved_bank_records.jsonl` 即正式 Phase 1 bank 输入；`ai_rejected`、`deferred`
+和 `quarantined` 仅保留用于审计、误差分析或未来扩充稀缺类别。这里的 `AI review` 不得
+在论文或实验报告中表述为人工审核。

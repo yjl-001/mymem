@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independently review Phase 1 teacher records and route only disputes to humans."""
+"""Independently review Phase 1 teacher records for a precision-first bank."""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ from memgen.experience.phase1 import (
     canonical_json_sha256,
     file_sha256,
     iter_jsonl,
-    route_ai_adjudication,
     route_ai_review,
     split_audit_reasons,
     upgrade_verified_experience,
@@ -33,7 +32,6 @@ from scripts.build_teacher_bank import TeacherClient
 
 
 PROMPT_VERSION = "phase1-ai-review-v1-independent-evidence"
-ADJUDICATION_PROMPT_VERSION = "phase1-ai-adjudication-v1-focused-resolution"
 REVIEW_SCHEMA = "phase1-ai-review-record-v1"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-pro"
@@ -46,8 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--review-records-output", type=Path, required=True)
     parser.add_argument("--approved-output", type=Path, required=True)
     parser.add_argument("--rejected-output", type=Path, required=True)
+    parser.add_argument("--deferred-output", type=Path, required=True)
     parser.add_argument("--quarantined-output", type=Path, required=True)
-    parser.add_argument("--human-review-output", type=Path, required=True)
     parser.add_argument("--report-output", type=Path, required=True)
     parser.add_argument("--model", default=os.environ.get("DEEPSEEK_REVIEW_MODEL", DEFAULT_MODEL))
     parser.add_argument("--base-url", default=os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL))
@@ -61,7 +59,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--connect-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--read-timeout-seconds", type=float, default=180.0)
     parser.add_argument("--confidence-threshold", type=float, default=0.85)
-    parser.add_argument("--adjudication-confidence-threshold", type=float, default=0.8)
     parser.add_argument("--thinking", choices=("enabled", "disabled"), default="disabled")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -147,66 +144,6 @@ Return exactly this JSON shape:
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def adjudicator_messages(
-    experience: dict[str, Any],
-    teacher_record: dict[str, Any],
-    first_review: dict[str, Any],
-    semantic_warnings: list[str],
-) -> list[dict[str, str]]:
-    teacher_bank = teacher_record.get("bank")
-    if isinstance(teacher_bank, dict):
-        teacher_bank = {
-            key: value for key, value in teacher_bank.items() if key != "quality"
-        }
-    system = """You are the senior adjudicator for a small set of difficult
-experience-bank reviews. Structural integrity, provenance, verifier binding,
-and schema validity have already passed. Resolve the remaining semantic
-uncertainty from the source evidence.
-
-The first reviewer was independent; its conclusion is evidence but not authority.
-Semantic warnings are heuristic signals and may be false positives. Re-evaluate
-the target and reference against the trajectories and verifier diagnostics. A
-format-only failure is valid, but it must not be described as an unsupported
-reasoning error. Prefer a decisive approve or reject when evidence supports one;
-use uncertain only when the record remains genuinely ambiguous after careful
-comparison. Return JSON only in the requested schema."""
-    payload = {
-        "context": experience.get("context"),
-        "target_trajectory": experience.get("trajectory"),
-        "reference_trajectory": experience.get("reference_trajectory"),
-        "experience_type": experience.get("experience_type"),
-        "reference_failure_types": experience.get("reference_failure_types"),
-        "target_verifier": experience.get("target_verifier"),
-        "reference_verifier": experience.get("reference_verifier"),
-        "teacher_bank": teacher_bank,
-        "first_review": first_review,
-        "semantic_warnings": semantic_warnings,
-    }
-    user = f"""Adjudicate this difficult record:
-{json.dumps(payload, ensure_ascii=False, sort_keys=True)}
-
-Return exactly this JSON shape:
-{{
-  "decision": "approve|reject|uncertain",
-  "confidence": 0.0,
-  "criteria": {{
-    "target_supported": true,
-    "reference_supported": true,
-    "target_reference_distinct": true,
-    "factually_consistent": true,
-    "failure_type_aligned": true,
-    "transferable_without_instance_leakage": true
-  }},
-  "evidence": {{
-    "target": "brief decisive observation",
-    "reference": "brief decisive observation"
-  }},
-  "issues": [],
-  "uncertainty_reason": ""
-}}"""
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-
 def parse_review_payload(content: str) -> dict[str, Any]:
     if not isinstance(content, str) or not content.strip():
         raise ValueError("Reviewer returned empty content")
@@ -270,26 +207,6 @@ def _backup_and_filter_resume(
     return compatible
 
 
-def load_human_resolutions(path: Path) -> dict[str, dict[str, Any]]:
-    """Load completed dispute decisions so bounded pilots survive full continuation."""
-
-    resolutions: dict[str, dict[str, Any]] = {}
-    if not path.exists():
-        return resolutions
-    for record in iter_jsonl(path):
-        resolution = record.get("human_resolution")
-        if (
-            isinstance(resolution, dict)
-            and resolution.get("decision") in {"approve", "reject"}
-            and isinstance(record.get("review_provenance_sha256"), str)
-        ):
-            resolutions[str(record.get("experience_id", ""))] = {
-                "review_provenance_sha256": record["review_provenance_sha256"],
-                "human_resolution": resolution,
-            }
-    return resolutions
-
-
 def deterministic_audit(record: dict[str, Any]) -> dict[str, Any]:
     """Read the current audit field while accepting pre-migration review records."""
 
@@ -313,8 +230,6 @@ def main() -> None:
     args = parse_args()
     if not 0.0 <= args.confidence_threshold <= 1.0:
         raise ValueError("--confidence-threshold must be in [0, 1]")
-    if not 0.0 <= args.adjudication_confidence_threshold <= 1.0:
-        raise ValueError("--adjudication-confidence-threshold must be in [0, 1]")
     api_key = os.environ.get(args.api_key_env)
     if not api_key:
         raise RuntimeError(f"Set {args.api_key_env} before running AI review")
@@ -410,7 +325,7 @@ def main() -> None:
                 flush=True,
             )
 
-        for index, experience_id in enumerate(teacher_records, start=1):
+        for experience_id in teacher_records:
             review_record = dict(completed[experience_id])
             audit = deterministic_audit(review_record)
             review_record.pop("automatic_gate", None)
@@ -444,46 +359,8 @@ def main() -> None:
             review_record["initial_route"] = initial_route
             review_record["integrity_reasons"] = integrity_reasons
             review_record["semantic_warnings"] = semantic_warnings
-            if initial_route == "ai_adjudication":
-                adjudication = review_record.get("adjudication")
-                if not (
-                    isinstance(adjudication, dict)
-                    and adjudication.get("prompt_version")
-                    == ADJUDICATION_PROMPT_VERSION
-                    and adjudication.get("reviewer", {}).get("model") == args.model
-                    and isinstance(adjudication.get("ai_review"), dict)
-                ):
-                    adjudication_review = client.call(
-                        adjudicator_messages(
-                            experiences[experience_id],
-                            teacher_records[experience_id],
-                            review_record["ai_review"],
-                            semantic_warnings,
-                        ),
-                        response_parser=parse_review_payload,
-                    )
-                    adjudication = {
-                        "prompt_version": ADJUDICATION_PROMPT_VERSION,
-                        "reviewer": {"model": args.model, "base_url": args.base_url},
-                        "ai_review": adjudication_review,
-                    }
-                    review_record["adjudication"] = adjudication
-                    handle.write(
-                        json.dumps(review_record, ensure_ascii=False, sort_keys=True)
-                        + "\n"
-                    )
-                    handle.flush()
-                    print(
-                        f"[ai-adjudication] {index}/{len(teacher_records)} "
-                        f"{experience_id} -> {adjudication_review['decision']}",
-                        flush=True,
-                    )
-                review_record["route"] = route_ai_adjudication(
-                    adjudication["ai_review"],
-                    confidence_threshold=args.adjudication_confidence_threshold,
-                )
-            else:
-                review_record["route"] = initial_route
+            review_record.pop("adjudication", None)
+            review_record["route"] = initial_route
             completed[experience_id] = review_record
 
     ordered_reviews = []
@@ -505,28 +382,17 @@ def main() -> None:
         semantic_warnings = audit["semantic_warnings"]
         review_record["integrity_reasons"] = integrity_reasons
         review_record["semantic_warnings"] = semantic_warnings
-        if initial_route == "ai_adjudication":
-            adjudication = review_record.get("adjudication")
-            if not isinstance(adjudication, dict):
-                raise RuntimeError(f"Missing adjudication for {experience_id}")
-            review_record["route"] = route_ai_adjudication(
-                adjudication["ai_review"],
-                confidence_threshold=args.adjudication_confidence_threshold,
-            )
-        else:
-            review_record["route"] = initial_route
+        review_record.pop("adjudication", None)
+        review_record["route"] = initial_route
         review_record["routing_confidence_threshold"] = args.confidence_threshold
-        review_record["adjudication_confidence_threshold"] = (
-            args.adjudication_confidence_threshold
-        )
+        review_record.pop("adjudication_confidence_threshold", None)
         completed[experience_id] = review_record
         ordered_reviews.append(review_record)
     write_jsonl(args.review_records_output, ordered_reviews)
     approved: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
     quarantined: list[dict[str, Any]] = []
-    human: list[dict[str, Any]] = []
-    prior_human_resolutions = load_human_resolutions(args.human_review_output)
     for review_record in ordered_reviews:
         experience_id = review_record["experience_id"]
         teacher_record = teacher_records[experience_id]
@@ -536,43 +402,17 @@ def main() -> None:
             approved.append(gated_record)
         elif route == "ai_rejected":
             rejected.append(gated_record)
+        elif route == "deferred":
+            deferred.append(gated_record)
         elif route == "quarantined":
             quarantined.append(gated_record)
         else:
-            experience = experiences[experience_id]
-            prior_resolution = prior_human_resolutions.get(experience_id)
-            if (
-                prior_resolution
-                and prior_resolution["review_provenance_sha256"]
-                == review_record["review_provenance_sha256"]
-            ):
-                human_resolution = prior_resolution["human_resolution"]
-            else:
-                human_resolution = {"decision": None, "reviewer_notes": ""}
-            human.append(
-                {
-                    "experience_id": experience_id,
-                    "review_provenance_sha256": review_record[
-                        "review_provenance_sha256"
-                    ],
-                    "context": experience["context"],
-                    "target_trajectory": experience["trajectory"],
-                    "reference_trajectory": experience["reference_trajectory"],
-                    "target_verifier": experience["target_verifier"],
-                    "reference_verifier": experience["reference_verifier"],
-                    "teacher_bank": teacher_record["bank"],
-                    "deterministic_audit": review_record["deterministic_audit"],
-                    "ai_review": review_record["ai_review"],
-                    "adjudication": review_record.get("adjudication"),
-                    "teacher_record": teacher_record,
-                    "human_resolution": human_resolution,
-                }
-            )
+            raise RuntimeError(f"Unexpected review route for {experience_id}: {route}")
 
     write_jsonl(args.approved_output, approved)
     write_jsonl(args.rejected_output, rejected)
+    write_jsonl(args.deferred_output, deferred)
     write_jsonl(args.quarantined_output, quarantined)
-    write_jsonl(args.human_review_output, human)
     route_counts = Counter(item["route"] for item in ordered_reviews)
     initial_route_counts = Counter(item["initial_route"] for item in ordered_reviews)
     quarantine_reason_counts = Counter(
@@ -581,17 +421,61 @@ def main() -> None:
     semantic_warning_counts = Counter(
         reason for item in ordered_reviews for reason in item["semantic_warnings"]
     )
-    human_escalation_counts = Counter()
+    deferred_reason_counts = Counter()
+    deferred_criterion_false_counts = Counter()
     for item in ordered_reviews:
-        if item["route"] != "human_review":
+        if item["route"] != "deferred":
             continue
-        adjudication_review = item["adjudication"]["ai_review"]
-        if adjudication_review["decision"] == "uncertain":
-            human_escalation_counts["adjudicator_uncertain"] += 1
-        if adjudication_review["confidence"] < args.adjudication_confidence_threshold:
-            human_escalation_counts["adjudicator_low_confidence"] += 1
+        first_review = item["ai_review"]
+        if first_review["decision"] == "uncertain":
+            deferred_reason_counts["reviewer_uncertain"] += 1
+        if first_review["confidence"] < args.confidence_threshold:
+            deferred_reason_counts["reviewer_low_confidence"] += 1
+        for criterion, passed in first_review["criteria"].items():
+            if not passed:
+                deferred_criterion_false_counts[criterion] += 1
+
+    review_decision_counts = Counter(
+        item["ai_review"]["decision"]
+        for item in ordered_reviews
+        if isinstance(item.get("ai_review"), dict)
+    )
+    confidence_values_by_route: dict[str, list[float]] = {}
+    for item in ordered_reviews:
+        if not isinstance(item.get("ai_review"), dict):
+            continue
+        confidence_values_by_route.setdefault(item["route"], []).append(
+            float(item["ai_review"]["confidence"])
+        )
+    confidence_by_route = {
+        route: {
+            "count": len(values),
+            "min": min(values),
+            "mean": sum(values) / len(values),
+            "max": max(values),
+        }
+        for route, values in sorted(confidence_values_by_route.items())
+    }
+
+    experience_type_route_counts: dict[str, Counter[str]] = {}
+    for item in ordered_reviews:
+        experience_type = str(
+            experiences[item["experience_id"]].get(
+                "experience_type", "unclassified_task_failure"
+            )
+        )
+        counts = experience_type_route_counts.setdefault(experience_type, Counter())
+        counts[item["route"]] += 1
+    type_route_report = {
+        experience_type: dict(sorted(counts.items()))
+        for experience_type, counts in sorted(experience_type_route_counts.items())
+    }
+    approved_rate_by_experience_type = {
+        experience_type: counts.get("ai_approved", 0) / sum(counts.values())
+        for experience_type, counts in sorted(experience_type_route_counts.items())
+    }
     report = {
-        "schema_version": "phase1-ai-review-report-v3",
+        "schema_version": "phase1-ai-review-report-v4",
         "created_at": created_at,
         "teacher_record_count": len(teacher_records),
         "reviewed_count": len(ordered_reviews),
@@ -606,17 +490,21 @@ def main() -> None:
         "initial_route_counts": dict(sorted(initial_route_counts.items())),
         "quarantine_reason_counts": dict(sorted(quarantine_reason_counts.items())),
         "semantic_warning_counts": dict(sorted(semantic_warning_counts.items())),
-        "human_escalation_reason_counts": dict(
-            sorted(human_escalation_counts.items())
+        "deferred_reason_counts": dict(sorted(deferred_reason_counts.items())),
+        "deferred_criterion_false_counts": dict(
+            sorted(deferred_criterion_false_counts.items())
         ),
+        "review_decision_counts": dict(sorted(review_decision_counts.items())),
+        "confidence_by_route": confidence_by_route,
+        "experience_type_route_counts": type_route_report,
+        "approved_rate_by_experience_type": approved_rate_by_experience_type,
         "confidence_threshold": args.confidence_threshold,
-        "adjudication_confidence_threshold": args.adjudication_confidence_threshold,
-        "adjudication_count": initial_route_counts.get("ai_adjudication", 0),
-        "human_review_required_count": len(human),
-        "human_review_policy": (
+        "deferred_count": len(deferred),
+        "selection_policy": (
             "Integrity/provenance/schema failures are quarantined outside quality "
-            "judgment; Pro review owns semantic approval/rejection; only unresolved "
-            "second-pass adjudicator uncertainty requires human resolution."
+            "judgment; only first-pass Pro approvals at or above the confidence "
+            "threshold enter the bank; uncertain or low-confidence records are "
+            "deferred without adjudication or human review."
         ),
         "artifacts": {
             "experiences_sha256": file_sha256(args.experiences),
@@ -624,8 +512,8 @@ def main() -> None:
             "review_records_sha256": file_sha256(args.review_records_output),
             "approved_sha256": file_sha256(args.approved_output),
             "rejected_sha256": file_sha256(args.rejected_output),
+            "deferred_sha256": file_sha256(args.deferred_output),
             "quarantined_sha256": file_sha256(args.quarantined_output),
-            "human_review_sha256": file_sha256(args.human_review_output),
         },
     }
     args.report_output.parent.mkdir(parents=True, exist_ok=True)
@@ -634,7 +522,7 @@ def main() -> None:
         handle.write("\n")
     print(
         f"[ai-review] approved={len(approved)} rejected={len(rejected)} "
-        f"quarantined={len(quarantined)} human={len(human)} "
+        f"deferred={len(deferred)} quarantined={len(quarantined)} "
         f"report={args.report_output}",
         flush=True,
     )
