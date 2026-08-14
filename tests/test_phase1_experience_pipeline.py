@@ -522,11 +522,14 @@ class AIReviewRoutingTests(unittest.TestCase):
             "ai_approved",
         )
 
-    def test_decision_must_match_structured_assessments(self) -> None:
-        with self.assertRaisesRegex(ValueError, "conflicts with structured assessments"):
-            route_ai_review(
-                [], self.review("partially_supported", decision="approve")
-            )
+    def test_parser_normalizes_decision_from_structured_assessments(self) -> None:
+        payload = self.review("partially_supported", decision="approve")
+        parsed = parse_review_payload(json.dumps(payload))
+        self.assertEqual(parsed["decision"], "defer")
+        self.assertEqual(parsed["reported_decision"], "approve")
+        self.assertIn(
+            "decision", [item["path"] for item in parsed["normalizations"]]
+        )
 
     def test_audit_reasons_split_integrity_from_semantic_warnings(self) -> None:
         integrity, semantic = split_audit_reasons(

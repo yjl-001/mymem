@@ -18,6 +18,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from memgen.experience.phase1 import (
+    AI_REVIEW_PAIR_ASSESSMENTS,
+    TEACHER_BANK_REQUIRED_FIELDS,
     ai_review_assessment_statuses,
     audit_teacher_record,
     canonical_json_sha256,
@@ -50,9 +52,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=os.environ.get("DEEPSEEK_REVIEW_MODEL", DEFAULT_MODEL))
     parser.add_argument("--base-url", default=os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL))
     parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
-    parser.add_argument("--max-tokens", type=int, default=2200)
+    parser.add_argument("--max-tokens", type=int, default=3200)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--retries", type=int, default=5)
     parser.add_argument("--proxy-retries", type=int, default=20)
     parser.add_argument("--proxy-retry-initial-seconds", type=float, default=30.0)
     parser.add_argument("--proxy-retry-max-seconds", type=float, default=300.0)
@@ -177,6 +179,74 @@ def parse_review_payload(content: str) -> dict[str, Any]:
         cleaned = cleaned.split("\n", 1)[1]
         cleaned = cleaned.rsplit("```", 1)[0].strip()
     payload = json.loads(cleaned)
+    status_aliases = {
+        "fully_supported": "supported",
+        "partial": "partially_supported",
+        "partial_supported": "partially_supported",
+        "partially-supported": "partially_supported",
+        "partially supported": "partially_supported",
+        "unsupported": "unsupported_or_contradicted",
+        "not_supported": "unsupported_or_contradicted",
+        "contradicted": "unsupported_or_contradicted",
+        "unsupported/contradicted": "unsupported_or_contradicted",
+    }
+    normalizations: list[dict[str, str]] = []
+    field_assessments = payload.get("field_assessments", {})
+    for section, fields in TEACHER_BANK_REQUIRED_FIELDS.items():
+        section_assessments = field_assessments.get(section, {})
+        for field in fields:
+            if field == "confidence":
+                continue
+            assessment = section_assessments.get(field)
+            if not isinstance(assessment, dict):
+                continue
+            reported = assessment.get("status")
+            canonical = status_aliases.get(reported) if isinstance(reported, str) else None
+            if canonical:
+                assessment["status"] = canonical
+                normalizations.append(
+                    {
+                        "path": f"{section}.{field}",
+                        "reported": str(reported),
+                        "canonical": canonical,
+                    }
+                )
+    pair_assessments = payload.get("pair_assessments", {})
+    for field in AI_REVIEW_PAIR_ASSESSMENTS:
+        assessment = pair_assessments.get(field)
+        if not isinstance(assessment, dict):
+            continue
+        reported = assessment.get("status")
+        canonical = status_aliases.get(reported) if isinstance(reported, str) else None
+        if canonical:
+            assessment["status"] = canonical
+            normalizations.append(
+                {
+                    "path": f"pair.{field}",
+                    "reported": str(reported),
+                    "canonical": canonical,
+                }
+            )
+    statuses = ai_review_assessment_statuses(payload)
+    if "unsupported_or_contradicted" in statuses.values():
+        canonical_decision = "reject"
+    elif "partially_supported" in statuses.values():
+        canonical_decision = "defer"
+    else:
+        canonical_decision = "approve"
+    reported_decision = payload.get("decision")
+    if reported_decision != canonical_decision:
+        payload["reported_decision"] = reported_decision
+        payload["decision"] = canonical_decision
+        normalizations.append(
+            {
+                "path": "decision",
+                "reported": str(reported_decision),
+                "canonical": canonical_decision,
+            }
+        )
+    if normalizations:
+        payload["normalizations"] = normalizations
     route_ai_review([], payload)
     return payload
 
@@ -297,6 +367,8 @@ def main() -> None:
                 review = client.call(
                     reviewer_messages(experience, teacher_record),
                     response_parser=parse_review_payload,
+                    request_label="ai-review",
+                    expose_parser_error=True,
                 )
                 route = route_ai_review(
                     automatic_reasons,
@@ -345,6 +417,8 @@ def main() -> None:
                             teacher_records[experience_id],
                         ),
                         response_parser=parse_review_payload,
+                        request_label="ai-review",
+                        expose_parser_error=True,
                     )
                     review_record["ai_review"] = first_review
                     handle.write(

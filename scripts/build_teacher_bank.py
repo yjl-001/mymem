@@ -442,6 +442,8 @@ class TeacherClient:
         messages: list[dict[str, str]],
         *,
         response_parser: Callable[[str], dict[str, Any]] = parse_json_payload,
+        request_label: str = "teacher-bank",
+        expose_parser_error: bool = False,
     ) -> dict[str, Any]:
         body = {
             "model": self.model,
@@ -532,11 +534,16 @@ class TeacherClient:
                 ordinary_failures += 1
                 if ordinary_failures >= self.retries:
                     raise RuntimeError(
-                        "Teacher API returned an invalid JSON payload after short retries."
+                        f"{request_label} API returned an invalid response after short retries."
                     ) from None
                 delay = 2 ** (ordinary_failures - 1)
+                reason = (
+                    str(exc)
+                    if expose_parser_error and isinstance(exc, ValueError) and str(exc)
+                    else type(exc).__name__
+                )
                 print(
-                    "[teacher-bank] invalid teacher JSON payload "
+                    f"[{request_label}] invalid API response ({reason}) "
                     f"(retry {ordinary_failures}/{self.retries - 1}); waiting {delay}s...",
                     file=sys.stderr,
                     flush=True,

@@ -703,9 +703,6 @@ def route_ai_review(
 ) -> str:
     """Route from structured support assessments; confidence is diagnostic only."""
 
-    decision = review.get("decision")
-    if decision not in {"approve", "reject", "defer"}:
-        raise ValueError("AI review has invalid decision")
     confidence = review.get("confidence")
     if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
         raise ValueError("AI review has invalid confidence")
@@ -716,18 +713,11 @@ def route_ai_review(
 
     statuses = ai_review_assessment_statuses(review)
     if "unsupported_or_contradicted" in statuses.values():
-        expected_decision = "reject"
         semantic_route = "ai_rejected"
     elif "partially_supported" in statuses.values():
-        expected_decision = "defer"
         semantic_route = "deferred"
     else:
-        expected_decision = "approve"
         semantic_route = "ai_approved"
-    if decision != expected_decision:
-        raise ValueError(
-            f"AI review decision {decision!r} conflicts with structured assessments"
-        )
 
     integrity_reasons, _ = split_audit_reasons(automatic_reasons)
     if integrity_reasons:
