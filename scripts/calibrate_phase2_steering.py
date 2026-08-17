@@ -232,7 +232,46 @@ def main() -> None:
                             "summary_path": str((output_dir / "tune_real_vector" / config_id / "summary.json")),
                         }
                     )
-    winner = select_calibration_winner(calibration_rows)
+    try:
+        winner = select_calibration_winner(calibration_rows)
+    except ValueError as exc:
+        # A negative result is a valid Phase 2 outcome.  Preserve the complete
+        # calibration evidence instead of turning it into an opaque launcher
+        # failure or selecting an unsafe vector merely to finish the controls.
+        report = {
+            "schema_version": STEERING_CALIBRATION_SCHEMA,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "artifact": str(args.artifact),
+            "split": {
+                "logical_split": "calibration-val",
+                "tune": {"offset": 0, "count": args.tune_size},
+                "confirmation": None,
+            },
+            "entropy_threshold": threshold_artifact,
+            "vanilla_tune_summary": vanilla,
+            "calibration_candidates": calibration_rows,
+            "selected": None,
+            "confirmation_controls": {},
+            "acceptance": {},
+            "passed": False,
+            "failure_reason": str(exc),
+            "git_revision": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, text=True
+            ).strip(),
+        }
+        report["report_sha256"] = canonical_json_sha256(
+            {key: value for key, value in report.items() if key != "report_sha256"}
+        )
+        report_path = output_dir / "phase2_calibration_report.json"
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"[phase2-calibration] no safe format-preserving vector; report={report_path}",
+            flush=True,
+        )
+        return
     selected_config = dict(winner["config"])
     real_tune_summary = load_json(Path(winner["summary_path"]))
     candidate_count = int(real_tune_summary["candidate_boundary_count"])
