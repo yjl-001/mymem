@@ -98,7 +98,7 @@ class Phase2BoundaryAndGateTests(unittest.TestCase):
         self.assertEqual(stable_uniform(42, "sample", "1"), stable_uniform(42, "sample", "1"))
         self.assertNotEqual(stable_uniform(42, "sample", "1"), stable_uniform(42, "sample", "2"))
 
-    def test_anchor_requires_exact_delimiter_terminated_nonfinal_quotes(self) -> None:
+    def test_anchor_accepts_exact_equation_spans_but_rejects_final_box(self) -> None:
         experiences, _ = build_verified_experiences(
             [
                 rollout("success", 1.0, "Compute 2 + 2 = 4. Therefore \\boxed{4}"),
@@ -109,8 +109,8 @@ class Phase2BoundaryAndGateTests(unittest.TestCase):
         payload = {
             "decision": "anchor",
             "mechanism_cluster": "arithmetic_or_numeric",
-            "target_anchor": {"quote": "Compute 2 + 2 = 4."},
-            "reference_anchor": {"quote": "Compute 2 + 2 = 5."},
+            "target_anchor": {"quote": "2 + 2 = 4"},
+            "reference_anchor": {"quote": "2 + 2 = 5"},
         }
         self.assertEqual(validate_evidence_anchor(payload, experience), [])
         payload["target_anchor"]["quote"] = "\\boxed{4}"

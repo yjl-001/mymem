@@ -209,8 +209,10 @@ def validate_evidence_anchor(
     """Validate Pro-provided exact quotes before they become vector evidence.
 
     The reviewer can decide that a pair is not safely anchorable.  A quote is
-    accepted only when it appears exactly once in the original trajectory and
-    ends at a real delimiter, so the compiler never guesses a semantic span.
+    accepted only when it appears exactly once in the original trajectory. The
+    compiler then finds the first real online delimiter *after* that exact
+    span; requiring a formula itself to end in a period would discard most
+    useful GSM8K execution evidence.
     """
 
     reasons: list[str] = []
@@ -234,11 +236,9 @@ def validate_evidence_anchor(
         trajectory = str(experience.get(trajectory_field, ""))
         if trajectory.count(quote) != 1:
             reasons.append(f"{side}_quote_not_unique_exact_match")
-        if not quote.rstrip(" \t").endswith(PHASE2_DELIMITERS):
-            reasons.append(f"{side}_quote_not_delimiter_terminated")
         if "\\boxed" in quote or "\\fbox" in quote:
             reasons.append(f"{side}_quote_is_final_answer_formatting")
-        if len(quote) < 12 or len(quote) > 900:
+        if len(quote) < 3 or len(quote) > 1200:
             reasons.append(f"{side}_quote_length_out_of_range")
     return reasons
 

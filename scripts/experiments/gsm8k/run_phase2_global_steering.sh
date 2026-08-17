@@ -85,6 +85,7 @@ python scripts/compile_steering_vectors.py \
   --layers "${MEMGEN_PHASE2_LAYERS:-8,16,24}" \
   --experience-types "${MEMGEN_PHASE2_EXPERIENCE_TYPES:-answer_correctness}" \
   --batch-size "${MEMGEN_PHASE2_COMPILER_BATCH_SIZE:-2}" \
+  --min-evidence-count "${MEMGEN_PHASE2_MIN_ANCHORED_EVIDENCE:-50}" \
   --limit "${MEMGEN_PHASE2_COMPILER_LIMIT:-0}"
 
 # The initial global stay-on-track hypothesis is answer correctness.  Format

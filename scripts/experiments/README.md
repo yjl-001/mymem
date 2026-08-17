@@ -67,7 +67,9 @@ Teacher/Reviewer 记录、模型或 provenance 已变化的记录会在 `--resum
 
 Phase 2 会先由独立 Pro 从正式 bank 回连到 `verified_experiences.jsonl` 的原始 student
 轨迹，逐 pair 复制可精确匹配的 target/reference execution 或 verification evidence
-span；不能安全锚定的 pair 会被排除。compiler 只在这些锚点边界构造多个层的全局 residual
+span；span 可以是短等式或 LaTex 公式块，compiler 会在 span 后寻找首个真实在线 delimiter
+作为注入边界。不能安全锚定的 pair 会被排除；若可用 pair 少于最小证据数，流程会在校准前
+停止。compiler 只在这些锚点边界构造多个层的全局 residual
 vector，Teacher 文本不直接参与 hidden-state 差分。它先在
 `calibration-val` 的 tune 子集校准 layer、alpha、soft-gate slope 与注入预算，随后在
 同一 split 的独立 confirmation 子集运行 vanilla、entropy-only、真实 vector、随机

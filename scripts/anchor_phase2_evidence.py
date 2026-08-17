@@ -83,8 +83,9 @@ that end at a reasoning delimiter and are suitable hidden-state evidence.
 
 Rules:
 - Copy each quote character-for-character from its supplied trajectory. It must
-  occur exactly once and end with '.', ',', or a newline. Do not add ellipses,
-  Markdown fences, explanation, or escaped replacements.
+  occur exactly once. It may be a short equation, a LaTex display block, or a
+  sentence; the compiler will use the first online delimiter after the quote.
+  Do not add ellipses, Markdown fences, explanation, or escaped replacements.
 - Select an execution or verification step which materially bears on the task
   outcome. Prefer a calculation, constraint application, unit conversion,
   counting/rounding decision, temporal relation, or explicit check.
@@ -114,8 +115,8 @@ Return exactly this JSON shape:
 {{
   "decision": "anchor|exclude",
   "mechanism_cluster": "arithmetic_or_numeric|unit_or_conversion|counting_or_discreteness|temporal_or_sequence|relation_or_constraint|other_task_reasoning",
-  "target_anchor": {{"quote": "exact copied target text ending at delimiter"}},
-  "reference_anchor": {{"quote": "exact copied reference text ending at delimiter"}},
+  "target_anchor": {{"quote": "exact copied target evidence span"}},
+  "reference_anchor": {{"quote": "exact copied reference evidence span"}},
   "rationale": "brief evidence-grounded reason",
   "confidence": 0.0
 }}
@@ -239,7 +240,20 @@ def main() -> None:
             handle.flush()
             print(f"[phase2-anchor] {index}/{len(selected)} {experience_id} -> {route}", flush=True)
 
-    records = list(iter_jsonl(args.output))
+    selected_by_id = {str(experience["experience_id"]): experience for experience in selected}
+    # Revalidate completed records on every run.  This makes deterministic
+    # validator upgrades reusable without another expensive Pro API pass.
+    records: list[dict[str, Any]] = []
+    for record in iter_jsonl(args.output):
+        refreshed = dict(record)
+        experience = selected_by_id.get(str(record.get("experience_id", "")))
+        if experience is None:
+            raise ValueError(f"Anchor output references unknown experience {record.get('experience_id')!r}")
+        reasons = validate_evidence_anchor(record.get("anchor_review", {}), experience)
+        refreshed["validation_reasons"] = reasons
+        refreshed["route"] = "anchored" if not reasons else "excluded"
+        records.append(refreshed)
+    write_jsonl(args.output, records)
     route_counts = Counter(str(record.get("route")) for record in records)
     mechanism_counts = Counter(
         str(record.get("anchor_review", {}).get("mechanism_cluster"))

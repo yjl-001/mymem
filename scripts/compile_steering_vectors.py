@@ -55,6 +55,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional Pro-reviewed exact evidence anchors. Formal Phase 2 runs require this.",
     )
+    parser.add_argument(
+        "--anchor-boundary-search-tokens",
+        type=int,
+        default=64,
+        help="Maximum tokens scanned after an exact anchor to find the next runtime delimiter.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--model-revision", default="main")
@@ -75,6 +81,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--limit", type=int, default=0, help="0 means all selected pairs")
+    parser.add_argument(
+        "--min-evidence-count",
+        type=int,
+        default=50,
+        help="Abort before calibration when fewer anchored pairs than this are usable.",
+    )
     parser.add_argument(
         "--max-sequence-length",
         type=int,
@@ -104,7 +116,10 @@ def model_context_limit(model: Any) -> int | None:
 
 
 def tokenize_pair(
-    tokenizer: Any, experience: dict[str, Any], anchor_record: dict[str, Any] | None = None
+    tokenizer: Any,
+    experience: dict[str, Any],
+    anchor_record: dict[str, Any] | None = None,
+    anchor_boundary_search_tokens: int = 64,
 ) -> TokenizedPair | None:
     prompt = tokenizer.apply_chat_template(
         build_gsm8k_messages(str(experience["context"])),
@@ -122,13 +137,15 @@ def tokenize_pair(
             if quote_start < 0 or value.find(quote, quote_start + len(quote)) >= 0:
                 return ids, None
             prefix = value[: quote_start + len(quote)]
-            boundary = len(prompt_ids) + len(tokenizer.encode(prefix, add_special_tokens=False)) - 1
-            if boundary < len(prompt_ids) or boundary >= len(ids):
+            anchor_end = len(prompt_ids) + len(tokenizer.encode(prefix, add_special_tokens=False)) - 1
+            if anchor_end < len(prompt_ids) or anchor_end >= len(ids):
                 return ids, None
-            token_text = tokenizer.decode([ids[boundary]], skip_special_tokens=False)
-            if not token_text.rstrip(" \t").endswith((",", ".", "\n")):
-                return ids, None
-            return ids, boundary
+            upper = min(len(ids), anchor_end + 1 + anchor_boundary_search_tokens)
+            for boundary in range(anchor_end, upper):
+                token_text = tokenizer.decode([ids[boundary]], skip_special_tokens=False)
+                if token_text.rstrip(" \t").endswith((",", ".", "\n")):
+                    return ids, boundary
+            return ids, None
         boundary = last_completion_boundary(
             ids,
             completion_start=len(prompt_ids),
@@ -200,8 +217,17 @@ def rms(vector: Any) -> float:
 
 def main() -> None:
     args = parse_args()
-    if args.batch_size <= 0 or args.limit < 0 or args.max_sequence_length < 0:
-        raise ValueError("batch-size must be positive; limit/max-sequence-length must be non-negative")
+    if (
+        args.batch_size <= 0
+        or args.limit < 0
+        or args.max_sequence_length < 0
+        or args.min_evidence_count < 0
+    ):
+        raise ValueError(
+            "batch-size must be positive; limit/max-sequence-length/min-evidence-count must be non-negative"
+        )
+    if args.anchor_boundary_search_tokens <= 0:
+        raise ValueError("anchor-boundary-search-tokens must be positive")
     layers = list(parse_csv_numbers(args.layers, integer=True))
     if any(layer <= 0 for layer in layers) or len(set(layers)) != len(layers):
         raise ValueError("layers must be distinct positive 1-based transformer block indices")
@@ -367,7 +393,12 @@ def main() -> None:
                 }
             )
             continue
-        tokenized = tokenize_pair(tokenizer, experience, anchor)
+        tokenized = tokenize_pair(
+            tokenizer,
+            experience,
+            anchor,
+            anchor_boundary_search_tokens=args.anchor_boundary_search_tokens,
+        )
         if tokenized is None:
             trace.append(
                 {
@@ -405,9 +436,11 @@ def main() -> None:
         consume(pending)
 
     write_jsonl(evidence_path, trace)
-    if counts["all_selected"] == 0:
+    if counts["all_selected"] < args.min_evidence_count:
         raise RuntimeError(
-            "No selected pair contained a usable completion delimiter; no steering vector was written"
+            "Usable Phase 2 evidence is below min-evidence-count: "
+            f"compiled={counts['all_selected']} required={args.min_evidence_count}. "
+            "No vector was written and calibration must not start."
         )
     artifacts: list[dict[str, Any]] = []
     common = {
