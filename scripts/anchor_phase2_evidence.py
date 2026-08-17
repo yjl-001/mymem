@@ -33,7 +33,8 @@ from memgen.experience.phase2 import (
 from scripts.build_teacher_bank import TeacherClient
 
 
-PROMPT_VERSION = "phase2-evidence-anchor-v1-exact-quote"
+PROMPT_VERSION = "phase2-evidence-anchor-v2-exact-span"
+LEGACY_REUSABLE_PROMPT_VERSIONS = ("phase2-evidence-anchor-v1-exact-quote",)
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-pro"
 
@@ -61,14 +62,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def anchor_provenance(experience: Mapping[str, Any], bank_record: Mapping[str, Any]) -> str:
+def anchor_provenance(
+    experience: Mapping[str, Any], bank_record: Mapping[str, Any], *, prompt_version: str
+) -> str:
     return canonical_json_sha256(
         {
             "experience_provenance_sha256": experience.get("provenance_sha256"),
             "approved_bank_provenance_sha256": bank_record.get("provenance_sha256"),
             "approved_review": bank_record.get("ai_review_gate", {}).get("ai_review"),
             "bank": bank_record.get("bank"),
-            "prompt_version": PROMPT_VERSION,
+            "prompt_version": prompt_version,
         }
     )
 
@@ -148,7 +151,9 @@ def parse_anchor_payload(content: str) -> dict[str, Any]:
     return payload
 
 
-def compatible_resume(path: Path, expected: Mapping[str, str], model: str) -> dict[str, dict[str, Any]]:
+def compatible_resume(
+    path: Path, expected: Mapping[str, set[str]], model: str
+) -> dict[str, dict[str, Any]]:
     completed: dict[str, dict[str, Any]] = {}
     existing_count = 0
     if path.exists():
@@ -157,9 +162,10 @@ def compatible_resume(path: Path, expected: Mapping[str, str], model: str) -> di
             experience_id = str(record.get("experience_id", ""))
             if (
                 record.get("schema_version") == PHASE2_EVIDENCE_ANCHOR_SCHEMA
-                and record.get("prompt_version") == PROMPT_VERSION
+                and record.get("prompt_version")
+                in {PROMPT_VERSION, *LEGACY_REUSABLE_PROMPT_VERSIONS}
                 and record.get("reviewer", {}).get("model") == model
-                and record.get("anchor_provenance_sha256") == expected.get(experience_id)
+                and record.get("anchor_provenance_sha256") in expected.get(experience_id, set())
             ):
                 completed[experience_id] = record
     stale = existing_count - len(completed)
@@ -188,8 +194,21 @@ def main() -> None:
         selected = selected[: args.limit]
     bank_by_id = {str(record["experience_id"]): record for record in bank}
     expected = {
+        str(experience["experience_id"]): {
+            anchor_provenance(
+                experience,
+                bank_by_id[str(experience["experience_id"])],
+                prompt_version=prompt_version,
+            )
+            for prompt_version in (PROMPT_VERSION, *LEGACY_REUSABLE_PROMPT_VERSIONS)
+        }
+        for experience in selected
+    }
+    current_provenance = {
         str(experience["experience_id"]): anchor_provenance(
-            experience, bank_by_id[str(experience["experience_id"])]
+            experience,
+            bank_by_id[str(experience["experience_id"])],
+            prompt_version=PROMPT_VERSION,
         )
         for experience in selected
     }
@@ -231,7 +250,7 @@ def main() -> None:
                 "reviewer": {"model": args.model, "base_url": args.base_url},
                 "experience_id": experience_id,
                 "experience_provenance_sha256": experience["provenance_sha256"],
-                "anchor_provenance_sha256": expected[experience_id],
+                "anchor_provenance_sha256": current_provenance[experience_id],
                 "route": route,
                 "validation_reasons": reasons,
                 "anchor_review": review,
