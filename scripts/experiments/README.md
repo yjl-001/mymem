@@ -65,19 +65,22 @@ Teacher/Reviewer 记录、模型或 provenance 已变化的记录会在 `--resum
 和 `quarantined` 仅保留用于审计、误差分析或未来扩充稀缺类别。这里的 `AI review` 不得
 在论文或实验报告中表述为人工审核。
 
-Phase 2 会先由独立 Pro 从正式 bank 回连到 `verified_experiences.jsonl` 的原始 student
-轨迹，逐 pair 复制可精确匹配的 target/reference execution 或 verification evidence
-span；span 可以是短等式或 LaTex 公式块，compiler 会在 span 后寻找首个真实在线 delimiter
-作为注入边界。不能安全锚定的 pair 会被排除；若可用 pair 少于最小证据数，流程会在校准前
-停止。compiler 只在这些锚点边界构造多个层的全局 residual
-vector，Teacher 文本不直接参与 hidden-state 差分。它先在
-`calibration-val` 的 tune 子集校准 layer、alpha、soft-gate slope 与注入预算，随后在
-同一 split 的独立 confirmation 子集运行 vanilla、entropy-only、真实 vector、随机
-boundary、同范数随机 vector 和反转 vector 六个对照。运行时只需传入冻结的 Phase 1
-目录：
+当前正式的 Phase 2 主路径不再调用新的 AI。它只回连正式 bank 与
+`verified_experiences.jsonl` 的原始 student 轨迹，并比较四种 vector 构造：逐 pair
+归一化差分、全局 target/reference centroid 差分、由冻结 Phase 1 已审核机制文本做确定性
+分桶的平衡 centroid 差分，以及 SEAL-style execution − non-execution 差分。Teacher / Pro
+文本绝不输入 student；机制文本只在第三种方法中按已提交的关键词规则做分桶。SEAL-style
+方法只依赖轨迹中的空行/换行 thought 边界与确定性 reflection/transition 关键词；证据不足时
+不会伪造 artifact，而会在报告中标为 unavailable。
+
+每个可用 artifact 都独立在 `calibration-val` 的 tune 子集校准 layer、alpha、soft-gate
+slope 与注入预算，随后在同一 split 的独立 confirmation 子集运行 vanilla、entropy-only、
+真实 vector、随机 boundary、同范数随机 vector 和反转 vector 六个对照。汇总文件仅用于
+描述比较，明确禁止据此自动选择最终方法；进入后续阶段仍需独立冻结评测。运行时只需传入
+冻结的 Phase 1 目录：
 
 ```bash
-bash scripts/experiments/gsm8k/run_phase2_global_steering.sh \
+bash scripts/experiments/gsm8k/run_phase2_vector_construction_ablation.sh \
   /absolute/path/to/gsm8k_phase1_verified-student-contrast_<tag>
 ```
 

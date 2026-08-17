@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import Counter
 import hashlib
 import math
+import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from memgen.experience.phase1 import canonical_json_sha256
@@ -36,6 +37,38 @@ PHASE2_MECHANISM_CLUSTERS = frozenset(
         "relation_or_constraint",
         "other_task_reasoning",
     }
+)
+
+# These rules are deliberately deterministic and only operate on the Phase 1
+# bank text that was already reviewed before Phase 2 starts.  They are *not* a
+# replacement for a verifier and do not claim to recover a unique cognitive
+# root cause from every rollout.  Their only purpose is to make a frozen-bank
+# mechanism-conditioned vector ablation reproducible without another model
+# call.  The order below is part of the experimental contract.
+_MECHANISM_CLUSTER_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "unit_or_conversion",
+        re.compile(r"\b(unit|convert|conversion|rate|per[- ]|percent|percentage)\b", re.I),
+    ),
+    (
+        "counting_or_discreteness",
+        re.compile(r"\b(count|counting|combin|integer|whole number|discrete)\b", re.I),
+    ),
+    (
+        "temporal_or_sequence",
+        re.compile(r"\b(time|temporal|sequence|order|before|after|duration)\b", re.I),
+    ),
+    (
+        "relation_or_constraint",
+        re.compile(r"\b(constraint|relation|condition|inequal|compare|ratio|depend)\b", re.I),
+    ),
+    (
+        "arithmetic_or_numeric",
+        re.compile(
+            r"\b(arithmetic|numeric|calculation|compute|add|subtract|multiply|divide|sum|total|equation)\b",
+            re.I,
+        ),
+    ),
 )
 
 FORMAT_INSTRUCTION = (
@@ -114,7 +147,12 @@ def approved_experiences(
         reference = str(experience.get("reference_trajectory", "")).strip()
         if not target or not reference:
             raise ValueError(f"{experience_id} has an empty target or reference trajectory")
-        selected.append(dict(experience))
+        # Keep only the already-approved Phase 1 bank text as immutable
+        # metadata.  The GPU compiler may use it for a deterministic, auditable
+        # mechanism bucket, but never feeds it to the student model.
+        selected_row = dict(experience)
+        selected_row["phase1_bank"] = dict(record.get("bank", {}))
+        selected.append(selected_row)
 
     if not selected:
         raise ValueError("No approved experiences remain after Phase 2 type selection")
@@ -132,6 +170,36 @@ def approved_experiences(
         ),
     }
     return selected, report
+
+
+def phase1_mechanism_cluster(experience: Mapping[str, Any]) -> str | None:
+    """Map frozen, approved Phase 1 mechanism text to one stable bucket.
+
+    ``None`` is intentional: an experience whose already-approved abstraction
+    contains no high-precision cue remains available to global methods but is
+    excluded from the mechanism-balanced method rather than being guessed.
+    """
+
+    bank = experience.get("phase1_bank")
+    if not isinstance(bank, Mapping):
+        return None
+    reference = bank.get("reference")
+    evidence = bank.get("evidence")
+    fragments: list[str] = []
+    if isinstance(reference, Mapping):
+        for field in ("failure_mechanism", "failure_signal", "competing_pattern"):
+            value = reference.get(field)
+            if isinstance(value, str):
+                fragments.append(value)
+    if isinstance(evidence, Mapping):
+        value = evidence.get("reference_observation")
+        if isinstance(value, str):
+            fragments.append(value)
+    text = " ".join(fragments)
+    for cluster, rule in _MECHANISM_CLUSTER_RULES:
+        if rule.search(text):
+            return cluster
+    return None
 
 
 def parse_csv_strings(value: str) -> list[str]:

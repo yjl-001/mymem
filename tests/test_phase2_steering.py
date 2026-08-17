@@ -7,6 +7,7 @@ from memgen.experience.phase1 import ROLLOUT_SCHEMA, build_verified_experiences
 from memgen.experience.phase2 import (
     approved_experiences,
     last_completion_boundary,
+    phase1_mechanism_cluster,
     select_calibration_winner,
     soft_entropy_gate,
     stable_uniform,
@@ -80,6 +81,19 @@ class Phase2SelectionTests(unittest.TestCase):
         record["provenance_sha256"] = "tampered"
         with self.assertRaisesRegex(ValueError, "mismatched provenance_sha256"):
             approved_experiences([record], [self.experience])
+
+    def test_uses_only_frozen_phase1_bank_text_for_mechanism_bucket(self) -> None:
+        record = approved_record(self.experience)
+        record["bank"] = {
+            "reference": {
+                "failure_mechanism": "The arithmetic calculation applies the operation incorrectly.",
+                "failure_signal": "The intermediate total is inconsistent.",
+            },
+            "evidence": {"reference_observation": "An incorrect total is shown."},
+        }
+        selected, _ = approved_experiences([record], [self.experience])
+        self.assertEqual(phase1_mechanism_cluster(selected[0]), "arithmetic_or_numeric")
+        self.assertIsNone(phase1_mechanism_cluster(self.experience))
 
 
 class Phase2BoundaryAndGateTests(unittest.TestCase):

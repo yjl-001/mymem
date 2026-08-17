@@ -180,15 +180,18 @@ next-token logits；不插入 token，也不重建既有 KV cache。
 - 正式 bank 只包含所有关键 assessment 均为 supported 的记录；deferred、rejected 与 quarantined 均保留可追溯证据但不参与 vector 编译；
 - 出现自相矛盾、事实错误或 target/reference 等价的记录必须可被 Pro 审核拒绝并保留证据。
 
-### Phase 2：全局 SEAL-style vector 可行性
+### Phase 2：无新增 AI 的 vector 构造对比
 
 **目的**：先验证 residual intervention 是否有意义，不引入动态检索复杂度。
 
 **工作项**：
 
-- 从正确且紧凑的 execution-like boundary 与错误且冗余/转向的 boundary 中提取
-  student hidden states；
-- 为多个候选层构造全局 `stay_on_track` vector；
+- 冻结 `ai_approved` Phase 1 bank，不新增 teacher、reviewer 或人工归因；
+- 对同一批 student target/reference 轨迹比较逐 pair 差分、全局 centroid 差分、冻结
+  Phase 1 机制文本的确定性分桶 centroid 差分，以及 SEAL-style
+  execution − non-execution 差分；
+- SEAL-style 分段仅使用空行/换行和已提交关键词规则；不具备足够 thought evidence 的方法
+  必须报告 unavailable，不得补充模型标注；
 - 在 `calibration-val` 上选择 layer、alpha、soft-gate slope 和最大注入次数；
 - 实现 boundary layer hook、vector artifact load/save、完整 intervention trace。
 
@@ -312,12 +315,12 @@ injection_applied, generation_length, final_reward, output_path
 - 原始 MemGen 与 entropy gate 的基础实验工作流。
 - Phase 1 verifier-backed bank 流水线代码：固定 split manifest、冻结 student rollout、
   success/failure 配对、Flash teacher、确定性审计、Pro reviewer 与人工争议分流；
-- Phase 2 global-vector MVP 代码：Pro-approved evidence 与原始 verified trajectory
+- Phase 2 global-vector MVP 代码：Pro-approved bank 与原始 verified trajectory
   的 provenance join、多层 `target - reference` compiler、artifact/trace、熵校准、
   boundary residual hook、相对扰动上限和六组 calibration-val 对照的一键脚本；
 - Phase 2 首轮 calibration-val 结果：注入与安全约束均生效，但真实向量未优于
-  随机、反转或随机边界对照；已将 compiler 升级为独立 Pro 的 exact evidence-span
-  anchoring，并记录注入前后 logits KL/top-1 变化，等待重跑验证；
+  随机、反转或随机边界对照；其旧版为最后 delimiter 的 pair-delta，不能支撑方法结论。
+  已新增不含 Phase 2 AI 的四种 vector 构造对比，等待服务器运行；
 
 尚未完成：
 
