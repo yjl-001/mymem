@@ -303,7 +303,7 @@ injection_applied, generation_length, final_reward, output_path
 - 任何 bank artifact、split manifest 和结果必须带版本/hash；
 - 高熵仅代表“可能需要帮助”，绝不能在论文或日志中被表述为“模型确定出错”。
 
-## 8. 当前状态（2026-08-12）
+## 8. 当前状态（2026-08-17）
 
 已完成：
 
@@ -312,11 +312,14 @@ injection_applied, generation_length, final_reward, output_path
 - 原始 MemGen 与 entropy gate 的基础实验工作流。
 - Phase 1 verifier-backed bank 流水线代码：固定 split manifest、冻结 student rollout、
   success/failure 配对、Flash teacher、确定性审计、Pro reviewer 与人工争议分流；
+- Phase 2 global-vector MVP 代码：Pro-approved evidence 与原始 verified trajectory
+  的 provenance join、多层 `target - reference` compiler、artifact/trace、熵校准、
+  boundary residual hook、相对扰动上限和六组 calibration-val 对照的一键脚本；
 
 尚未完成：
 
-- 在服务器上运行完整 Phase 1 rollout/teacher/reviewer 流水线，并完成争议裁决；
+- 在服务器上完成当前 Phase 1 bank 的冻结审计，并运行 Phase 2 calibration-val
+  实验以验证真实 vector 是否优于随机/反转对照；
 - 经验聚类；
-- vector compiler、layer hook、soft-gated residual integrator；
 - Phase 2–4 的对照评测；
 - MI side-KV bank 实现。

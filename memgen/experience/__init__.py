@@ -11,6 +11,19 @@ from memgen.experience.phase1 import (
     summarize_human_review,
     write_jsonl,
 )
+from memgen.experience.phase2 import (
+    PHASE2_DELIMITERS,
+    PHASE2_ELIGIBLE_EXPERIENCE_TYPES,
+    PHASE2_PRIMARY_EXPERIENCE_TYPE,
+    STEERING_CALIBRATION_SCHEMA,
+    STEERING_VECTOR_ARTIFACT_SCHEMA,
+    approved_experiences,
+    build_gsm8k_messages,
+    last_completion_boundary,
+    select_calibration_winner,
+    soft_entropy_gate,
+    stable_uniform,
+)
 
 __all__ = [
     "TEACHER_BANK_REQUIRED_FIELDS",
@@ -22,4 +35,15 @@ __all__ = [
     "iter_jsonl",
     "summarize_human_review",
     "write_jsonl",
+    "PHASE2_DELIMITERS",
+    "PHASE2_ELIGIBLE_EXPERIENCE_TYPES",
+    "PHASE2_PRIMARY_EXPERIENCE_TYPE",
+    "STEERING_CALIBRATION_SCHEMA",
+    "STEERING_VECTOR_ARTIFACT_SCHEMA",
+    "approved_experiences",
+    "build_gsm8k_messages",
+    "last_completion_boundary",
+    "select_calibration_winner",
+    "soft_entropy_gate",
+    "stable_uniform",
 ]
