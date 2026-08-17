@@ -188,7 +188,9 @@ def is_delimiter(tokenizer: Any, token_id: int) -> bool:
     )
 
 
-def sink_masked_entropy(model: Any, input_ids: Any, attention_mask: Any, sink_count: int) -> float:
+def sink_masked_entropy(
+    model: Any, input_ids: Any, attention_mask: Any, sink_count: int
+) -> tuple[float, Any]:
     """Compute the FlashMem-style last-layer entropy without leading sinks."""
 
     import torch
@@ -225,7 +227,10 @@ def sink_masked_entropy(model: Any, input_ids: Any, attention_mask: Any, sink_co
     value = float(entropy.mean().item())
     if not math.isfinite(value):
         raise RuntimeError("Non-finite sink-masked entropy")
-    return value
+    # The caller uses these logits as the no-injection counterfactual for the
+    # same prefix.  The attention forward already exists for entropy gating, so
+    # recording it adds no extra model pass.
+    return value, output.logits[:, -1, :].detach().float()
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -275,6 +280,7 @@ def generate_one(
         input_ids = torch.tensor([ids], dtype=torch.long, device=device)
         attention_mask = torch.ones_like(input_ids)
         event: dict[str, Any] | None = None
+        baseline_logits = None
         should_arm = False
         gate = 0.0
         if generation_step > 0 and is_delimiter(tokenizer, ids[-1]):
@@ -284,7 +290,7 @@ def generate_one(
                 "injection_count_before": injection_count,
             }
             if condition != "vanilla":
-                entropy = sink_masked_entropy(
+                entropy, baseline_logits = sink_masked_entropy(
                     model, input_ids, attention_mask, sink_token_count
                 )
                 triggered = entropy >= entropy_threshold and injection_count < max_injections
@@ -334,6 +340,17 @@ def generate_one(
             event["injection"] = hook_result or {"applied": False}
             if hook_result and hook_result.get("applied"):
                 injection_count += 1
+                if baseline_logits is not None:
+                    baseline_log_probs = baseline_logits.log_softmax(dim=-1)
+                    injected_log_probs = output.logits[:, -1, :].float().log_softmax(dim=-1)
+                    baseline_probs = baseline_log_probs.exp()
+                    event["logits_kl_baseline_to_injected"] = float(
+                        (baseline_probs * (baseline_log_probs - injected_log_probs)).sum().item()
+                    )
+                    event["top1_token_changed"] = bool(
+                        baseline_logits.argmax(dim=-1).item()
+                        != output.logits[:, -1, :].argmax(dim=-1).item()
+                    )
             events.append(event)
         next_token = int(output.logits[:, -1, :].argmax(dim=-1).item())
         ids.append(next_token)
@@ -487,6 +504,17 @@ def main() -> None:
     applied = sum(int(item["injection_applied_count"]) for item in records)
     candidate = sum(int(item["candidate_boundary_count"]) for item in records)
     disabled = sum(len(item["disabled_injection_reasons"]) for item in records)
+    injection_events = [
+        event
+        for item in records
+        for event in item["intervention_trace"]
+        if event.get("injection", {}).get("applied")
+    ]
+    logit_kls = [
+        float(event["logits_kl_baseline_to_injected"])
+        for event in injection_events
+        if "logits_kl_baseline_to_injected" in event
+    ]
     summary = {
         "schema_version": "steering-evaluation-summary-v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -522,6 +550,14 @@ def main() -> None:
         "max_observed_relative_delta_norm": max(
             (float(item["max_relative_delta_norm"]) for item in records), default=0.0
         ),
+        "injection_logit_diagnostics": {
+            "measured_count": len(logit_kls),
+            "mean_kl_baseline_to_injected": sum(logit_kls) / len(logit_kls) if logit_kls else 0.0,
+            "max_kl_baseline_to_injected": max(logit_kls, default=0.0),
+            "top1_token_changed_count": sum(
+                bool(event.get("top1_token_changed")) for event in injection_events
+            ),
+        },
         "results": {"path": result_path.name, "sha256": __import__("hashlib").sha256(result_path.read_bytes()).hexdigest()},
         "git_revision": git_revision(),
     }

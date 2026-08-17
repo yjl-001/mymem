@@ -10,6 +10,7 @@ from memgen.experience.phase2 import (
     select_calibration_winner,
     soft_entropy_gate,
     stable_uniform,
+    validate_evidence_anchor,
 )
 
 
@@ -96,6 +97,27 @@ class Phase2BoundaryAndGateTests(unittest.TestCase):
         self.assertGreater(soft_entropy_gate(6.0, 5.0, 0.1), 0.99)
         self.assertEqual(stable_uniform(42, "sample", "1"), stable_uniform(42, "sample", "1"))
         self.assertNotEqual(stable_uniform(42, "sample", "1"), stable_uniform(42, "sample", "2"))
+
+    def test_anchor_requires_exact_delimiter_terminated_nonfinal_quotes(self) -> None:
+        experiences, _ = build_verified_experiences(
+            [
+                rollout("success", 1.0, "Compute 2 + 2 = 4. Therefore \\boxed{4}"),
+                rollout("failure", 0.0, "Compute 2 + 2 = 5. Therefore \\boxed{5}"),
+            ]
+        )
+        experience = experiences[0]
+        payload = {
+            "decision": "anchor",
+            "mechanism_cluster": "arithmetic_or_numeric",
+            "target_anchor": {"quote": "Compute 2 + 2 = 4."},
+            "reference_anchor": {"quote": "Compute 2 + 2 = 5."},
+        }
+        self.assertEqual(validate_evidence_anchor(payload, experience), [])
+        payload["target_anchor"]["quote"] = "\\boxed{4}"
+        self.assertIn(
+            "target_quote_is_final_answer_formatting",
+            validate_evidence_anchor(payload, experience),
+        )
 
 
 class Phase2CalibrationTests(unittest.TestCase):

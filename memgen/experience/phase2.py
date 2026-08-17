@@ -17,6 +17,7 @@ from memgen.experience.phase1 import canonical_json_sha256
 
 STEERING_VECTOR_ARTIFACT_SCHEMA = "steering-vector-artifact-v1"
 STEERING_CALIBRATION_SCHEMA = "steering-calibration-report-v1"
+PHASE2_EVIDENCE_ANCHOR_SCHEMA = "phase2-evidence-anchor-v1"
 PHASE2_DELIMITERS = (",", ".", "\n")
 PHASE2_PRIMARY_EXPERIENCE_TYPE = "answer_correctness"
 PHASE2_ELIGIBLE_EXPERIENCE_TYPES = frozenset(
@@ -24,6 +25,16 @@ PHASE2_ELIGIBLE_EXPERIENCE_TYPES = frozenset(
         "answer_correctness",
         "format_compliance",
         "mixed_or_unclassified_task_failure",
+    }
+)
+PHASE2_MECHANISM_CLUSTERS = frozenset(
+    {
+        "arithmetic_or_numeric",
+        "unit_or_conversion",
+        "counting_or_discreteness",
+        "temporal_or_sequence",
+        "relation_or_constraint",
+        "other_task_reasoning",
     }
 )
 
@@ -190,6 +201,46 @@ def soft_entropy_gate(entropy: float, threshold: float, slope: float) -> float:
     if scaled <= -40:
         return 0.0
     return 1.0 / (1.0 + math.exp(-scaled))
+
+
+def validate_evidence_anchor(
+    payload: Mapping[str, Any], experience: Mapping[str, Any]
+) -> list[str]:
+    """Validate Pro-provided exact quotes before they become vector evidence.
+
+    The reviewer can decide that a pair is not safely anchorable.  A quote is
+    accepted only when it appears exactly once in the original trajectory and
+    ends at a real delimiter, so the compiler never guesses a semantic span.
+    """
+
+    reasons: list[str] = []
+    if payload.get("decision") != "anchor":
+        return ["reviewer_excluded"]
+    cluster = payload.get("mechanism_cluster")
+    if cluster not in PHASE2_MECHANISM_CLUSTERS:
+        reasons.append("invalid_mechanism_cluster")
+    for side, trajectory_field in (
+        ("target", "trajectory"),
+        ("reference", "reference_trajectory"),
+    ):
+        anchor = payload.get(f"{side}_anchor")
+        if not isinstance(anchor, Mapping):
+            reasons.append(f"missing_{side}_anchor")
+            continue
+        quote = anchor.get("quote")
+        if not isinstance(quote, str) or not quote.strip():
+            reasons.append(f"missing_{side}_quote")
+            continue
+        trajectory = str(experience.get(trajectory_field, ""))
+        if trajectory.count(quote) != 1:
+            reasons.append(f"{side}_quote_not_unique_exact_match")
+        if not quote.rstrip(" \t").endswith(PHASE2_DELIMITERS):
+            reasons.append(f"{side}_quote_not_delimiter_terminated")
+        if "\\boxed" in quote or "\\fbox" in quote:
+            reasons.append(f"{side}_quote_is_final_answer_formatting")
+        if len(quote) < 12 or len(quote) > 900:
+            reasons.append(f"{side}_quote_length_out_of_range")
+    return reasons
 
 
 def select_calibration_winner(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

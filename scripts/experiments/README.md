@@ -65,8 +65,10 @@ Teacher/Reviewer 记录、模型或 provenance 已变化的记录会在 `--resum
 和 `quarantined` 仅保留用于审计、误差分析或未来扩充稀缺类别。这里的 `AI review` 不得
 在论文或实验报告中表述为人工审核。
 
-Phase 2 会从正式 bank 回连到 `verified_experiences.jsonl` 的原始 student 轨迹，构造
-多个层的全局 residual vector；Teacher 文本不直接参与 hidden-state 差分。它先在
+Phase 2 会先由独立 Pro 从正式 bank 回连到 `verified_experiences.jsonl` 的原始 student
+轨迹，逐 pair 复制可精确匹配的 target/reference execution 或 verification evidence
+span；不能安全锚定的 pair 会被排除。compiler 只在这些锚点边界构造多个层的全局 residual
+vector，Teacher 文本不直接参与 hidden-state 差分。它先在
 `calibration-val` 的 tune 子集校准 layer、alpha、soft-gate slope 与注入预算，随后在
 同一 split 的独立 confirmation 子集运行 vanilla、entropy-only、真实 vector、随机
 boundary、同范数随机 vector 和反转 vector 六个对照。运行时只需传入冻结的 Phase 1
@@ -80,5 +82,5 @@ bash scripts/experiments/gsm8k/run_phase2_global_steering.sh \
 初始默认使用 100 个 tune + 100 个 confirmation 样本，避免在发现架构/环境错误前占用
 整段 GPU 时间。成功后可仅在服务器 `.server.env` 中提高 `MEMGEN_PHASE2_TUNE_SIZE` 和
 `MEMGEN_PHASE2_CONFIRM_SIZE`；不要改动已提交脚本。正式 vector 只使用
-`answer_correctness` evidence，`format_compliance` 等类型会同时单独编译，留给后续
-条件化/类型化实验，避免格式监督淹没主推理向量。
+`answer_correctness` evidence；`format_compliance` 等类型保留给后续条件化/类型化实验，
+避免格式监督淹没主推理向量。

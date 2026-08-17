@@ -14,6 +14,8 @@ from memgen.experience.phase1 import (
 from memgen.experience.phase2 import (
     PHASE2_DELIMITERS,
     PHASE2_ELIGIBLE_EXPERIENCE_TYPES,
+    PHASE2_EVIDENCE_ANCHOR_SCHEMA,
+    PHASE2_MECHANISM_CLUSTERS,
     PHASE2_PRIMARY_EXPERIENCE_TYPE,
     STEERING_CALIBRATION_SCHEMA,
     STEERING_VECTOR_ARTIFACT_SCHEMA,
@@ -23,6 +25,7 @@ from memgen.experience.phase2 import (
     select_calibration_winner,
     soft_entropy_gate,
     stable_uniform,
+    validate_evidence_anchor,
 )
 
 __all__ = [
@@ -37,6 +40,8 @@ __all__ = [
     "write_jsonl",
     "PHASE2_DELIMITERS",
     "PHASE2_ELIGIBLE_EXPERIENCE_TYPES",
+    "PHASE2_EVIDENCE_ANCHOR_SCHEMA",
+    "PHASE2_MECHANISM_CLUSTERS",
     "PHASE2_PRIMARY_EXPERIENCE_TYPE",
     "STEERING_CALIBRATION_SCHEMA",
     "STEERING_VECTOR_ARTIFACT_SCHEMA",
@@ -46,4 +51,5 @@ __all__ = [
     "select_calibration_winner",
     "soft_entropy_gate",
     "stable_uniform",
+    "validate_evidence_anchor",
 ]

@@ -315,6 +315,9 @@ injection_applied, generation_length, final_reward, output_path
 - Phase 2 global-vector MVP 代码：Pro-approved evidence 与原始 verified trajectory
   的 provenance join、多层 `target - reference` compiler、artifact/trace、熵校准、
   boundary residual hook、相对扰动上限和六组 calibration-val 对照的一键脚本；
+- Phase 2 首轮 calibration-val 结果：注入与安全约束均生效，但真实向量未优于
+  随机、反转或随机边界对照；已将 compiler 升级为独立 Pro 的 exact evidence-span
+  anchoring，并记录注入前后 logits KL/top-1 变化，等待重跑验证；
 
 尚未完成：
 

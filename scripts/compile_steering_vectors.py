@@ -43,12 +43,18 @@ class TokenizedPair:
     target_boundary: int
     reference_ids: list[int]
     reference_boundary: int
+    mechanism_cluster: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--approved-bank", type=Path, required=True)
     parser.add_argument("--experiences", type=Path, required=True)
+    parser.add_argument(
+        "--evidence-anchors",
+        type=Path,
+        help="Optional Pro-reviewed exact evidence anchors. Formal Phase 2 runs require this.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--model-revision", default="main")
@@ -97,7 +103,9 @@ def model_context_limit(model: Any) -> int | None:
     return min(valid) if valid else None
 
 
-def tokenize_pair(tokenizer: Any, experience: dict[str, Any]) -> TokenizedPair | None:
+def tokenize_pair(
+    tokenizer: Any, experience: dict[str, Any], anchor_record: dict[str, Any] | None = None
+) -> TokenizedPair | None:
     prompt = tokenizer.apply_chat_template(
         build_gsm8k_messages(str(experience["context"])),
         tokenize=False,
@@ -105,8 +113,22 @@ def tokenize_pair(tokenizer: Any, experience: dict[str, Any]) -> TokenizedPair |
     )
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
 
-    def completion_ids(value: str) -> tuple[list[int], int | None]:
+    def completion_ids(value: str, quote: str | None) -> tuple[list[int], int | None]:
         ids = prompt_ids + tokenizer.encode(value, add_special_tokens=False)
+        if anchor_record is not None and not isinstance(quote, str):
+            return ids, None
+        if quote is not None:
+            quote_start = value.find(quote)
+            if quote_start < 0 or value.find(quote, quote_start + len(quote)) >= 0:
+                return ids, None
+            prefix = value[: quote_start + len(quote)]
+            boundary = len(prompt_ids) + len(tokenizer.encode(prefix, add_special_tokens=False)) - 1
+            if boundary < len(prompt_ids) or boundary >= len(ids):
+                return ids, None
+            token_text = tokenizer.decode([ids[boundary]], skip_special_tokens=False)
+            if not token_text.rstrip(" \t").endswith((",", ".", "\n")):
+                return ids, None
+            return ids, boundary
         boundary = last_completion_boundary(
             ids,
             completion_start=len(prompt_ids),
@@ -116,8 +138,15 @@ def tokenize_pair(tokenizer: Any, experience: dict[str, Any]) -> TokenizedPair |
         )
         return ids, boundary
 
-    target_ids, target_boundary = completion_ids(str(experience["trajectory"]))
-    reference_ids, reference_boundary = completion_ids(str(experience["reference_trajectory"]))
+    review = anchor_record.get("anchor_review", {}) if anchor_record else {}
+    target_anchor = review.get("target_anchor") if isinstance(review, dict) else None
+    reference_anchor = review.get("reference_anchor") if isinstance(review, dict) else None
+    target_quote = target_anchor.get("quote") if isinstance(target_anchor, dict) else None
+    reference_quote = reference_anchor.get("quote") if isinstance(reference_anchor, dict) else None
+    target_ids, target_boundary = completion_ids(str(experience["trajectory"]), target_quote)
+    reference_ids, reference_boundary = completion_ids(
+        str(experience["reference_trajectory"]), reference_quote
+    )
     if target_boundary is None or reference_boundary is None:
         return None
     return TokenizedPair(
@@ -126,6 +155,9 @@ def tokenize_pair(tokenizer: Any, experience: dict[str, Any]) -> TokenizedPair |
         target_boundary=target_boundary,
         reference_ids=reference_ids,
         reference_boundary=reference_boundary,
+        mechanism_cluster=(
+            str(review.get("mechanism_cluster")) if isinstance(review, dict) else None
+        ),
     )
 
 
@@ -193,6 +225,22 @@ def main() -> None:
         selection_report["selected_count_after_limit"] = len(selected)
     if not selected:
         raise ValueError("No selected experiences")
+    anchors_by_id: dict[str, dict[str, Any]] = {}
+    if args.evidence_anchors is not None:
+        for anchor in iter_jsonl(args.evidence_anchors):
+            experience_id = str(anchor.get("experience_id", ""))
+            if not experience_id or experience_id in anchors_by_id:
+                raise ValueError(
+                    f"Missing or duplicate evidence-anchor experience_id: {experience_id!r}"
+                )
+            anchors_by_id[experience_id] = anchor
+        for experience in selected:
+            anchor = anchors_by_id.get(str(experience["experience_id"]))
+            if anchor is not None and anchor.get("route") == "anchored":
+                if anchor.get("experience_provenance_sha256") != experience.get("provenance_sha256"):
+                    raise ValueError(
+                        f"Evidence anchor provenance mismatch for {experience['experience_id']}"
+                    )
 
     torch_dtype = {
         "bfloat16": torch.bfloat16,
@@ -221,6 +269,16 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     evidence_path = output_dir / "compiler_evidence_trace.jsonl"
 
+    cluster_variants = sorted(
+        {
+            f"mechanism-{record['anchor_review']['mechanism_cluster']}"
+            for record in anchors_by_id.values()
+            if record.get("route") == "anchored"
+            and isinstance(record.get("anchor_review"), dict)
+            and isinstance(record["anchor_review"].get("mechanism_cluster"), str)
+        }
+    )
+    vector_variants = ["all_selected", *requested_types, *cluster_variants]
     sums: dict[str, dict[int, Any]] = {}
     counts: Counter[str] = Counter()
     trace: list[dict[str, Any]] = []
@@ -229,7 +287,7 @@ def main() -> None:
     def initialize(hidden_size: int) -> None:
         if sums:
             return
-        for vector_type in ["all_selected", *requested_types]:
+        for vector_type in vector_variants:
             sums[vector_type] = {
                 layer: torch.zeros(hidden_size, dtype=torch.float64, device="cpu")
                 for layer in layers
@@ -271,9 +329,13 @@ def main() -> None:
                 normalized = (delta / delta_rms).detach().to(dtype=torch.float64, device="cpu")
                 sums["all_selected"][layer] += normalized
                 sums[vector_type][layer] += normalized
+                if pair.mechanism_cluster:
+                    sums[f"mechanism-{pair.mechanism_cluster}"][layer] += normalized
                 per_layer_rms[str(layer)] = delta_rms
             counts["all_selected"] += 1
             counts[vector_type] += 1
+            if pair.mechanism_cluster:
+                counts[f"mechanism-{pair.mechanism_cluster}"] += 1
             trace.append(
                 {
                     "experience_id": pair.experience["experience_id"],
@@ -287,20 +349,36 @@ def main() -> None:
                     "reference_boundary_token_index": pair.reference_boundary,
                     "target_sequence_length": len(pair.target_ids),
                     "reference_sequence_length": len(pair.reference_ids),
+                    "mechanism_cluster": pair.mechanism_cluster,
                     "per_layer_difference_rms": per_layer_rms,
                     "status": "compiled",
                 }
             )
 
     for index, experience in enumerate(selected, start=1):
-        tokenized = tokenize_pair(tokenizer, experience)
+        anchor = anchors_by_id.get(str(experience["experience_id"])) if anchors_by_id else None
+        if anchors_by_id and (anchor is None or anchor.get("route") != "anchored"):
+            trace.append(
+                {
+                    "experience_id": experience["experience_id"],
+                    "experience_type": experience["experience_type"],
+                    "provenance_sha256": experience["provenance_sha256"],
+                    "status": "skipped_no_pro_anchored_evidence",
+                }
+            )
+            continue
+        tokenized = tokenize_pair(tokenizer, experience, anchor)
         if tokenized is None:
             trace.append(
                 {
                     "experience_id": experience["experience_id"],
                     "experience_type": experience["experience_type"],
                     "provenance_sha256": experience["provenance_sha256"],
-                    "status": "skipped_no_completion_delimiter",
+                    "status": (
+                        "skipped_unusable_pro_anchored_boundary"
+                        if anchors_by_id
+                        else "skipped_no_completion_delimiter"
+                    ),
                 }
             )
             continue
@@ -341,7 +419,11 @@ def main() -> None:
             "tokenizer_revision": tokenizer_revision,
         },
         "construction": {
-            "boundary_definition": "last_completion_delimiter_token",
+            "boundary_definition": (
+                "pro_reviewed_exact_evidence_span_boundary"
+                if args.evidence_anchors is not None
+                else "last_completion_delimiter_token"
+            ),
             "delimiters": [",", ".", "\\n"],
             "difference": "mean(normalize(target_hidden - reference_hidden))",
             "layers": layers,
@@ -352,11 +434,14 @@ def main() -> None:
         "inputs": {
             "approved_bank_sha256": file_sha256(args.approved_bank),
             "verified_experiences_sha256": file_sha256(args.experiences),
+            "evidence_anchors_sha256": (
+                file_sha256(args.evidence_anchors) if args.evidence_anchors is not None else None
+            ),
             "selection": selection_report,
             "compiler_git_revision": git_revision(),
         },
     }
-    for vector_type in ["all_selected", *requested_types]:
+    for vector_type in vector_variants:
         evidence_count = counts[vector_type]
         if evidence_count == 0:
             continue
@@ -378,7 +463,11 @@ def main() -> None:
                 item["source_episode_ids"]
                 for item in trace
                 if item.get("status") == "compiled"
-                and (vector_type == "all_selected" or item["experience_type"] == vector_type)
+                and (
+                    vector_type == "all_selected"
+                    or item["experience_type"] == vector_type
+                    or item.get("mechanism_cluster") == vector_type.removeprefix("mechanism-")
+                )
             ],
         }
         torch.save(payload, artifact_path)
