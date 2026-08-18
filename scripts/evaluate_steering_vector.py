@@ -357,6 +357,18 @@ def generate_one(
         past = output.past_key_values
         if eos is not None and next_token == eos:
             break
+    # A candidate's next candidate boundary is an observable, post-intervention
+    # outcome.  It is recorded after generation rather than used to trigger an
+    # online intervention, so runtime remains causal.
+    entropy_event_indices = [index for index, event in enumerate(events) if "entropy" in event]
+    for current_index, next_index in zip(entropy_event_indices, entropy_event_indices[1:]):
+        current = events[current_index]
+        following = events[next_index]
+        current_entropy = float(current["entropy"])
+        next_entropy = float(following["entropy"])
+        current["next_candidate_entropy"] = next_entropy
+        current["entropy_delta_to_next_candidate"] = next_entropy - current_entropy
+        current["entropy_decreased_to_next_candidate"] = next_entropy < current_entropy
     return ids[len(prompt_ids) :], events
 
 
@@ -515,6 +527,25 @@ def main() -> None:
         for event in injection_events
         if "logits_kl_baseline_to_injected" in event
     ]
+
+    def entropy_recovery_summary(predicate: Any) -> dict[str, Any]:
+        matched = [
+            event
+            for item in records
+            for event in item["intervention_trace"]
+            if predicate(event) and "entropy_delta_to_next_candidate" in event
+        ]
+        deltas = [float(event["entropy_delta_to_next_candidate"]) for event in matched]
+        return {
+            "measured_count": len(deltas),
+            "mean_delta_to_next_candidate": sum(deltas) / len(deltas) if deltas else None,
+            "entropy_decreased_rate": (
+                sum(bool(event["entropy_decreased_to_next_candidate"]) for event in matched)
+                / len(deltas)
+                if deltas
+                else None
+            ),
+        }
     summary = {
         "schema_version": "steering-evaluation-summary-v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -556,6 +587,16 @@ def main() -> None:
             "max_kl_baseline_to_injected": max(logit_kls, default=0.0),
             "top1_token_changed_count": sum(
                 bool(event.get("top1_token_changed")) for event in injection_events
+            ),
+        },
+        "entropy_recovery_diagnostics": {
+            # Triggered is available for entropy-only controls; injected is the
+            # matched mechanistic outcome for vector conditions.
+            "triggered": entropy_recovery_summary(
+                lambda event: bool(event.get("entropy_triggered", False))
+            ),
+            "injected": entropy_recovery_summary(
+                lambda event: bool(event.get("injection", {}).get("applied", False))
             ),
         },
         "results": {"path": result_path.name, "sha256": __import__("hashlib").sha256(result_path.read_bytes()).hexdigest()},

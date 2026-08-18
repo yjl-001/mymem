@@ -65,13 +65,12 @@ Teacher/Reviewer 记录、模型或 provenance 已变化的记录会在 `--resum
 和 `quarantined` 仅保留用于审计、误差分析或未来扩充稀缺类别。这里的 `AI review` 不得
 在论文或实验报告中表述为人工审核。
 
-当前正式的 Phase 2 主路径不再调用新的 AI。它只回连正式 bank 与
-`verified_experiences.jsonl` 的原始 student 轨迹，并比较四种 vector 构造：逐 pair
-归一化差分、全局 target/reference centroid 差分、由冻结 Phase 1 已审核机制文本做确定性
-分桶的平衡 centroid 差分，以及 SEAL-style execution − non-execution 差分。Teacher / Pro
-文本绝不输入 student；机制文本只在第三种方法中按已提交的关键词规则做分桶。SEAL-style
-方法只依赖轨迹中的空行/换行 thought 边界与确定性 reflection/transition 关键词；证据不足时
-不会伪造 artifact，而会在报告中标为 unavailable。
+当前正式的 Phase 2 主路径不再调用新的 AI。它重放正式 bank 中原始 student 轨迹的
+sink-masked attention entropy，只从高熵 reasoning boundary 构造 vector：成功 target 在下一
+boundary 降到低熵的是 `successful_recovery`，失败 reference 在下一 boundary 仍未收敛的是
+`failed_persistence`。它分别编译两种 artifact：当前状态的中心差，以及从当前 boundary 到
+下一 boundary 的恢复位移差。未来 entropy 仅用于离线标签；在线仍只根据当前 entropy 触发。
+Teacher / Pro 文本绝不输入 student，也不参与此阶段的新标注。
 
 每个可用 artifact 都独立在 `calibration-val` 的 tune 子集校准 layer、alpha、soft-gate
 slope 与注入预算，随后在同一 split 的独立 confirmation 子集运行 vanilla、entropy-only、
@@ -80,7 +79,7 @@ slope 与注入预算，随后在同一 split 的独立 confirmation 子集运�
 冻结的 Phase 1 目录：
 
 ```bash
-bash scripts/experiments/gsm8k/run_phase2_vector_construction_ablation.sh \
+bash scripts/experiments/gsm8k/run_phase2_entropy_recovery.sh \
   /absolute/path/to/gsm8k_phase1_verified-student-contrast_<tag>
 ```
 

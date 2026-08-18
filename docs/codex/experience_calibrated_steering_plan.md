@@ -92,7 +92,7 @@ target 和 reference 的价值不是“正负文本装饰”，而是将可复�
 的失败模式区分开。reference 必须是 verified failure，或单独标记为不可用于正式
 实验的 `teacher_inferred`。
 
-### 4.2 SEAL-style compiled artifact
+### 4.2 条件匹配的 entropy-recovery artifact
 
 每个经验簇 `k`、每个候选 layer `l` 保存：
 
@@ -104,15 +104,27 @@ source_episode_ids, target/reference provenance,
 construction_config, calibration_statistics
 ```
 
-向量由**目标 student 模型自身**生成，不能直接使用强教师的 hidden state：
+向量由**目标 student 模型自身**生成，不能直接使用强教师的 hidden state。离线构造必须
+与在线 gate 的状态条件匹配：仅保留 sink-masked attention entropy 高于 bank-source 分位数
+阈值 \(\tau_H\) 的 reasoning boundary。强教师/Pro 不参与 Phase 2 的新标注。
+
+对成功 target，只有高熵后下一 reasoning boundary 下降到低阈值 \(\tau_L\) 的状态记为
+`successful_recovery`；对失败 reference，只有高熵后仍未下降的状态记为
+`failed_persistence`。未来 boundary 仅用于离线构造标签，在线触发始终只使用当前 state。
 
 \[
-S_{k,l} = \frac{1}{N}\sum_i \operatorname{Normalize}
-\left(h^+_{i,l} - h^-_{i,l}\right).
+S_{\mathrm{state},l}=\operatorname{Mean}(h_{l,t}\mid\mathrm{successful\ recovery})
+-\operatorname{Mean}(h_{l,t}\mid\mathrm{failed\ persistence}),
 \]
 
-其中正负 evidence 属于同一经验簇，优先使用相近任务/难度的配对 rollout。第一版可
-先使用全局簇 `stay_on_track`；后续才扩展到多个经验簇。
+\[
+S_{\mathrm{disp},l}=\operatorname{Mean}(h_{l,t'}-h_{l,t}\mid\mathrm{successful\ recovery})
+-\operatorname{Mean}(h_{l,t'}-h_{l,t}\mid\mathrm{failed\ persistence}).
+\]
+
+其中 \(t'\) 是 \(t\) 后的下一 reasoning boundary。该假设不是“高熵等于错误”，而是：
+若高熵状态之后存在可重复的成功收敛状态转移，则其方向应比最终答案收尾的单点差分更适合
+在同类在线状态中注入。若证据数不足，方法必须输出 unavailable，不得用额外 AI 补标。
 
 ### 4.3 在线注入
 
@@ -180,18 +192,18 @@ next-token logits；不插入 token，也不重建既有 KV cache。
 - 正式 bank 只包含所有关键 assessment 均为 supported 的记录；deferred、rejected 与 quarantined 均保留可追溯证据但不参与 vector 编译；
 - 出现自相矛盾、事实错误或 target/reference 等价的记录必须可被 Pro 审核拒绝并保留证据。
 
-### Phase 2：无新增 AI 的 vector 构造对比
+### Phase 2：条件匹配的 entropy-recovery vector
 
 **目的**：先验证 residual intervention 是否有意义，不引入动态检索复杂度。
 
 **工作项**：
 
 - 冻结 `ai_approved` Phase 1 bank，不新增 teacher、reviewer 或人工归因；
-- 对同一批 student target/reference 轨迹比较逐 pair 差分、全局 centroid 差分、冻结
-  Phase 1 机制文本的确定性分桶 centroid 差分，以及 SEAL-style
-  execution − non-execution 差分；
-- SEAL-style 分段仅使用空行/换行和已提交关键词规则；不具备足够 thought evidence 的方法
-  必须报告 unavailable，不得补充模型标注；
+- 在每个 `\boxed` 前的 reasoning delimiter 重放与在线完全相同的 sink-masked attention
+  entropy，使用 bank-source 分位数定义高熵和低熵阈值；
+- 构造 `successful_recovery − failed_persistence` 的状态 vector 与恢复位移 vector；
+- 旧版的末尾单点 pair-delta、全局 centroid、机制平衡 centroid 与 SEAL-style 仅保留为
+  已完成的消融/不可用性证据，不作为本轮主假设；
 - 在 `calibration-val` 上选择 layer、alpha、soft-gate slope 和最大注入次数；
 - 实现 boundary layer hook、vector artifact load/save、完整 intervention trace。
 
@@ -211,6 +223,8 @@ next-token logits；不插入 token，也不重建既有 KV cache。
 - 真实 vector + entropy gate 在 `calibration-val` 上优于同范数随机向量与反转向量；
 - 真实 vector 的结果不能仅等价于“输出更短”：格式正确率不下降，且 accuracy/奖励
   的变化方向优于随机对照；
+- 真实 vector 在实际注入后到下一个 candidate boundary 的 entropy 变化，必须优于
+  entropy-only、同范数随机 vector 与反转 vector；该中间指标仅记录后果，不参与在线触发；
 - 95% 以上的触发满足预设的相对扰动上限 `||ΔH|| / ||H|| <= r_max`；
 - 发生 NaN、格式崩坏或超出扰动上限时自动禁用该次注入并留下 trace。
 

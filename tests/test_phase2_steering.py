@@ -6,6 +6,8 @@ import unittest
 from memgen.experience.phase1 import ROLLOUT_SCHEMA, build_verified_experiences
 from memgen.experience.phase2 import (
     approved_experiences,
+    entropy_quantile,
+    entropy_recovery_label,
     last_completion_boundary,
     phase1_mechanism_cluster,
     select_calibration_winner,
@@ -111,6 +113,29 @@ class Phase2BoundaryAndGateTests(unittest.TestCase):
         self.assertGreater(soft_entropy_gate(6.0, 5.0, 0.1), 0.99)
         self.assertEqual(stable_uniform(42, "sample", "1"), stable_uniform(42, "sample", "1"))
         self.assertNotEqual(stable_uniform(42, "sample", "1"), stable_uniform(42, "sample", "2"))
+
+    def test_entropy_recovery_labels_require_matched_high_entropy_states(self) -> None:
+        self.assertEqual(entropy_quantile([1.0, 2.0, 3.0, 4.0], 0.5), 2.5)
+        self.assertEqual(
+            entropy_recovery_label(
+                side="target", current_entropy=5.0, next_entropy=3.0,
+                high_threshold=5.0, low_threshold=3.0,
+            ),
+            "successful_recovery",
+        )
+        self.assertEqual(
+            entropy_recovery_label(
+                side="reference", current_entropy=5.0, next_entropy=4.0,
+                high_threshold=5.0, low_threshold=3.0,
+            ),
+            "failed_persistence",
+        )
+        self.assertIsNone(
+            entropy_recovery_label(
+                side="target", current_entropy=4.9, next_entropy=2.0,
+                high_threshold=5.0, low_threshold=3.0,
+            )
+        )
 
     def test_anchor_accepts_exact_equation_spans_but_rejects_final_box(self) -> None:
         experiences, _ = build_verified_experiences(

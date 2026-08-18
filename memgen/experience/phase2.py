@@ -271,6 +271,58 @@ def soft_entropy_gate(entropy: float, threshold: float, slope: float) -> float:
     return 1.0 / (1.0 + math.exp(-scaled))
 
 
+def entropy_quantile(values: Sequence[float], quantile: float) -> float:
+    """Return a deterministic linear-interpolated quantile for finite values."""
+
+    if not values:
+        raise ValueError("No entropy values")
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError("quantile must be in [0, 1]")
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("entropy values must be finite")
+    ordered = sorted(float(value) for value in values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def entropy_recovery_label(
+    *,
+    side: str,
+    current_entropy: float,
+    next_entropy: float | None,
+    high_threshold: float,
+    low_threshold: float,
+) -> str | None:
+    """Label a high-entropy boundary using only frozen trajectory outcomes.
+
+    A target (verified-success) contributes only if its next reasoning boundary
+    has recovered below the low entropy threshold.  A reference
+    (verified-failure) contributes only if it remains above that threshold.
+    The future boundary is offline-only evidence; runtime gating remains causal
+    and uses the current entropy alone.
+    """
+
+    values = (current_entropy, high_threshold, low_threshold)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("entropy thresholds must be finite")
+    if high_threshold < low_threshold:
+        raise ValueError("high_threshold must be at least low_threshold")
+    if side not in {"target", "reference"}:
+        raise ValueError("side must be target or reference")
+    if current_entropy < high_threshold or next_entropy is None:
+        return None
+    if not math.isfinite(next_entropy):
+        raise ValueError("next_entropy must be finite when present")
+    if side == "target" and next_entropy <= low_threshold:
+        return "successful_recovery"
+    if side == "reference" and next_entropy > low_threshold:
+        return "failed_persistence"
+    return None
+
+
 def validate_evidence_anchor(
     payload: Mapping[str, Any], experience: Mapping[str, Any]
 ) -> list[str]:

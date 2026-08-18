@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16"
     )
     parser.add_argument("--attn-implementation", default="eager")
+    parser.add_argument(
+        "--require-entropy-recovery",
+        action="store_true",
+        help="Require confirmation-time injected entropy recovery to beat entropy-only, random-vector, and reversed controls.",
+    )
+    parser.add_argument("--min-entropy-recovery-events", type=int, default=10)
     return parser.parse_args()
 
 
@@ -131,9 +137,17 @@ def run_evaluation(
     return load_json(output_dir / "summary.json")
 
 
+def recovery_mean(summary: dict[str, Any], *, injected: bool) -> tuple[int, float | None]:
+    diagnostics = summary.get("entropy_recovery_diagnostics", {})
+    record = diagnostics.get("injected" if injected else "triggered", {})
+    count = int(record.get("measured_count", 0))
+    value = record.get("mean_delta_to_next_candidate")
+    return count, float(value) if isinstance(value, (int, float)) else None
+
+
 def main() -> None:
     args = parse_args()
-    if args.tune_size <= 0 or args.confirm_size <= 0:
+    if args.tune_size <= 0 or args.confirm_size <= 0 or args.min_entropy_recovery_events <= 0:
         raise ValueError("tune-size and confirm-size must be positive")
     if args.max_new_tokens <= 0 or args.r_max <= 0 or args.sink_token_count < 0:
         raise ValueError("Invalid generation/safety argument")
@@ -253,6 +267,11 @@ def main() -> None:
             "selected": None,
             "confirmation_controls": {},
             "acceptance": {},
+            "mechanistic_acceptance": {},
+            "entropy_recovery_requirement": {
+                "enabled": args.require_entropy_recovery,
+                "min_events": args.min_entropy_recovery_events,
+            },
             "passed": False,
             "failure_reason": str(exc),
             "git_revision": subprocess.check_output(
@@ -314,6 +333,22 @@ def main() -> None:
             and real["max_observed_relative_delta_norm"] <= args.r_max
         ),
     }
+    mechanistic_acceptance: dict[str, bool] = {}
+    if args.require_entropy_recovery:
+        real_count, real_delta = recovery_mean(real, injected=True)
+        comparisons = {
+            "entropy_only": recovery_mean(controls["entropy_only"], injected=False),
+            "random_vector": recovery_mean(controls["random_vector"], injected=True),
+            "reversed_vector": recovery_mean(controls["reversed_vector"], injected=True),
+        }
+        for name, (count, delta) in comparisons.items():
+            mechanistic_acceptance[f"real_recovers_entropy_faster_than_{name}"] = bool(
+                real_count >= args.min_entropy_recovery_events
+                and count >= args.min_entropy_recovery_events
+                and real_delta is not None
+                and delta is not None
+                and real_delta < delta
+            )
     report = {
         "schema_version": STEERING_CALIBRATION_SCHEMA,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -330,7 +365,12 @@ def main() -> None:
         "random_boundary_rate": random_boundary_rate,
         "confirmation_controls": controls,
         "acceptance": acceptance,
-        "passed": all(acceptance.values()),
+        "mechanistic_acceptance": mechanistic_acceptance,
+        "entropy_recovery_requirement": {
+            "enabled": args.require_entropy_recovery,
+            "min_events": args.min_entropy_recovery_events,
+        },
+        "passed": all(acceptance.values()) and all(mechanistic_acceptance.values()),
         "git_revision": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, text=True
         ).strip(),
