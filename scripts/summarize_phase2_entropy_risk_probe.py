@@ -32,12 +32,18 @@ def first_decision(record: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def entropy_summary(records: list[dict[str, Any]], *, injected: bool) -> dict[str, Any]:
+def entropy_summary(records: list[dict[str, Any]], *, mode: str) -> dict[str, Any]:
+    if mode not in {"triggered", "injected"}:
+        raise ValueError(f"Unsupported entropy-summary mode: {mode}")
     events = [
         event
         for record in records
         for event in record.get("intervention_trace", [])
-        if bool(event.get("injection", {}).get("applied")) == injected
+        if (
+            bool(event.get("entropy_triggered", False))
+            if mode == "triggered"
+            else bool(event.get("injection", {}).get("applied"))
+        )
         and "entropy_delta_to_next_candidate" in event
     ]
     deltas = [float(event["entropy_delta_to_next_candidate"]) for event in events]
@@ -94,10 +100,10 @@ def main() -> None:
             if baseline_decisions[sample_id] is not None
         )
     entropy = {
-        "entropy_only": entropy_summary(records_by_condition["entropy_only"], injected=False),
-        "real_vector": entropy_summary(records_by_condition["real_vector"], injected=True),
-        "random_vector": entropy_summary(records_by_condition["random_vector"], injected=True),
-        "reversed_vector": entropy_summary(records_by_condition["reversed_vector"], injected=True),
+        "entropy_only": entropy_summary(records_by_condition["entropy_only"], mode="triggered"),
+        "real_vector": entropy_summary(records_by_condition["real_vector"], mode="injected"),
+        "random_vector": entropy_summary(records_by_condition["random_vector"], mode="injected"),
+        "reversed_vector": entropy_summary(records_by_condition["reversed_vector"], mode="injected"),
     }
     real_delta = entropy["real_vector"]["mean_delta_to_next_candidate"]
     acceptance = {
@@ -123,7 +129,7 @@ def main() -> None:
         ),
     }
     output = {
-        "schema_version": "phase2-entropy-risk-probe-summary-v1",
+        "schema_version": "phase2-entropy-risk-probe-summary-v2",
         "diagnostic": {
             "path": str(args.diagnostic_report),
             "risk_diagnostic": diagnostic.get("risk_diagnostic"),
@@ -134,6 +140,7 @@ def main() -> None:
                 "accuracy": summaries[condition].get("accuracy"),
                 "format_accuracy": summaries[condition].get("format_accuracy"),
                 "mean_injections": summaries[condition].get("mean_injections"),
+                "injection_logit_diagnostics": summaries[condition].get("injection_logit_diagnostics"),
             }
             for condition in CONDITIONS
         },
