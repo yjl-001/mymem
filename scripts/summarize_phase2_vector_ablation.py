@@ -39,11 +39,17 @@ def main() -> None:
                 "passed": report.get("passed"),
                 "selected": report.get("selected"),
                 "acceptance": report.get("acceptance"),
+                "mechanistic_acceptance": report.get("mechanistic_acceptance", {}),
+                "entropy_recovery_requirement": report.get("entropy_recovery_requirement"),
                 "confirmation": {
                     "real_accuracy": real.get("accuracy"),
                     "vanilla_accuracy": vanilla.get("accuracy"),
                     "real_format_accuracy": real.get("format_accuracy"),
                     "vanilla_format_accuracy": vanilla.get("format_accuracy"),
+                },
+                "entropy_recovery": {
+                    condition: controls.get(condition, {}).get("entropy_recovery_diagnostics")
+                    for condition in ("entropy_only", "real_vector", "random_vector", "reversed_vector")
                 },
             }
         )
