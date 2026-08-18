@@ -323,6 +323,76 @@ def entropy_recovery_label(
     return None
 
 
+def entropy_transition_label(
+    *,
+    current_entropy: float,
+    next_entropy: float | None,
+    high_threshold: float,
+    low_threshold: float,
+) -> str | None:
+    """Classify a high-entropy transition without using final trajectory outcome.
+
+    This is the Phase-2 risk-diagnostic label.  In contrast with
+    :func:`entropy_recovery_label`, it deliberately applies to *both* verified
+    success (target) and verified failure (reference) trajectories, so the
+    resulting four-cell table can test whether recovery/persistence is really
+    explained by final outcome.
+    """
+
+    values = (current_entropy, high_threshold, low_threshold)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("entropy thresholds must be finite")
+    if high_threshold < low_threshold:
+        raise ValueError("high_threshold must be at least low_threshold")
+    if current_entropy < high_threshold or next_entropy is None:
+        return None
+    if not math.isfinite(next_entropy):
+        raise ValueError("next_entropy must be finite when present")
+    return "recovery" if next_entropy <= low_threshold else "persistence"
+
+
+def deterministic_train_partition(identifier: str, *, seed: int, train_fraction: float) -> bool:
+    """Return a stable per-experience train/holdout assignment.
+
+    Splitting by experience rather than by boundary prevents a near-identical
+    trajectory from contributing evidence to both a prototype and its held-out
+    evaluation.
+    """
+
+    if not identifier:
+        raise ValueError("identifier must be non-empty")
+    if not 0.0 < train_fraction < 1.0:
+        raise ValueError("train_fraction must be strictly between zero and one")
+    return stable_uniform(seed, "phase2-risk-split", identifier) < train_fraction
+
+
+def binary_roc_auc(labels: Sequence[int | bool], scores: Sequence[float]) -> float:
+    """Compute tie-aware ROC AUC without a heavyweight metrics dependency."""
+
+    if len(labels) != len(scores) or not labels:
+        raise ValueError("labels and scores must be non-empty and have the same length")
+    pairs = [(bool(label), float(score)) for label, score in zip(labels, scores)]
+    if not all(math.isfinite(score) for _, score in pairs):
+        raise ValueError("scores must be finite")
+    positives = sum(label for label, _ in pairs)
+    negatives = len(pairs) - positives
+    if positives == 0 or negatives == 0:
+        raise ValueError("ROC AUC requires both positive and negative labels")
+    ordered = sorted(enumerate(pairs), key=lambda item: item[1][1])
+    ranks = [0.0] * len(pairs)
+    index = 0
+    while index < len(ordered):
+        end = index + 1
+        while end < len(ordered) and ordered[end][1][1] == ordered[index][1][1]:
+            end += 1
+        average_rank = (index + 1 + end) / 2.0
+        for original_index, _ in ordered[index:end]:
+            ranks[original_index] = average_rank
+        index = end
+    positive_rank_sum = sum(rank for rank, (label, _) in zip(ranks, pairs) if label)
+    return (positive_rank_sum - positives * (positives + 1) / 2.0) / (positives * negatives)
+
+
 def validate_evidence_anchor(
     payload: Mapping[str, Any], experience: Mapping[str, Any]
 ) -> list[str]:

@@ -55,7 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logical-split", choices=("calibration-val", "dev-test", "final-test"), required=True)
     parser.add_argument("--layer", type=int, required=True, help="1-based decoder block index")
     parser.add_argument("--alpha", type=float, default=0.03)
-    parser.add_argument("--entropy-threshold", type=float, required=True)
+    parser.add_argument("--entropy-threshold", type=float)
+    parser.add_argument(
+        "--use-artifact-entropy-threshold",
+        action="store_true",
+        help="Read the fixed high-entropy threshold stored in the vector artifact.",
+    )
     parser.add_argument("--gate-slope", type=float, default=0.15)
     parser.add_argument("--max-injections", type=int, default=3)
     parser.add_argument("--r-max", type=float, default=0.10)
@@ -65,6 +70,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offset", type=int, default=0, help="Skip this many manifest-ordered split examples")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--random-boundary-rate", type=float, default=0.15)
+    parser.add_argument(
+        "--risk-gate",
+        action="store_true",
+        help="Require the artifact's current-state persistence-risk gate in addition to high entropy.",
+    )
+    parser.add_argument(
+        "--first-high-entropy-only",
+        action="store_true",
+        help="Make exactly one decision at the first high-entropy boundary of each completion.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16"
@@ -189,8 +204,13 @@ def is_delimiter(tokenizer: Any, token_id: int) -> bool:
 
 
 def sink_masked_entropy(
-    model: Any, input_ids: Any, attention_mask: Any, sink_count: int
-) -> tuple[float, Any]:
+    model: Any,
+    input_ids: Any,
+    attention_mask: Any,
+    sink_count: int,
+    *,
+    hidden_state_layer: int | None = None,
+) -> tuple[float, Any, Any | None]:
     """Compute the FlashMem-style last-layer entropy without leading sinks."""
 
     import torch
@@ -200,7 +220,7 @@ def sink_masked_entropy(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_attentions=True,
-            output_hidden_states=False,
+            output_hidden_states=hidden_state_layer is not None,
             use_cache=False,
             return_dict=True,
         )
@@ -230,7 +250,24 @@ def sink_masked_entropy(
     # The caller uses these logits as the no-injection counterfactual for the
     # same prefix.  The attention forward already exists for entropy gating, so
     # recording it adds no extra model pass.
-    return value, output.logits[:, -1, :].detach().float()
+    state = None
+    if hidden_state_layer is not None:
+        if output.hidden_states is None or hidden_state_layer >= len(output.hidden_states):
+            raise RuntimeError("Model hidden states do not cover the risk-gate layer")
+        state = output.hidden_states[hidden_state_layer][0, -1, :].detach().float()
+    return value, output.logits[:, -1, :].detach().float(), state
+
+
+def persistence_risk_score(state: Any, risk_gate: dict[str, Any]) -> float:
+    """Score whether a current state resembles persistent rather than recovery states."""
+
+    import torch
+
+    recovery = risk_gate["recovery_center"].to(device=state.device, dtype=torch.float32)
+    persistence = risk_gate["persistence_center"].to(device=state.device, dtype=torch.float32)
+    recovery_similarity = torch.nn.functional.cosine_similarity(state, recovery, dim=0)
+    persistence_similarity = torch.nn.functional.cosine_similarity(state, persistence, dim=0)
+    return float((persistence_similarity - recovery_similarity).item())
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -268,6 +305,8 @@ def generate_one(
     seed: int,
     random_boundary_rate: float,
     device: str,
+    risk_gate: dict[str, Any] | None,
+    first_high_entropy_only: bool,
 ) -> tuple[list[int], list[dict[str, Any]]]:
     import torch
 
@@ -276,6 +315,7 @@ def generate_one(
     past = None
     eos = tokenizer.eos_token_id
     injection_count = 0
+    first_high_entropy_seen = False
     for generation_step in range(max_new_tokens):
         input_ids = torch.tensor([ids], dtype=torch.long, device=device)
         attention_mask = torch.ones_like(input_ids)
@@ -290,19 +330,47 @@ def generate_one(
                 "injection_count_before": injection_count,
             }
             if condition != "vanilla":
-                entropy, baseline_logits = sink_masked_entropy(
-                    model, input_ids, attention_mask, sink_token_count
+                entropy, baseline_logits, state = sink_masked_entropy(
+                    model,
+                    input_ids,
+                    attention_mask,
+                    sink_token_count,
+                    hidden_state_layer=int(risk_gate["layer"]) if risk_gate is not None else None,
                 )
-                triggered = entropy >= entropy_threshold and injection_count < max_injections
+                high_entropy = entropy >= entropy_threshold
+                first_decision_available = not first_high_entropy_only or not first_high_entropy_seen
+                if high_entropy:
+                    first_high_entropy_seen = True
+                risk_score = None
+                risk_passed = True
+                if risk_gate is not None and high_entropy:
+                    if state is None:
+                        raise RuntimeError("Risk-gate state was not returned by entropy forward")
+                    risk_score = persistence_risk_score(state, risk_gate)
+                    risk_passed = risk_score > float(risk_gate["threshold"])
+                triggered = (
+                    high_entropy
+                    and first_decision_available
+                    and risk_passed
+                    and injection_count < max_injections
+                )
                 gate = soft_entropy_gate(entropy, entropy_threshold, gate_slope)
                 event.update(
                     {
                         "entropy": entropy,
                         "entropy_threshold": entropy_threshold,
                         "soft_gate": gate,
+                        "high_entropy": high_entropy,
+                        "first_high_entropy_decision_available": first_decision_available,
                         "entropy_triggered": triggered,
                     }
                 )
+                if risk_gate is not None:
+                    event.update({
+                        "persistence_risk_score": risk_score,
+                        "persistence_risk_threshold": float(risk_gate["threshold"]),
+                        "persistence_risk_passed": risk_passed if high_entropy else False,
+                    })
                 if condition in {"real_vector", "random_vector", "reversed_vector"}:
                     should_arm = triggered
                 elif condition == "random_boundary":
@@ -396,6 +464,24 @@ def main() -> None:
     artifact_model = artifact.get("reasoner", {}).get("model_name")
     if artifact_model != args.model:
         raise ValueError(f"Artifact model {artifact_model!r} differs from requested model {args.model!r}")
+    if args.use_artifact_entropy_threshold:
+        if args.entropy_threshold is not None:
+            raise ValueError("Specify either --entropy-threshold or --use-artifact-entropy-threshold, not both")
+        value = artifact.get("construction", {}).get("high_entropy_threshold")
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise ValueError("Artifact has no finite construction.high_entropy_threshold")
+        args.entropy_threshold = float(value)
+    if args.entropy_threshold is None or not math.isfinite(args.entropy_threshold):
+        raise ValueError("A finite --entropy-threshold or --use-artifact-entropy-threshold is required")
+    risk_gate = artifact.get("risk_gate") if args.risk_gate else None
+    if args.risk_gate:
+        if not isinstance(risk_gate, dict):
+            raise ValueError("--risk-gate requires an artifact with risk_gate metadata")
+        if int(risk_gate.get("layer", -1)) != args.layer:
+            raise ValueError("Risk-gate layer must equal --layer")
+        for key in ("recovery_center", "persistence_center", "threshold"):
+            if key not in risk_gate:
+                raise ValueError(f"Risk-gate artifact is missing {key}")
 
     manifest = load_manifest(args.split_manifest)
     if manifest.get("dataset", {}).get("revision") != args.dataset_revision:
@@ -468,6 +554,8 @@ def main() -> None:
                 seed=args.seed,
                 random_boundary_rate=args.random_boundary_rate,
                 device=args.device,
+                risk_gate=risk_gate,
+                first_high_entropy_only=args.first_high_entropy_only,
             )
             completion = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
             diagnosis = diagnose_gsm8k_completion(
@@ -567,6 +655,8 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "offset": args.offset,
             "random_boundary_rate": args.random_boundary_rate,
+            "risk_gate": args.risk_gate,
+            "first_high_entropy_only": args.first_high_entropy_only,
             "seed": args.seed,
             "attn_implementation": args.attn_implementation,
         },

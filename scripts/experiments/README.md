@@ -65,26 +65,31 @@ Teacher/Reviewer 记录、模型或 provenance 已变化的记录会在 `--resum
 和 `quarantined` 仅保留用于审计、误差分析或未来扩充稀缺类别。这里的 `AI review` 不得
 在论文或实验报告中表述为人工审核。
 
-当前正式的 Phase 2 主路径不再调用新的 AI。它重放正式 bank 中原始 student 轨迹的
-sink-masked attention entropy，只从高熵 reasoning boundary 构造 vector：成功 target 在下一
-boundary 降到低熵的是 `successful_recovery`，失败 reference 在下一 boundary 仍未收敛的是
-`failed_persistence`。它分别编译两种 artifact：当前状态的中心差，以及从当前 boundary 到
-下一 boundary 的恢复位移差。未来 entropy 仅用于离线标签；在线仍只根据当前 entropy 触发。
-Teacher / Pro 文本绝不输入 student，也不参与此阶段的新标注。
+当前正式的 Phase 2 主路径不再调用新的 AI。它只读取 `ai_approved_bank_records.jsonl`
+作为质量闸门，并按 `experience_id` 连接 `verified_experiences.jsonl` 中的原始 student
+`context`、成功 `trajectory` 与失败 `reference_trajectory`。Teacher / Pro 的自然语言经验、
+证据与机制描述不会输入 student，也不参与新的 Phase 2 标注。
 
-每个可用 artifact 都独立在 `calibration-val` 的 tune 子集校准 layer、alpha、soft-gate
-slope 与注入预算，随后在同一 split 的独立 confirmation 子集运行 vanilla、entropy-only、
-真实 vector、随机 boundary、同范数随机 vector 和反转 vector 六个对照。汇总文件仅用于
-描述比较，明确禁止据此自动选择最终方法；进入后续阶段仍需独立冻结评测。运行时只需传入
-冻结的 Phase 1 目录：
+下一轮采用最小的两阶段设计。第一阶段在固定第 24 层重放两侧原始轨迹的 sink-masked
+entropy，并将所有高熵边界按下一边界的熵分为 `recovery` / `persistence`；它完整报告
+`target/reference × recovery/persistence` 四格表。bank 按 `experience_id` 切为 train 与
+held-out，只有 held-out ROC-AUC 达到预设要求时，才从 bank-train 的两个状态中心编译一个
+`recovery − persistence` state vector。未来 entropy 只用于离线标签。
+
+第二阶段不再搜索 layer、vector 类型、alpha、slope 或注入次数：固定在第 24 层、固定
+`alpha=0.05`、固定 entropy soft-gate slope `0.10`、每条生成最多一次。在线仅在**第一个**
+高熵边界同时满足“更像 persistence 而非 recovery”的当前 hidden-state 风险分数时才注入。
+评测使用从未参与任何选择的 `dev-test`，比较 vanilla、entropy-only、真实向量、同范数
+随机向量及反向向量，并核验各条件首个决策前缀完全一致。
+
+运行时只需传入冻结的 Phase 1 目录：
 
 ```bash
-bash scripts/experiments/gsm8k/run_phase2_entropy_recovery.sh \
+bash scripts/experiments/gsm8k/run_phase2_entropy_risk_probe.sh \
   /absolute/path/to/gsm8k_phase1_verified-student-contrast_<tag>
 ```
 
-初始默认使用 100 个 tune + 100 个 confirmation 样本，避免在发现架构/环境错误前占用
-整段 GPU 时间。成功后可仅在服务器 `.server.env` 中提高 `MEMGEN_PHASE2_TUNE_SIZE` 和
-`MEMGEN_PHASE2_CONFIRM_SIZE`；不要改动已提交脚本。正式 vector 只使用
-`answer_correctness` evidence；`format_compliance` 等类型保留给后续条件化/类型化实验，
-避免格式监督淹没主推理向量。
+默认使用完整 bank 做离线风险诊断、`dev-test` 的前 100 题做在线 smoke probe。风险诊断不
+通过会在生成 vector 前停止；不要通过降低 AUC 门槛来强行进入在线实验。正式 vector 只使用
+`answer_correctness` evidence；`format_compliance` 等类型保留给后续条件化/类型化实验，避免
+格式监督淹没主推理向量。

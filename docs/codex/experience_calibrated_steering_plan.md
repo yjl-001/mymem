@@ -92,13 +92,13 @@ target 和 reference 的价值不是“正负文本装饰”，而是将可复�
 的失败模式区分开。reference 必须是 verified failure，或单独标记为不可用于正式
 实验的 `teacher_inferred`。
 
-### 4.2 条件匹配的 entropy-recovery artifact
+### 4.2 条件匹配的 entropy-risk artifact
 
-每个经验簇 `k`、每个候选 layer `l` 保存：
+最小探针只保存固定 layer `l=24` 的一个 artifact：
 
 ```text
 memory_id, cluster_id, layer, boundary_definition,
-vector S[k,l], vector_rms, evidence_count,
+vector S[l], recovery/persistence prototypes, vector_rms, evidence_count,
 reasoner_model_revision, tokenizer_revision,
 source_episode_ids, target/reference provenance,
 construction_config, calibration_statistics
@@ -108,23 +108,25 @@ construction_config, calibration_statistics
 与在线 gate 的状态条件匹配：仅保留 sink-masked attention entropy 高于 bank-source 分位数
 阈值 \(\tau_H\) 的 reasoning boundary。强教师/Pro 不参与 Phase 2 的新标注。
 
-对成功 target，只有高熵后下一 reasoning boundary 下降到低阈值 \(\tau_L\) 的状态记为
-`successful_recovery`；对失败 reference，只有高熵后仍未下降的状态记为
-`failed_persistence`。未来 boundary 仅用于离线构造标签，在线触发始终只使用当前 state。
+高熵后下一 reasoning boundary 下降到低阈值 \(\tau_L\) 的状态记为 `recovery`，否则记为
+`persistence`。此标签同时适用于成功 target 和失败 reference，并以四格表报告；不能预设
+最终答案结果与局部熵转移一一对应。bank 先按 `experience_id` 切分，原型仅由 bank-train
+构造，是否存在可用风险轴由 bank-heldout 的 ROC-AUC 决定。未来 boundary 仅用于离线标签，
+在线触发始终只使用当前 state。
 
 \[
-S_{\mathrm{state},l}=\operatorname{Mean}(h_{l,t}\mid\mathrm{successful\ recovery})
--\operatorname{Mean}(h_{l,t}\mid\mathrm{failed\ persistence}),
+S_l=\operatorname{Mean}(h_{l,t}\mid\mathrm{recovery,bank\text{-}train})
+-\operatorname{Mean}(h_{l,t}\mid\mathrm{persistence,bank\text{-}train}),
 \]
 
 \[
-S_{\mathrm{disp},l}=\operatorname{Mean}(h_{l,t'}-h_{l,t}\mid\mathrm{successful\ recovery})
--\operatorname{Mean}(h_{l,t'}-h_{l,t}\mid\mathrm{failed\ persistence}).
+R(h_t)=\cos(h_t,\mu_{\mathrm{persistence}})-\cos(h_t,\mu_{\mathrm{recovery}}).
 \]
 
-其中 \(t'\) 是 \(t\) 后的下一 reasoning boundary。该假设不是“高熵等于错误”，而是：
-若高熵状态之后存在可重复的成功收敛状态转移，则其方向应比最终答案收尾的单点差分更适合
-在同类在线状态中注入。若证据数不足，方法必须输出 unavailable，不得用额外 AI 补标。
+其中 \(t'\) 是 \(t\) 后的下一 reasoning boundary，\(R(h_t)>0\) 表示当前状态更像持续
+发散。该假设不是“高熵等于错误”，而是：只有当前 state 可预测局部 persistence 时，才值得
+注入一个朝 recovery 原型移动的方向。若证据数不足或 held-out AUC 不达标，方法必须停止，
+不得用额外 AI 补标或继续调参。
 
 ### 4.3 在线注入
 
@@ -140,8 +142,9 @@ H'_{l,t}=H_{l,t}+g_E(t)\,g_R(t,k)\,\alpha\,
 \]
 
 - \(g_E\)：sink-masked entropy 的软门控；
-- \(g_R\)：检索相关度；第一版全局 vector 时取 1；
-- \(\alpha\)：在 `calibration-val` 上选择的相对扰动强度。
+- \(g_R\)：当前 state 的 persistence-risk 门；本最小探针中为 \(\mathbb{1}[R(h_t)>0]\)，
+  而不是检索或另一个训练模型；
+- \(\alpha\)：本最小探针预先固定为 `0.05`，不按任务正确率搜索。
 
 注入位置为选定 Transformer layer 的 boundary token hidden state，影响后续层与
 next-token logits；不插入 token，也不重建既有 KV cache。
@@ -192,44 +195,47 @@ next-token logits；不插入 token，也不重建既有 KV cache。
 - 正式 bank 只包含所有关键 assessment 均为 supported 的记录；deferred、rejected 与 quarantined 均保留可追溯证据但不参与 vector 编译；
 - 出现自相矛盾、事实错误或 target/reference 等价的记录必须可被 Pro 审核拒绝并保留证据。
 
-### Phase 2：条件匹配的 entropy-recovery vector
+### Phase 2：最小化的 entropy-risk probe
 
-**目的**：先验证 residual intervention 是否有意义，不引入动态检索复杂度。
+**目的**：先区分“高熵但自然恢复”与“高熵后持续发散”，再验证单次定向 residual
+intervention；不再同时搜索 vector 类型、layer、强度、门控斜率与注入预算。
 
 **工作项**：
 
-- 冻结 `ai_approved` Phase 1 bank，不新增 teacher、reviewer 或人工归因；
-- 在每个 `\boxed` 前的 reasoning delimiter 重放与在线完全相同的 sink-masked attention
-  entropy，使用 bank-source 分位数定义高熵和低熵阈值；
-- 构造 `successful_recovery − failed_persistence` 的状态 vector 与恢复位移 vector；
-- 旧版的末尾单点 pair-delta、全局 centroid、机制平衡 centroid 与 SEAL-style 仅保留为
-  已完成的消融/不可用性证据，不作为本轮主假设；
-- 在 `calibration-val` 上选择 layer、alpha、soft-gate slope 和最大注入次数；
-- 实现 boundary layer hook、vector artifact load/save、完整 intervention trace。
+- 冻结 `ai_approved` Phase 1 bank，不新增 teacher、reviewer 或人工归因；正式 compiler 只重放
+  对应 `verified_experiences` 的原始成功/失败 student trajectories；
+- 在第 24 层、每个 `\boxed` 前 reasoning delimiter 重放 sink-masked attention entropy；高/低
+  阈值只由 bank-train 分位数确定；
+- 对 target（verified success）与 reference（verified failure）都标注高熵后的
+  `recovery/persistence`，报告完整四格表，而不是只保留其中对角线；
+- 以 `experience_id` 分割 bank-train / bank-heldout，从 train 构造 recovery/persistence 的状态
+  原型，以 held-out ROC-AUC 验证当前 state 是否可分；AUC 不达预设门槛则停止；
+- 只有诊断通过，才构造单一 `recovery − persistence` state vector，并以
+  `cos(h,persistence)-cos(h,recovery)>0` 作为在线风险门；
+- 在线固定第 24 层、`alpha=0.05`、soft-gate slope `0.10`、每轨迹最多一次；只在**第一个**
+  高熵边界作是否注入的决定。
 
 **必须对照**：
 
 1. vanilla；
-2. entropy gate 但不注入；
-3. 每个 boundary 注入真实 vector；
-4. 随机 boundary 注入真实 vector；
-5. entropy gate 注入同范数随机 vector；
-6. entropy gate 注入正负标签反转 vector。
+2. entropy + risk gate 但不注入；
+3. entropy + risk gate 注入真实 vector；
+4. 相同门控下的同范数随机 vector；
+5. 相同门控下的反转 vector。
 
-**产物**：`SteeringVectorArtifact`、校准报告、对照实验 JSONL、可一键复现实验脚本。
+**产物**：四格风险诊断报告、带 risk prototype 的 `SteeringVectorArtifact`、按 sample ID
+对齐的单次 intervention trace、`dev-test` probe 汇总。
 
 **验收标准**：
 
-- 真实 vector + entropy gate 在 `calibration-val` 上优于同范数随机向量与反转向量；
-- 真实 vector 的结果不能仅等价于“输出更短”：格式正确率不下降，且 accuracy/奖励
-  的变化方向优于随机对照；
-- 真实 vector 在实际注入后到下一个 candidate boundary 的 entropy 变化，必须优于
-  entropy-only、同范数随机 vector 与反转 vector；该中间指标仅记录后果，不参与在线触发；
-- 95% 以上的触发满足预设的相对扰动上限 `||ΔH|| / ||H|| <= r_max`；
+- held-out bank ROC-AUC 必须达到预设门槛（当前 `0.60`），且 train/held-out 两类事件均不少于
+  50；否则不进入在线阶段；
+- vanilla 与 entropy-only completion 必须完全一致；真实、随机、反向 vector 的首个决策前缀
+  必须一致；
+- 真实 vector 在实际注入后到下一个 candidate boundary 的 entropy 变化，必须优于 entropy-only、
+  同范数随机 vector 与反转 vector；该后果指标不参与在线触发；
+- 格式正确率不低于 vanilla，且没有 disabled/超限注入；准确率仅在上述机制标准满足后解释；
 - 发生 NaN、格式崩坏或超出扰动上限时自动禁用该次注入并留下 trace。
-
-> 数值的绝对通过线不在开发前伪造：`r_max`、alpha、layer 均只可在
-> `calibration-val` 确定，随后锁定并进入下一阶段。
 
 ### Phase 3：经验簇与轻量检索
 

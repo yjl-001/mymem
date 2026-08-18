@@ -6,8 +6,11 @@ import unittest
 from memgen.experience.phase1 import ROLLOUT_SCHEMA, build_verified_experiences
 from memgen.experience.phase2 import (
     approved_experiences,
+    binary_roc_auc,
+    deterministic_train_partition,
     entropy_quantile,
     entropy_recovery_label,
+    entropy_transition_label,
     last_completion_boundary,
     phase1_mechanism_cluster,
     select_calibration_winner,
@@ -136,6 +139,38 @@ class Phase2BoundaryAndGateTests(unittest.TestCase):
                 high_threshold=5.0, low_threshold=3.0,
             )
         )
+
+    def test_transition_label_keeps_the_four_cells_outcome_agnostic(self) -> None:
+        self.assertEqual(
+            entropy_transition_label(
+                current_entropy=5.0, next_entropy=3.0,
+                high_threshold=5.0, low_threshold=3.0,
+            ),
+            "recovery",
+        )
+        self.assertEqual(
+            entropy_transition_label(
+                current_entropy=5.0, next_entropy=3.5,
+                high_threshold=5.0, low_threshold=3.0,
+            ),
+            "persistence",
+        )
+        self.assertIsNone(
+            entropy_transition_label(
+                current_entropy=4.9, next_entropy=1.0,
+                high_threshold=5.0, low_threshold=3.0,
+            )
+        )
+
+    def test_risk_partition_and_auc_are_deterministic(self) -> None:
+        assigned = deterministic_train_partition("experience-1", seed=42, train_fraction=0.5)
+        self.assertEqual(
+            assigned,
+            deterministic_train_partition("experience-1", seed=42, train_fraction=0.5),
+        )
+        self.assertIsInstance(assigned, bool)
+        self.assertEqual(binary_roc_auc([0, 0, 1, 1], [0.1, 0.2, 0.8, 0.9]), 1.0)
+        self.assertEqual(binary_roc_auc([0, 1, 0, 1], [0.5, 0.5, 0.5, 0.5]), 0.5)
 
     def test_anchor_accepts_exact_equation_spans_but_rejects_final_box(self) -> None:
         experiences, _ = build_verified_experiences(
