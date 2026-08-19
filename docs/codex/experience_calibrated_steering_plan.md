@@ -229,12 +229,16 @@ intervention；不再同时搜索 vector 类型、layer、强度、门控斜率�
 **验收标准**：
 
 - held-out bank ROC-AUC 必须达到预设门槛（当前 `0.60`），且 train/held-out 两类事件均不少于
-  50；否则不进入在线阶段；
+  50；同时报告 PR-AUC、persistence 正类比例及其相对比例的提升；否则不进入在线阶段；
 - vanilla 与 entropy-only completion 必须完全一致；真实、随机、反向 vector 的首个决策前缀
   必须一致；
 - 真实 vector 在实际注入后到下一个 candidate boundary 的 entropy 变化，必须优于 entropy-only、
   同范数随机 vector 与反转 vector；该 entropy 必须从携带先前注入影响的 causal KV cache
   continuation 读取，不能由相同 token 文本重新无干预 forward 得到；该后果指标不参与在线触发；
+- 每个 entropy 对照都必须按 `sample_id` 配对，实际配对事件不少于 50，且
+  `ΔH_real − ΔH_control` 的 95% bootstrap CI 上界小于 0；只比较均值不构成通过；
+- 若先运行了 `dev-test` 的 smoke 前缀，确认实验只能使用未看过的剩余 offset，不能重新将已看过
+  的样本混入确认统计；
 - 格式正确率不低于 vanilla，且没有 disabled/超限注入；准确率仅在上述机制标准满足后解释；
 - 发生 NaN、格式崩坏或超出扰动上限时自动禁用该次注入并留下 trace。
 

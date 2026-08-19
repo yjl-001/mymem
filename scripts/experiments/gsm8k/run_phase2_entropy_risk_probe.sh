@@ -50,6 +50,7 @@ STUDENT_MODEL="$MEMGEN_GSM8K_STUDENT_MODEL"
 STUDENT_REVISION="${MEMGEN_GSM8K_STUDENT_REVISION:-main}"
 DATASET_REVISION="${MEMGEN_GSM8K_DATASET_REVISION:-main}"
 EVAL_ATTN="${MEMGEN_PHASE2_EVAL_ATTN_IMPLEMENTATION:-eager}"
+EVAL_OFFSET="${MEMGEN_PHASE2_RISK_EVAL_OFFSET:-0}"
 
 python scripts/compile_phase2_entropy_risk_vector.py \
   --approved-bank "$APPROVED_BANK" \
@@ -93,6 +94,7 @@ for CONDITION in vanilla entropy_only real_vector random_vector reversed_vector;
     --r-max "${MEMGEN_PHASE2_R_MAX:-0.10}" \
     --sink-token-count "${MEMGEN_PHASE2_SINK_TOKEN_COUNT:-4}" \
     --max-new-tokens "${MEMGEN_PHASE2_MAX_NEW_TOKENS:-768}" \
+    --offset "$EVAL_OFFSET" \
     --limit "${MEMGEN_PHASE2_RISK_EVAL_LIMIT:-100}" \
     --seed "${MEMGEN_PHASE2_SEED:-42}" \
     --device cuda \
@@ -104,6 +106,8 @@ done
 python scripts/summarize_phase2_entropy_risk_probe.py \
   --diagnostic-report "$VECTOR_DIR/entropy_risk_diagnostic_report.json" \
   --evaluation-root "$EVAL_DIR" \
+  --bootstrap-resamples "${MEMGEN_PHASE2_RISK_BOOTSTRAP_RESAMPLES:-10000}" \
+  --min-paired-events "${MEMGEN_PHASE2_RISK_MIN_PAIRED_EVENTS:-50}" \
   --output "$RUN_DIR/entropy_risk_probe_summary.json"
 
 echo "Phase 2 entropy-risk probe: $RUN_DIR"

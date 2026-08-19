@@ -393,6 +393,37 @@ def binary_roc_auc(labels: Sequence[int | bool], scores: Sequence[float]) -> flo
     return (positive_rank_sum - positives * (positives + 1) / 2.0) / (positives * negatives)
 
 
+def binary_average_precision(labels: Sequence[int | bool], scores: Sequence[float]) -> float:
+    """Compute tie-aware average precision for a binary, positive-class score."""
+
+    if len(labels) != len(scores) or not labels:
+        raise ValueError("labels and scores must be non-empty and have the same length")
+    pairs = [(bool(label), float(score)) for label, score in zip(labels, scores)]
+    if not all(math.isfinite(score) for _, score in pairs):
+        raise ValueError("scores must be finite")
+    positives = sum(label for label, _ in pairs)
+    if positives == 0:
+        raise ValueError("Average precision requires at least one positive label")
+    ordered = sorted(pairs, key=lambda item: item[1], reverse=True)
+    true_positives = 0
+    false_positives = 0
+    average_precision = 0.0
+    index = 0
+    while index < len(ordered):
+        end = index + 1
+        while end < len(ordered) and ordered[end][1] == ordered[index][1]:
+            end += 1
+        group = ordered[index:end]
+        group_positives = sum(label for label, _ in group)
+        true_positives += group_positives
+        false_positives += len(group) - group_positives
+        if group_positives:
+            precision = true_positives / (true_positives + false_positives)
+            average_precision += (group_positives / positives) * precision
+        index = end
+    return average_precision
+
+
 def validate_evidence_anchor(
     payload: Mapping[str, Any], experience: Mapping[str, Any]
 ) -> list[str]:

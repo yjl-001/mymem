@@ -93,3 +93,9 @@ bash scripts/experiments/gsm8k/run_phase2_entropy_risk_probe.sh \
 通过会在生成 vector 前停止；不要通过降低 AUC 门槛来强行进入在线实验。正式 vector 只使用
 `answer_correctness` evidence；`format_compliance` 等类型保留给后续条件化/类型化实验，避免
 格式监督淹没主推理向量。
+
+确认时不改变任何干预参数：将 `.server.env` 中
+`MEMGEN_PHASE2_RISK_EVAL_OFFSET=100`、`MEMGEN_PHASE2_RISK_EVAL_LIMIT=0`，只运行未看过的
+`dev-test` 后缀。汇总会按 sample ID 对 real/control 的实际熵转移做 bootstrap CI；每个对照至少
+需要 50 个配对事件，且 CI 上界小于 0 才通过。bank-heldout 同时报告 ROC-AUC、PR-AUC 与
+persistence 正类比例，避免类别失衡下误读 PR-AUC。

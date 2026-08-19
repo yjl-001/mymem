@@ -6,6 +6,7 @@ import unittest
 from memgen.experience.phase1 import ROLLOUT_SCHEMA, build_verified_experiences
 from memgen.experience.phase2 import (
     approved_experiences,
+    binary_average_precision,
     binary_roc_auc,
     deterministic_train_partition,
     entropy_quantile,
@@ -171,6 +172,8 @@ class Phase2BoundaryAndGateTests(unittest.TestCase):
         self.assertIsInstance(assigned, bool)
         self.assertEqual(binary_roc_auc([0, 0, 1, 1], [0.1, 0.2, 0.8, 0.9]), 1.0)
         self.assertEqual(binary_roc_auc([0, 1, 0, 1], [0.5, 0.5, 0.5, 0.5]), 0.5)
+        self.assertEqual(binary_average_precision([0, 0, 1, 1], [0.1, 0.2, 0.8, 0.9]), 1.0)
+        self.assertEqual(binary_average_precision([0, 1, 0, 1], [0.5, 0.5, 0.5, 0.5]), 0.5)
 
     def test_anchor_accepts_exact_equation_spans_but_rejects_final_box(self) -> None:
         experiences, _ = build_verified_experiences(

@@ -32,6 +32,7 @@ from memgen.experience.phase2 import (
     PHASE2_ELIGIBLE_EXPERIENCE_TYPES,
     STEERING_VECTOR_ARTIFACT_SCHEMA,
     approved_experiences,
+    binary_average_precision,
     binary_roc_auc,
     build_gsm8k_messages,
     deterministic_train_partition,
@@ -328,7 +329,7 @@ def main() -> None:
         if counts.get(label, 0) < args.min_events_per_label
     ]
     base_report = {
-        "schema_version": "phase2-entropy-risk-diagnostic-v1",
+        "schema_version": "phase2-entropy-risk-diagnostic-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "selected_pair_count": len(selected), "context_eligible_pair_count": len(pairs),
         "candidate_boundary_count": len(all_entropies),
@@ -381,6 +382,8 @@ def main() -> None:
     ]
     heldout_labels = [event.label == "persistence" for event in holdout_events]
     auc = binary_roc_auc(heldout_labels, heldout_scores)
+    persistence_prevalence = sum(heldout_labels) / len(heldout_labels)
+    average_precision = binary_average_precision(heldout_labels, heldout_scores)
     predicted = [score > 0.0 for score in heldout_scores]
     positives = sum(heldout_labels)
     negatives = len(heldout_labels) - positives
@@ -390,6 +393,9 @@ def main() -> None:
         "risk_score": "cosine(current,persistence_center) - cosine(current,recovery_center)",
         "risk_threshold": 0.0,
         "heldout_roc_auc": auc,
+        "heldout_average_precision": average_precision,
+        "heldout_persistence_prevalence": persistence_prevalence,
+        "heldout_average_precision_lift_over_prevalence": average_precision - persistence_prevalence,
         "heldout_balanced_accuracy_at_zero": 0.5 * (true_positive / positives + true_negative / negatives),
         "heldout_event_count": len(holdout_events),
         "heldout_persistence_count": positives,
