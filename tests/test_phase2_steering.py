@@ -12,9 +12,11 @@ from memgen.experience.phase2 import (
     entropy_quantile,
     entropy_recovery_label,
     entropy_transition_label,
+    leave_one_out_nearest_cosines,
     last_completion_boundary,
     phase1_mechanism_cluster,
     select_calibration_winner,
+    select_max_cosine_event_pair,
     soft_entropy_gate,
     stable_uniform,
     validate_evidence_anchor,
@@ -174,6 +176,19 @@ class Phase2BoundaryAndGateTests(unittest.TestCase):
         self.assertEqual(binary_roc_auc([0, 1, 0, 1], [0.5, 0.5, 0.5, 0.5]), 0.5)
         self.assertEqual(binary_average_precision([0, 0, 1, 1], [0.1, 0.2, 0.8, 0.9]), 1.0)
         self.assertEqual(binary_average_precision([0, 1, 0, 1], [0.5, 0.5, 0.5, 0.5]), 0.5)
+
+    def test_conditional_action_pairing_is_max_similarity_and_stably_tied(self) -> None:
+        selected = select_max_cosine_event_pair(
+            [(4, [1.0, 0.0]), (2, [0.0, 1.0])],
+            [(7, [1.0, 0.0]), (3, [0.0, 1.0])],
+        )
+        self.assertEqual(selected, (2, 3, 1.0))
+        nearest = leave_one_out_nearest_cosines([[1.0, 0.0], [0.0, 1.0], [0.9, 0.1]])
+        self.assertEqual(len(nearest), 3)
+        self.assertAlmostEqual(nearest[0], 0.9938837347)
+        self.assertAlmostEqual(nearest[1], 0.1104315261)
+        self.assertAlmostEqual(nearest[2], 0.9938837347)
+        self.assertIsNone(select_max_cosine_event_pair([], [(1, [1.0, 0.0])]))
 
     def test_anchor_accepts_exact_equation_spans_but_rejects_final_box(self) -> None:
         experiences, _ = build_verified_experiences(

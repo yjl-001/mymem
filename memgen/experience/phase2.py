@@ -351,6 +351,59 @@ def entropy_transition_label(
     return "recovery" if next_entropy <= low_threshold else "persistence"
 
 
+def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    """Return cosine similarity for two finite, non-zero hidden-state vectors."""
+
+    if len(left) != len(right) or not left:
+        raise ValueError("vectors must be non-empty and have the same length")
+    left_values = [float(value) for value in left]
+    right_values = [float(value) for value in right]
+    if not all(math.isfinite(value) for value in [*left_values, *right_values]):
+        raise ValueError("vectors must be finite")
+    left_norm_sq = sum(value * value for value in left_values)
+    right_norm_sq = sum(value * value for value in right_values)
+    if left_norm_sq <= 0.0 or right_norm_sq <= 0.0:
+        raise ValueError("vectors must have non-zero norm")
+    return sum(left_value * right_value for left_value, right_value in zip(left_values, right_values)) / math.sqrt(
+        left_norm_sq * right_norm_sq
+    )
+
+
+def select_max_cosine_event_pair(
+    reference_events: Sequence[tuple[int, Sequence[float]]],
+    target_events: Sequence[tuple[int, Sequence[float]]],
+) -> tuple[int, int, float] | None:
+    """Choose one deterministic reference-persistence/target-recovery pair.
+
+    Candidates are keyed by boundary rank.  The highest cross-trajectory cosine
+    pair is selected; ties use the earlier reference boundary and then earlier
+    target boundary.  This is intentionally outcome-independent beyond the
+    frozen transition labels that formed the two input sets.
+    """
+
+    best: tuple[int, int, float] | None = None
+    for reference_rank, reference_state in reference_events:
+        for target_rank, target_state in target_events:
+            score = cosine_similarity(reference_state, target_state)
+            candidate = (int(reference_rank), int(target_rank), score)
+            if best is None or score > best[2] or (
+                score == best[2] and candidate[:2] < best[:2]
+            ):
+                best = candidate
+    return best
+
+
+def leave_one_out_nearest_cosines(keys: Sequence[Sequence[float]]) -> list[float]:
+    """Return each key's nearest cosine neighbour, excluding itself."""
+
+    if len(keys) < 2:
+        return []
+    return [
+        max(cosine_similarity(key, other) for other_index, other in enumerate(keys) if other_index != index)
+        for index, key in enumerate(keys)
+    ]
+
+
 def deterministic_train_partition(identifier: str, *, seed: int, train_fraction: float) -> bool:
     """Return a stable per-experience train/holdout assignment.
 

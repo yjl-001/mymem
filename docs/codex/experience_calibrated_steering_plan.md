@@ -464,12 +464,17 @@ injection_applied, generation_length, final_reward, output_path
 - Phase 2 causal-cache 确认实验：真实全局 `recovery − persistence` vector 在 140 个配对事件上
   未优于 entropy-only、随机或反转对照，且相对反转向量显著更差；全局 centroid action 分支
   已关闭，详见本文件的 Phase 2 负结果；
-- 下一版仅保留风险 gate，提出了尚未实现的 H3：student-state top-1 检索式、条件化 recovery
-  displacement action，且已规定 split、对照、停止规则与确认门槛；
+- 下一版仅保留风险 gate，提出了尚未实现的 H3：student-state top-1 检索式、同题
+  reference-persistence → target-recovery local-contrast action，且已规定 split、对照、停止规则与
+  确认门槛；
+- H3 的只读可行性审计脚本：重放冻结轨迹并统计同一 `experience_id` 内的
+  reference-persistence → target-recovery local-contrast candidates、对齐相似度、action RMS 与
+  leave-one-out 检索阈值；它不生成回答、不注入向量，也不调用 AI；
 
 尚未完成：
 
 - 审计未看过的 `calibration-val` / evaluation 剩余 split，并预注册 H3 的开发集和独立确认集；
-- 对 H3 的经验级 key/action 定义做设计审查；通过前不实现、不调参、不重跑全局向量；
+- 在服务器上运行 H3 的只读 action-bank 可行性审计；根据候选数量决定是否有条件进入 H3
+  intervention 实现，不能放宽同题 pair 条件来凑样本；
 - H3 通过机制验证后才进行冻结配置的最终评测；
 - MI side-KV bank 实现。

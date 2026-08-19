@@ -99,3 +99,17 @@ bash scripts/experiments/gsm8k/run_phase2_entropy_risk_probe.sh \
 `dev-test` 后缀。汇总会按 sample ID 对 real/control 的实际熵转移做 bootstrap CI；每个对照至少
 需要 50 个配对事件，且 CI 上界小于 0 才通过。bank-heldout 同时报告 ROC-AUC、PR-AUC 与
 persistence 正类比例，避免类别失衡下误读 PR-AUC。
+
+全局 `recovery − persistence` vector 已在独立确认中失败，不能继续调参或扩大运行。下一步仅可先做
+H3 的**离线**条件化 action 可行性审计：它不生成回答、不注入向量、不调用 AI，而是统计同一
+`experience_id` 内可形成的 reference-persistence → target-recovery pairs、state 对齐相似度、
+action RMS 与 leave-one-out 检索覆盖率。
+
+```bash
+bash scripts/experiments/gsm8k/run_phase2_conditional_action_audit.sh \
+  /absolute/path/to/gsm8k_phase1_verified-student-contrast_<tag>
+```
+
+审计报告为 `conditional_action_feasibility_report.json`。若 bank-train action 少于两个，脚本仍会
+写出报告并标记 `insufficient_train_candidates_for_threshold`；这属于 H3 定义的可行性负结果，不应通过
+放宽 target/reference 配对条件来绕过。
