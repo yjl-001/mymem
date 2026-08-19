@@ -9,6 +9,7 @@ adds a bounded residual only to the hidden state of a triggered delimiter.
 from __future__ import annotations
 
 import argparse
+import copy
 from datetime import datetime, timezone
 import json
 import math
@@ -203,25 +204,59 @@ def is_delimiter(tokenizer: Any, token_id: int) -> bool:
     )
 
 
-def sink_masked_entropy(
+def clone_past_key_values(past_key_values: Any) -> Any:
+    """Clone a cache before a read-only entropy probe advances it by one token.
+
+    Hugging Face dynamic caches are mutable.  The entropy probe must therefore
+    consume a clone: the original cache remains the pre-boundary state that an
+    armed residual hook will consume on its counterfactual branch.
+    """
+
+    if past_key_values is None:
+        return None
+    try:
+        legacy = past_key_values.to_legacy_cache()
+        from_legacy = getattr(type(past_key_values), "from_legacy_cache", None)
+        if callable(from_legacy):
+            cloned_legacy = tuple(
+                tuple(value.clone() if hasattr(value, "clone") else copy.deepcopy(value) for value in layer)
+                for layer in legacy
+            )
+            return from_legacy(cloned_legacy)
+    except (AttributeError, NotImplementedError, TypeError, ValueError):
+        pass
+    try:
+        return copy.deepcopy(past_key_values)
+    except Exception as exc:  # pragma: no cover - model/cache implementation dependent
+        raise RuntimeError("Unable to clone past_key_values for the causal entropy probe") from exc
+
+
+def cached_sink_masked_entropy_probe(
     model: Any,
     input_ids: Any,
     attention_mask: Any,
     sink_count: int,
     *,
+    past_key_values: Any,
     hidden_state_layer: int | None = None,
-) -> tuple[float, Any, Any | None]:
-    """Compute the FlashMem-style last-layer entropy without leading sinks."""
+) -> tuple[float, Any, Any | None, Any]:
+    """Probe one boundary through its actual cached continuation.
+
+    Unlike a fresh full-prefix pass, this retains all prior residual injections
+    in the cache.  The returned model output is an unmodified continuation on
+    a cloned cache and can be reused directly when no injection is selected.
+    """
 
     import torch
 
     with torch.inference_mode():
         output = model(
-            input_ids=input_ids,
+            input_ids=input_ids[:, -1:],
             attention_mask=attention_mask,
             output_attentions=True,
             output_hidden_states=hidden_state_layer is not None,
-            use_cache=False,
+            past_key_values=clone_past_key_values(past_key_values),
+            use_cache=True,
             return_dict=True,
         )
     attentions = output.attentions
@@ -233,9 +268,10 @@ def sink_masked_entropy(
     valid_positions = attention_mask[0].nonzero(as_tuple=True)[0]
     if valid_positions.numel() < 2:
         raise ValueError("Need at least two valid tokens for entropy")
-    query_index = int(valid_positions[-1].item())
-    raw = attentions[-1][0, :, query_index, :].float()
+    raw = attentions[-1][0, :, -1, :].float()
     keys = valid_positions[sink_count:]
+    if raw.shape[-1] != valid_positions.numel():
+        raise RuntimeError("Cached attention key length does not match the full attention mask")
     if keys.numel() == 0:
         raise ValueError("Sink mask removed every attention key")
     probs = raw.index_select(1, keys)
@@ -255,7 +291,7 @@ def sink_masked_entropy(
         if output.hidden_states is None or hidden_state_layer >= len(output.hidden_states):
             raise RuntimeError("Model hidden states do not cover the risk-gate layer")
         state = output.hidden_states[hidden_state_layer][0, -1, :].detach().float()
-    return value, output.logits[:, -1, :].detach().float(), state
+    return value, output.logits[:, -1, :].detach().float(), state, output
 
 
 def persistence_risk_score(state: Any, risk_gate: dict[str, Any]) -> float:
@@ -321,6 +357,7 @@ def generate_one(
         attention_mask = torch.ones_like(input_ids)
         event: dict[str, Any] | None = None
         baseline_logits = None
+        probe_output = None
         should_arm = False
         gate = 0.0
         if generation_step > 0 and is_delimiter(tokenizer, ids[-1]):
@@ -330,11 +367,12 @@ def generate_one(
                 "injection_count_before": injection_count,
             }
             if condition != "vanilla":
-                entropy, baseline_logits, state = sink_masked_entropy(
+                entropy, baseline_logits, state, probe_output = cached_sink_masked_entropy_probe(
                     model,
                     input_ids,
                     attention_mask,
                     sink_token_count,
+                    past_key_values=past,
                     hidden_state_layer=int(risk_gate["layer"]) if risk_gate is not None else None,
                 )
                 high_entropy = entropy >= entropy_threshold
@@ -358,6 +396,7 @@ def generate_one(
                 event.update(
                     {
                         "entropy": entropy,
+                        "entropy_measurement": "cached_continuation",
                         "entropy_threshold": entropy_threshold,
                         "soft_gate": gate,
                         "high_entropy": high_entropy,
@@ -385,25 +424,30 @@ def generate_one(
                     )
             else:
                 event["entropy_triggered"] = False
-        if should_arm:
-            hook.arm(alpha=alpha, gate=gate)
+        hook_result = None
+        if probe_output is not None and not should_arm:
+            # Reusing this output preserves the actual cached state whose
+            # attention supplied the entropy/risk decision.
+            output = probe_output
         else:
+            if should_arm:
+                hook.arm(alpha=alpha, gate=gate)
+            else:
+                hook.disarm()
+            model_kwargs: dict[str, Any] = {
+                "attention_mask": attention_mask,
+                "use_cache": True,
+                "return_dict": True,
+            }
+            if past is None:
+                model_kwargs["input_ids"] = input_ids
+            else:
+                model_kwargs["input_ids"] = input_ids[:, -1:]
+                model_kwargs["past_key_values"] = past
+            with torch.inference_mode():
+                output = model(**model_kwargs)
+            hook_result = hook.last_result if should_arm else None
             hook.disarm()
-
-        model_kwargs: dict[str, Any] = {
-            "attention_mask": attention_mask,
-            "use_cache": True,
-            "return_dict": True,
-        }
-        if past is None:
-            model_kwargs["input_ids"] = input_ids
-        else:
-            model_kwargs["input_ids"] = input_ids[:, -1:]
-            model_kwargs["past_key_values"] = past
-        with torch.inference_mode():
-            output = model(**model_kwargs)
-        hook_result = hook.last_result if should_arm else None
-        hook.disarm()
         if event is not None:
             event["injection"] = hook_result or {"applied": False}
             if hook_result and hook_result.get("applied"):

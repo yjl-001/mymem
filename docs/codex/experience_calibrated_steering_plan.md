@@ -233,7 +233,8 @@ intervention；不再同时搜索 vector 类型、layer、强度、门控斜率�
 - vanilla 与 entropy-only completion 必须完全一致；真实、随机、反向 vector 的首个决策前缀
   必须一致；
 - 真实 vector 在实际注入后到下一个 candidate boundary 的 entropy 变化，必须优于 entropy-only、
-  同范数随机 vector 与反转 vector；该后果指标不参与在线触发；
+  同范数随机 vector 与反转 vector；该 entropy 必须从携带先前注入影响的 causal KV cache
+  continuation 读取，不能由相同 token 文本重新无干预 forward 得到；该后果指标不参与在线触发；
 - 格式正确率不低于 vanilla，且没有 disabled/超限注入；准确率仅在上述机制标准满足后解释；
 - 发生 NaN、格式崩坏或超出扰动上限时自动禁用该次注入并留下 trace。
 
