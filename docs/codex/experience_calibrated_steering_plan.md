@@ -292,29 +292,53 @@ alpha 或符号来挽救它；反转向量也不得事后改作 treatment。风�
 **目的**：检验失败的全局均值方向能否被一个严格条件化的、检索到的经验动作替代。此处
 尚是研究设计，不构成实现授权。
 
-**最小假设 H3**：若在线状态 $q$ 同时满足高熵与 $R(q)>0$，则它与某个已验证 failure
-persistence state 的 student-space 相似性，可选择与该经验相配套的 successful recovery
-displacement；这个局部动作比任意同尺度扰动更能降低下一 candidate boundary 的熵。
+**最小假设 H3**：若在线状态 $q$ 同时满足高熵与 $R(q)>0$，其与一个已验证
+reference-persistence state 的 student-space 相似性，可选择该**同一经验**中与之对齐的
+target-recovery state，构成局部 counterfactual correction。这个 action 比无注入、反向 action
+和破坏匹配关系后的 action 更能降低下一 candidate boundary 的熵。
 
-对每条候选经验 $i$，仅当同一 `experience_id` 中同时存在可审计的 reference persistence
-事件和 target recovery 事件时，构造：
+这里明确不用 `h^{target}_{u'}-h^{target}_{u}`：它含有成功轨迹正常的 token-to-token
+演化，未与 reference failure 对比，因而更像语言生成过程中的时间位移，而不是纠偏动作。
 
-\[
-k_i=h^{\mathrm{reference}}_{24,t_i},\qquad
-a_i=h^{\mathrm{target}}_{24,u'_i}-h^{\mathrm{target}}_{24,u_i},
-\]
-
-其中 $t_i$ 是 reference 的高熵后持续事件，$u_i\rightarrow u'_i$ 是 target 的高熵后
-自然恢复事件。在线只做 student hidden-state 的 top-1 cosine 检索：
+对每个 `experience_id`，从 reference 的高熵 `persistence` 事件集合与 target 的高熵
+`recovery` 事件集合中，选择 hidden-state cosine 相似度最高的一对；相同相似度时选择更早的
+reference boundary，再选择更早的 target boundary。每个经验仅保留这一对：
 
 \[
-i^*=\arg\max_i\cos(q,k_i),\qquad
-H'_{24}=H_{24}+0.05\operatorname{RMS}(H_{24})\widehat{a}_{i^*}.
+(t_i,u_i)=\arg\max_{t\in P_i,\,u\in C_i}
+\cos\bigl(h^{\mathrm{reference}}_{24,t},h^{\mathrm{target}}_{24,u}\bigr),
 \]
 
-这不是把相似性或 observation 当作因果证明：$a_i$ 仍是一个待证伪的 action candidate。
-它相对全局 `S` 的唯一新主张是**状态条件化**——用相近的失败状态选择相应成功轨迹中实际发生的
-局部状态位移，而不平均不同机制和推理阶段。
+\[
+k_i=\operatorname{norm}\bigl(h^{\mathrm{reference}}_{24,t_i}\bigr),\qquad
+a_i=\operatorname{norm}\bigl(h^{\mathrm{target}}_{24,u_i}-h^{\mathrm{reference}}_{24,t_i}\bigr).
+\]
+
+其中 $P_i$ 是 reference persistence 事件，$C_i$ 是 target recovery 事件。$k_i$ 是
+“将持续发散的局部状态”的检索键，$a_i$ 则是同题成功/失败局部状态之间的对比方向；它不是
+已知因果真值，而是待验证的 action candidate。这样做避免用 boundary rank 或文本相似度做
+事后对齐，也避免不同经验、不同推理阶段的全局平均。
+
+在线只做 student hidden-state 的 top-1 cosine 检索：
+
+\[
+i^*=\arg\max_i\cos\bigl(\operatorname{norm}(q),k_i\bigr),\qquad
+H'_{24}=H_{24}+0.05\operatorname{RMS}(H_{24})a_{i^*}.
+\]
+
+若没有候选 action，或 top-1 相似度低于只由 bank-train 的 leave-one-out key-neighbour
+similarity 分布预先确定的阈值，则 abstain。高熵门和风险门均为二元条件；本最小实验**不再**
+乘 soft entropy gate，以免引入额外强度变量。
+
+阈值的唯一允许定义为：对每个 bank-train key 取其 leave-one-out 最近邻相似度，令
+
+\[
+\tau_{\mathrm{sim}}=Q_{0.05}\left\{
+\max_{j\ne i}\cos(k_i,k_j)\right\}_{i\in\mathrm{bank\text{-}train}}.
+\]
+
+在线 query 的 top-1 分数必须不低于 \(\tau_{\mathrm{sim}}\)。该规则只描述 bank 内邻域的
+覆盖范围，不使用答案、熵恢复结果或任何在线任务指标选择阈值。
 
 **预先固定的最小设计**：
 
@@ -322,19 +346,28 @@ H'_{24}=H_{24}+0.05\operatorname{RMS}(H_{24})\widehat{a}_{i^*}.
   文本 embedding 或人工归因；
 - 保持 layer `24`、熵 85% 分位数、风险门 $R(q)>0$、首个候选边界、每样本最多一次、
   安全归一化 `alpha=0.05`，并以真实 causal KV-cache continuation 读取下一个边界熵；
-- 检索仅在该 gate 已触发时发生；若候选池为空或 top-1 相似度低于**仅由 bank-train** 确定的
-  阈值，则 abstain，不注入；不搜索 layer、alpha、符号、top-k 或阈值；
-- 先按 `experience_id` 切分：bank-train 形成 action pool、prototype 与相似度阈值；bank-heldout
-  在配置冻结后仅报告候选覆盖率及 top-1 相似度分布，不能反向改变 action 定义或阈值；在线
-  开发/确认集均不得与这些构造样本重叠。
+- 检索仅在该 gate 已触发时发生；若候选池为空或 top-1 相似度低于 $\tau_{\mathrm{sim}}$，则
+  abstain，不注入；不搜索 layer、alpha、符号、top-k 或阈值；
+- 先按 `experience_id` 切分：bank-train 形成 action pool、风险 prototype 与
+  $\tau_{\mathrm{sim}}$；bank-heldout 在配置冻结后仅报告候选覆盖率、同题 pair 对齐相似度及
+  top-1 检索相似度分布，不能反向改变 action 定义或阈值；在线开发/确认集均不得与这些构造样本
+  重叠；
+- 代码实现前先运行**纯离线可行性审计**：报告每个过滤步骤后剩余的唯一
+  `experience_id` 数、action RMS 分布、source/target 对齐相似度和 $\tau_{\mathrm{sim}}$。
+  action pool 最低规模尚未由现有统计确定；在看到这项审计前不得实现或将阈值事后放宽。
 
 **必要对照与判定**：保留同题、同一首次候选 boundary、相同风险 gate、最多一次的四组记录：
 
 1. `vanilla / entropy-only`：只记录触发与风险，不注入；两者的 completion 必须一致；
 2. `retrieved action`：使用 $a_{i^*}$；
 3. `reversed retrieved action`：使用 $-a_{i^*}$，检验方向依赖；
-4. `query-shuffled action`：以另一个已触发样本的 query 选择 action，保留 action 分布和范数、
-   破坏“当前状态—经验”的匹配关系，检验检索条件化而非任意扰动。
+4. `query-shuffled action`：先由 observation-only pass 为所有合格样本冻结真实 action id，
+   再以对 `sample_id` 的确定性 derangement 重排这些 action，保留 action 分布和范数、破坏
+   “当前状态—经验”的匹配关系，检验检索条件化而非任意扰动。
+
+所有 intervention condition 必须先复用同一份 observation-only assignment manifest：其中包含
+首次触发 boundary、风险分数、真实检索 action id、相似度和 abstain 原因。真实/反转/重排组只在
+这一个已冻结 boundary 改变 action；因此三组的注入前 prefix、触发集合和 action 范数可精确对齐。
 
 真实 action 必须在按 `sample_id` 配对、至少 50 个共同事件上，使
 `ΔH_retrieved − ΔH_control` 对每一项动作对照的 bootstrap 95% CI 上界都小于 0；同时不能损害
