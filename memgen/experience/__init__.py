@@ -27,6 +27,26 @@ from memgen.experience.phase2 import (
     stable_uniform,
     validate_evidence_anchor,
 )
+from memgen.experience.memory import (
+    ApprovedMemorySourceSelector,
+    MemoryArtifactAuditor,
+    MemoryBankBuilder,
+    MemoryRecord,
+    MemoryRecordCompiler,
+    MemoryRecordRejected,
+    MemorySanitizerConfig,
+    PayloadSanitizer,
+)
+from memgen.experience.retrieval import (
+    BM25Config,
+    BM25Hit,
+    BM25MemoryIndex,
+    RetrievalQuery,
+    RetrievalQueryBuilder,
+    RetrievalQueryConfig,
+    TextAnalyzer,
+    TextAnalyzerConfig,
+)
 
 __all__ = [
     "TEACHER_BANK_REQUIRED_FIELDS",
@@ -52,4 +72,20 @@ __all__ = [
     "soft_entropy_gate",
     "stable_uniform",
     "validate_evidence_anchor",
+    "ApprovedMemorySourceSelector",
+    "MemoryArtifactAuditor",
+    "BM25Config",
+    "BM25Hit",
+    "BM25MemoryIndex",
+    "MemoryBankBuilder",
+    "MemoryRecord",
+    "MemoryRecordCompiler",
+    "MemoryRecordRejected",
+    "MemorySanitizerConfig",
+    "PayloadSanitizer",
+    "RetrievalQuery",
+    "RetrievalQueryBuilder",
+    "RetrievalQueryConfig",
+    "TextAnalyzer",
+    "TextAnalyzerConfig",
 ]

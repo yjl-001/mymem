@@ -104,7 +104,7 @@ memory payload**，而不是只做 Phase 2 的质量标签。payload 仅允许�
 失败机制/警告信号；必须剔除原题、原始轨迹、`\boxed{}` 答案、原始 evidence quote 与实例特有数值。
 不再产生新的 Teacher/Pro 调用。
 
-下一轮尚未实现，因此目前没有新的服务器运行命令。实现顺序与实验门槛已固定：
+E0-v1 已进入实现与服务器机制审计阶段；E1 仍未实现。顺序与实验门槛固定为：
 
 1. E0：审计 payload 无泄漏，并验证 layer-24 canonical side-KV 能附加而不改写原 cache，且有非零
    memory attention mass；
@@ -113,6 +113,21 @@ memory payload**，而不是只做 Phase 2 的质量标签。payload 仅允许�
    相同 sample、prefix、触发位置和单次预算；
 3. 仅当 matched memory 相比 shuffled/gate-only 有配对因果证据且格式不受损时，才做 target/reference
    字段消融和随机位置时机消融，最后才进入 final-test。
+
+E0-v1 的实现入口现为：
+
+```bash
+bash scripts/experiments/gsm8k/run_e0_experience_memory.sh \
+  /absolute/path/to/phase1-run-dir
+```
+
+未传第二个参数时，脚本会从 Phase 1 split manifest 的 `calibration-val` 自动构造 answer-blind
+机制审计 prefixes；也可显式传入满足同一审计 schema 的 JSONL。
+
+`MEMGEN_E0_MAX_PAYLOAD_TOKENS` 必须在服务器的 `.server.env` 中显式冻结。若只需要先查看
+payload/BM25 的拒收率和长度分布，可临时设置 `MEMGEN_E0_TEXT_ONLY=1`；这种运行不包含 KV/cache
+机制审计，不能标记为正式 E0 通过。详细对象与 artifact 契约见
+[`e0_memory_side_kv_design.md`](../../docs/codex/e0_memory_side_kv_design.md)。
 
 下一 boundary 熵、logits KL、memory attention、检索分数和延迟均会记录为诊断；主要问题是模型是否
 利用了匹配的经验内容并改善最终任务表现，而不是是否单纯降低熵。完整规范见
