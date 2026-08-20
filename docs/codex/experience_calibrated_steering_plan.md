@@ -1,67 +1,65 @@
-# Experience-Calibrated Entropy-Gated Steering：实施计划与验收标准
+# Experience-Calibrated Entropy-Gated Memory：实施计划与验收标准
 
 ## 1. 目标与边界
 
-本计划验证一个训练无关、可审计的 latent-memory 原型：离线从**已验证**的
-历史推理经验中提取 target/reference steering vectors；在线仅在推理边界且
-sink-masked attention entropy 较高时，将相关向量以受控 residual intervention
-施加给冻结的 reasoner。
+本计划验证一个训练无关、可审计的**风险触发式经验记忆**原型。Phase 1 从已验证的
+成功/失败 rollout 中产生经 Pro 审核的经验抽象；在线阶段只在 reasoning boundary 出现高熵、且
+hidden state 显示可能持续发散时，检索语义相关的经验内容，并将其作为 side-KV memory 提供给
+冻结的 reasoner。
 
-它不是原始 MemGen Weaver 的替代结论，而是一个低工程复杂度的实验路线。MemGen
-保留生成循环、候选 boundary、预算和评测框架；FlashMem 风格熵负责候选触发；
-SEAL-style vector 是第一版的注入接口。后续可在不改变经验生命周期和选择器的
-前提下，把 vector integrator 替换为 Memory Inception（MI）side-KV integrator。
+核心问题不再是“能否用一个 vector 降低熵”，而是：
 
-本计划的核心可检验问题是：
+> 当风险 gate 触发时，相比同预算的随机/错配经验内容，语义匹配的 Phase 1 经验能否被模型
+> 实际注意和利用，并改善推理结果而不损害格式？
 
-> 相对于不注入、随机注入和随机向量，来自真实 target/reference 经验的 steering
-> vector 能否在高熵 reasoning boundary 带来稳定且非破坏性的收益？
+高熵和 risk score 只回答**何时值得请求帮助**，不等价于模型出错；下一 boundary 熵只是辅助
+诊断，低熵既不是正确性的定义，也不是本路线的必要中介目标。主结果依次是经验内容的因果
+利用、任务正确率及格式安全性。
 
-截至 2026-08-19，Phase 2 已以独立确认集否定其中最简单的一种答案：全局
-`recovery − persistence` 状态中心差可以识别局部风险，但不是有效的 residual
-**动作**。这不否定 Phase 1 bank 或风险识别器；下一步问题收窄为：在 gate 已识别
-“可能持续发散”的当前状态后，能否从状态相近、已验证的经验中检索到一个可用的
-条件化 action，而不是套用一个全局均值方向。
+截至 2026-08-20，Phase 2 已确认风险识别成立，但否定了两个“动作即 hidden residual
+direction”的候选：全局 `recovery − persistence` centroid action 在独立确认中无效；同题
+local-contrast action 虽有可构造样本，但 raw hidden-state 的 top-1 路由 margin 很小。因此二者
+均保留为可审计的负向探索，不再作为主方法。该结果不否定 Phase 1 bank、风险 gate 或“在风险时
+调用经验内容”的假设。
 
-本计划不宣称 zero-shot 或“无外部监督”：bank 构造使用训练期的、已验证的
-rollout；教师模型只在离线阶段参与反思、归类和质检。
+本计划不宣称 zero-shot 或“无外部监督”：bank 构造使用训练期已验证 rollout；Flash Teacher 和
+Pro Reviewer 仅在 Phase 1 离线归纳/质检，后续 Phase 2/3 不新增 AI 标注。
 
-本计划中 MemGen、FlashMem、SEAL 和 MI 的精确机制、训练边界与项目映射，统一见
+本计划中 MemGen、FlashMem、SEAL 和 MI 的机制、训练边界与项目映射见
 [前置方法：MemGen、FlashMem、SEAL 与 Memory Inception](method_prerequisites_memgen_flashmem_seal_mi.md)。
-下文仅引用其接口职责：MemGen 提供控制框架，FlashMem 提供候选熵门控，SEAL 提供
-Phase 2 的 residual-vector MVP，MI 是 Phase 5 的 side-KV 升级路径。
+MemGen 提供生成与预算框架，FlashMem 风格熵提供候选时机，MI side-KV 是当前的内容整合接口；
+SEAL-style residual vector 仅作为已完成的历史 ablation。
 
 ## 2. 总体架构
 
 ```text
-bank-source 训练样本
-        │
-        ├─ frozen student rollout ── verifier ──► verified success / failure episodes
-        │                                             │
-        │                                  strong teacher: abstract / cluster / pair
-        │                                             │
-        ▼                                             ▼
-  target/reference memory records ──► student-space compiler ──► latent artifacts
-                                                                    │
-在线 prompt + 已生成 CoT ──► boundary ─► sink-masked entropy gate ─► retrieve ─► integrate
+bank-source 样本 ── frozen student rollout ── verifier ──► verified success / failure
+                                                     │
+                              Flash Teacher + Pro ──► ai_approved experience abstraction
+                                                     │
+                                  payload audit ────► sanitized MemoryRecord + semantic index + side-KV
+
+在线 prompt + 已生成 CoT ──► boundary ─► entropy + hidden-risk gate
+                                             │
+                                    semantic query / retrieve MemoryRecord
+                                             │
+                                      SideKVIntegrator ─► frozen reasoner continuation
 ```
 
-在线控制由三个可独立替换的接口组成：
+在线控制由三个可独立检验的接口组成：
 
 ```python
-artifact = compiler.compile(memory_record, frozen_reasoner)
-selected = selector.select(runtime_state, artifact_store)
-runtime_state = integrator.apply(runtime_state, selected)
+memory = compiler.compile(sanitized_memory_record, frozen_reasoner)
+selected = retriever.select(question_and_partial_cot, memory_index)
+runtime_state = integrator.apply_side_kv(runtime_state, selected)
 ```
 
-第一版的具体实现分别为：
-
-- `SteeringVectorCompiler`：target/reference evidence → student hidden-space vector；
-- `EntropyRetrieverSelector`：boundary + entropy + relevance retrieval；
-- `ResidualVectorIntegrator`：在选定层的 boundary hidden state 加入受控向量。
-
-MI 阶段仅替换为 `KVBankCompiler` 与 `SideKVIntegrator`；经验数据、检索、门控、
-日志和实验切分保持不变。
+- `EntropyRiskTrigger`：只根据当前 boundary 的 sink-masked entropy 与 hidden-risk score 决定
+  是否请求经验；它不决定经验内容。
+- `SemanticMemoryRetriever`：以题目和固定窗口的 partial CoT 为 query，在 Phase 1 的可用经验中
+  检索；不得以 raw risk hidden state 的 top-1 取代语义检索。
+- `MemoryRecordCompiler` / `SideKVIntegrator`：将冻结经验文本预编码为 canonical side KV，并在
+  固定 layer 让当前 query attention 可见；不改变原 prompt/history cache。
 
 ## 3. 数据切分与反泄漏约束
 
@@ -69,94 +67,77 @@ MI 阶段仅替换为 `KVBankCompiler` 与 `SideKVIntegrator`；经验数据、�
 
 | Split | 用途 | 禁止事项 |
 |---|---|---|
-| `bank-source` | student rollout、verifier、教师归纳、构造 vector | 不用于阈值/超参选择 |
-| `calibration-val` | 选熵阈值、layer、alpha、retrieval 阈值 | 不写入 bank，不供教师查看 |
-| `dev-test`（可选） | 完整 pipeline 的小规模调试 | 不用于最终报告 |
-| `final-test` | 一次性最终评估 | 不供 bank、教师、任何超参选择使用 |
+| `bank-source` | rollout、verifier、教师归纳、MemoryRecord 与风险原型 | 不用于线上方法选择或最终评估 |
+| `calibration-val` | payload token budget、检索器/side-KV 可行性与固定阈值 | 不写入 bank，不供教师查看 |
+| `dev-test`（可选） | 只读调试或预注册开发实验 | 不用于最终报告 |
+| `final-test` | 一次性最终评估 | 不供 bank、教师、检索器、任何配置选择使用 |
 
 约束：
 
-1. 教师只读取 `bank-source` 的轨迹及 verifier feedback；绝不读取 test 问题或答案。
-2. `verified_success` 与 `verified_failure` 必须由确定性 verifier/reward 标记；教师
-   不能覆盖这一标签。
-3. 当前 GSM8K preview 的 `teacher_inferred` reference 仅用于 schema 检查，不可用于
-   正式 contrastive vector。
-4. 每条 memory record 必须保存 source split、episode id、model revision、rollout
-   configuration 和生成日期，以支持审计与复现。
+1. 教师只读取 `bank-source` 的轨迹及 verifier feedback，绝不读取 test 问题或答案。
+2. `verified_success` / `verified_failure` 必须由确定性 verifier/reward 标记，教师不能覆盖它。
+3. 正式 record 必须来自 `ai_approved`；`teacher_inferred`、rejected、deferred、quarantined 都不进
+   memory index。
+4. 每条 record 保存 source split、experience id、模型/rollout revision、审核结论和 payload hash。
+5. runtime payload 严禁携带原题、完整 target/reference trajectory、`\\boxed{}` 答案、原始 evidence
+   quote 或可复原当前实例答案的数值 literal；它只能携带经审核的、可泛化的经验抽象。
 
-## 4. Latent artifact 定义
+## 4. Artifact 定义
 
-### 4.1 原始经验记录
-
-```text
-context + trajectory/actions + outcome/reward + verifier feedback
-  → target: situation / decision / verification / applicability boundary
-  → reference: competing pattern / failure signal / failure mechanism / non-reuse boundary
-```
-
-target 和 reference 的价值不是“正负文本装饰”，而是将可复用成功行为与已经观察到
-的失败模式区分开。reference 必须是 verified failure，或单独标记为不可用于正式
-实验的 `teacher_inferred`。
-
-### 4.2 条件匹配的 entropy-risk artifact
-
-最小探针只保存固定 layer `l=24` 的一个 artifact：
+### 4.1 Phase 1 原始经验与可用记忆
 
 ```text
-memory_id, cluster_id, layer, boundary_definition,
-vector S[l], recovery/persistence prototypes, vector_rms, evidence_count,
-reasoner_model_revision, tokenizer_revision,
-source_episode_ids, target/reference provenance,
-construction_config, calibration_statistics
+context + target/reference trajectory + verifier feedback
+  → teacher abstraction + Pro evidence review
+  → ai_approved MemoryRecord
+  → sanitized retrieval key + contrast payload + side-KV
 ```
 
-向量由**目标 student 模型自身**生成，不能直接使用强教师的 hidden state。离线构造必须
-与在线 gate 的状态条件匹配：仅保留 sink-masked attention entropy 高于 bank-source 分位数
-阈值 \(\tau_H\) 的 reasoning boundary。强教师/Pro 不参与 Phase 2 的新标注。
+target 是已验证的成功策略/验证动作；reference 是已验证失败的机制、信号和避免条件。二者的
+价值在于定义一个可复用的决策边界，而非向在线 student 暴露成功答案或失败 CoT。
 
-高熵后下一 reasoning boundary 下降到低阈值 \(\tau_L\) 的状态记为 `recovery`，否则记为
-`persistence`。此标签同时适用于成功 target 和失败 reference，并以四格表报告；不能预设
-最终答案结果与局部熵转移一一对应。bank 先按 `experience_id` 切分，原型仅由 bank-train
-构造，是否存在可用风险轴由 bank-heldout 的 ROC-AUC 决定。未来 boundary 仅用于离线标签，
-在线触发始终只使用当前 state。
+首版 `MemoryRecord` 的 payload 采用固定对比模板：
 
-\[
-S_l=\operatorname{Mean}(h_{l,t}\mid\mathrm{recovery,bank\text{-}train})
--\operatorname{Mean}(h_{l,t}\mid\mathrm{persistence,bank\text{-}train}),
-\]
+```text
+When facing: <reviewed situation / applicability>
+Prefer: <target success decision or verification strategy>
+Avoid: <reference failure mechanism or warning signal>
+```
+
+payload audit 必须逐项证明三个字段存在、长度受预算约束、无答案泄漏/原始 quote/实例特有 literal，
+并保留 source `experience_id` 与审核证据用于离线追溯，但这些 provenance 不送入模型。
+
+### 4.2 entropy-risk gate artifact（保留）
+
+固定 layer `l=24`，只用 bank-train 的高熵事件形成 recovery/persistence 原型：
 
 \[
 R(h_t)=\cos(h_t,\mu_{\mathrm{persistence}})-\cos(h_t,\mu_{\mathrm{recovery}}).
 \]
 
-其中 \(t'\) 是 \(t\) 后的下一 reasoning boundary，\(R(h_t)>0\) 表示当前状态更像持续
-发散。该假设不是“高熵等于错误”，而是：当前 state 可以预测局部 persistence 时，它才是
-值得考虑干预的候选。风险识别不推导任何全局方向就是有效动作；动作的因果有效性必须单独
-测试。若证据数不足或 held-out AUC 不达标，方法必须停止，不得用额外 AI 补标或继续调参。
+高熵后下一 reasoning boundary 从高阈值自然降到低阈值记为 `recovery`，否则为 `persistence`。
+这只用于离线监督风险原型并在 held-out bank 评估可分性；在线始终只读取当前 state。`R(h_t)>0`
+表示“更像会持续”的候选，不能被表述为“确定错误”，也不产生一个应该加到 residual stream 的动作。
 
-### 4.3 历史全局注入候选（已被否定）
+### 4.3 Side-KV memory artifact（当前主路径）
 
-以下 `S` 是 Phase 2 用于证伪的全局候选，不再允许作为正式在线方法。它保留在此处
-仅为了可审计地记录已检验过的假设与接口；否定结果见 Phase 2 结果小节。
+每个 `MemoryRecord` 编译为下列不可变 artifact：
 
-使用当前 state 的尺度进行归一化，而非直接使用无约束的均值差：
+```text
+memory_id, source_experience_id, approved_route, experience_type,
+sanitized_retrieval_key, sanitized_contrast_payload, payload_hash, token_count,
+kv_layer, canonical_pre_rope_kv, reasoner/tokenizer revision, compiler config
+```
 
-\[
-\hat S_{k,l}=S_{k,l}/\operatorname{RMS}(S_{k,l}),
-\]
+side KV 由目标 student reasoner 编码，而不是教师 hidden state；它以 canonical pre-RoPE key/value
+形式缓存，在线按当前位置正确施加 RoPE 后追加为 memory-only attention source。原 prompt 与生成
+history 的 KV cache 不得被覆盖、重建或作为 memory payload 泄漏。
 
-\[
-H'_{l,t}=H_{l,t}+g_E(t)\,g_R(t,k)\,\alpha\,
-\operatorname{RMS}(H_{l,t})\hat S_{k,l}.
-\]
+### 4.4 历史 residual-vector artifacts（已关闭）
 
-- \(g_E\)：sink-masked entropy 的软门控；
-- \(g_R\)：当前 state 的 persistence-risk 门；本最小探针中为 \(\mathbb{1}[R(h_t)>0]\)，
-  而不是检索或另一个训练模型；
-- \(\alpha\)：本最小探针预先固定为 `0.05`，不按任务正确率搜索。
-
-注入位置为选定 Transformer layer 的 boundary token hidden state，影响后续层与
-next-token logits；不插入 token，也不重建既有 KV cache。
+`S=μ_recovery-μ_persistence` 的全局 centroid residual action 已在独立确认中失败；同题
+reference-persistence → target-recovery local action 的 raw-state top-1 路由也因低 margin 停止。
+它们只作为负结果和诊断实现保留，不可通过重试、扩大样本、搜索 layer/alpha/符号来恢复为主实验。
 
 ## 5. 阶段计划
 
@@ -198,16 +179,17 @@ next-token logits；不插入 token，也不重建既有 KV cache。
 
 **验收标准**：
 
-- 所有正式 vector evidence 都能追溯到 verifier 结果；
+- 所有正式 memory evidence 都能追溯到 verifier 结果；
 - `teacher_inferred` 与 `verified_failure` 在 schema 和下游过滤中严格区分；
 - 全部 teacher records 都有独立 Pro review 和可追溯的审核结论；
-- 正式 bank 只包含所有关键 assessment 均为 supported 的记录；deferred、rejected 与 quarantined 均保留可追溯证据但不参与 vector 编译；
+- 正式 bank 只包含所有关键 assessment 均为 supported 的记录；deferred、rejected 与 quarantined 均保留可追溯证据但不参与 memory payload 编译；
 - 出现自相矛盾、事实错误或 target/reference 等价的记录必须可被 Pro 审核拒绝并保留证据。
 
-### Phase 2：最小化的 entropy-risk probe
+### Phase 2：entropy-risk probe 与 residual-vector 证伪（已完成）
 
-**目的**：先区分“高熵但自然恢复”与“高熵后持续发散”，再验证单次定向 residual
-intervention；不再同时搜索 vector 类型、layer、强度、门控斜率与注入预算。
+**目的**：先区分“高熵但自然恢复”与“高熵后持续发散”，并用严格的单次 residual
+intervention 证伪“风险分类方向可直接作为纠偏动作”的最小假设。它是历史 ablation，不是当前
+side-KV 主路径的优化入口。
 
 **工作项**：
 
@@ -287,139 +269,82 @@ target 有 `603` persistence / `72` recovery 事件。结论仅是当前 hidden 
 alpha 或符号来挽救它；反转向量也不得事后改作 treatment。风险 gate 可以保留，后续动作
 必须以新的、预先声明的条件化假设和未看过的评估数据重新检验。
 
-### Phase 3：条件化检索式 recovery action（设计，未实现）
+### Phase 3：经验内容检索与 side-KV 的最小因果实验（当前设计）
 
-**目的**：检验失败的全局均值方向能否被一个严格条件化的、检索到的经验动作替代。此处
-尚是研究设计，不构成实现授权。
+**假设 H3-content**：在高熵且 `R(h)>0` 的首个 reasoning boundary，给 frozen reasoner
+提供语义匹配、已审核且无泄漏的 Phase 1 contrast memory，能够产生与同预算错配 memory 不同的
+推理行为，并在不损害格式的前提下改善最终任务表现。
 
-**最小假设 H3**：若在线状态 $q$ 同时满足高熵与 $R(q)>0$，其与一个已验证
-reference-persistence state 的 student-space 相似性，可选择该**同一经验**中与之对齐的
-target-recovery state，构成局部 counterfactual correction。这个 action 比无注入、反向 action
-和破坏匹配关系后的 action 更能降低下一 candidate boundary 的熵。
+这不是“让当前 hidden state 变低熵”的假设；memory 是供 attention 使用的外部内容。若下一
+boundary 熵变化存在，只记录为辅助机制指标，不能代替内容利用或 accuracy 的判断。
 
-这里明确不用 `h^{target}_{u'}-h^{target}_{u}`：它含有成功轨迹正常的 token-to-token
-演化，未与 reference failure 对比，因而更像语言生成过程中的时间位移，而不是纠偏动作。
+#### E0：payload 与 side-KV 可行性审计
 
-对每个 `experience_id`，从 reference 的高熵 `persistence` 事件集合与 target 的高熵
-`recovery` 事件集合中，选择 hidden-state cosine 相似度最高的一对；相同相似度时选择更早的
-reference boundary，再选择更早的 target boundary。每个经验仅保留这一对：
+**目的**：先证明送入模型的是安全、可用的经验内容，而不是答案泄漏或无效 cache。
 
-\[
-(t_i,u_i)=\arg\max_{t\in P_i,\,u\in C_i}
-\cos\bigl(h^{\mathrm{reference}}_{24,t},h^{\mathrm{target}}_{24,u}\bigr),
-\]
+- 只用 Phase 1 `ai_approved + answer_correctness` records，不受历史 23 个 local-action
+  candidate 的限制；冻结已有 Teacher/Pro 输出，不发起新调用；
+- 从 Pro 支持的 `situation/applicability`、target 成功策略/验证、reference failure
+  mechanism/signal 构建固定模板 payload；逐条剔除原题、轨迹、答案、`\\boxed{}`、原始 evidence
+  quote 与实例数值；
+- 报告字段覆盖率、长度/重复率、泄漏审计、payload hash 与可追溯 provenance；
+- 使用冻结 reasoner 在 layer 24 编译 canonical pre-RoPE KV，验证其可附加、不会改写原 cache，
+  且 online query 对 memory 的 attention mass 非零。
 
-\[
-k_i=\operatorname{norm}\bigl(h^{\mathrm{reference}}_{24,t_i}\bigr),\qquad
-a_i=\operatorname{norm}\bigl(h^{\mathrm{target}}_{24,u_i}-h^{\mathrm{reference}}_{24,t_i}\bigr).
-\]
+**通过条件**：不存在 payload 泄漏；KV shape/RoPE/cache 单测通过；每次实际注入都可报告非零
+memory attention mass。E0 不报告“效果提升”。
 
-其中 $P_i$ 是 reference persistence 事件，$C_i$ 是 target recovery 事件。$k_i$ 是
-“将持续发散的局部状态”的检索键，$a_i$ 则是同题成功/失败局部状态之间的对比方向；它不是
-已知因果真值，而是待验证的 action candidate。这样做避免用 boundary rank 或文本相似度做
-事后对齐，也避免不同经验、不同推理阶段的全局平均。
+#### E1：匹配内容与错配内容的最小因果比较
 
-在线只做 student hidden-state 的 top-1 cosine 检索：
+先以 observation-only pass 生成不可变 assignment manifest：每个 sample 记录首个高熵候选
+boundary、risk score、是否触发、retrieval query、matched memory id/score、token budget 及 abstain
+reason。所有条件必须复用此 manifest，保证相同题、相同 prefix、同一触发位置且每题至多一次。
 
-\[
-i^*=\arg\max_i\cos\bigl(\operatorname{norm}(q),k_i\bigr),\qquad
-H'_{24}=H_{24}+0.05\operatorname{RMS}(H_{24})a_{i^*}.
-\]
+四个条件：
 
-若没有候选 action，或 top-1 相似度低于只由 bank-train 的 leave-one-out key-neighbour
-similarity 分布预先确定的阈值，则 abstain。高熵门和风险门均为二元条件；本最小实验**不再**
-乘 soft entropy gate，以免引入额外强度变量。
+1. `vanilla`：不计算/不使用 memory；
+2. `gate-observation-only`：运行相同 gate、但不附加 memory；其 completion 必须和 vanilla 一致；
+3. `matched-memory`：按 question + 固定 partial-CoT 窗口检索的 top-1 MemoryRecord side-KV；
+4. `shuffled-memory`：对触发样本按 `sample_id` 做确定性 derangement，使用另一条 matched
+   memory；保持完全相同的触发集合、memory 数量、token budget 和 side-KV layer。
 
-阈值的唯一允许定义为：对每个 bank-train key 取其 leave-one-out 最近邻相似度，令
+检索先在 `calibration-val` 离线比较透明 BM25 与冻结文本 embedding 的 retrieval quality，再固定一种
+方法、固定 top-1 和 payload budget；不能用最终 accuracy 选择检索器。在线 query 不得包含未来 token
+或最终答案。
 
-\[
-\tau_{\mathrm{sim}}=Q_{0.05}\left\{
-\max_{j\ne i}\cos(k_i,k_j)\right\}_{i\in\mathrm{bank\text{-}train}}.
-\]
+**判定顺序**：
 
-在线 query 的 top-1 分数必须不低于 \(\tau_{\mathrm{sim}}\)。该规则只描述 bank 内邻域的
-覆盖范围，不使用答案、熵恢复结果或任何在线任务指标选择阈值。
+1. 触发样本的 matched memory attention mass、retrieval score 和 injection logits-KL 证明内容实际
+   进入计算；
+2. `matched-memory` 相比 `shuffled-memory` 和 gate-only 的效果差异（paired sample ID，bootstrap CI）
+   是主要因果证据；主要任务指标为 GSM8K accuracy，格式正确率不得明显低于 vanilla；
+3. 只将下一 boundary 熵、token/延迟、失败案例作为诊断。若 E1 未过，结论是当前 payload、检索或
+   side-KV integrator 之一无效，不能归咎于 risk gate 或 Phase 1 bank 整体无效。
 
-**预先固定的最小设计**：
+#### E2：经验对比字段的消融（仅在 E1 通过后）
 
-- 仅用正式、`ai_approved` 的 `answer_correctness` records；不引入 Phase 2 teacher、Pro、
-  文本 embedding 或人工归因；
-- 保持 layer `24`、熵 85% 分位数、风险门 $R(q)>0$、首个候选边界、每样本最多一次、
-  安全归一化 `alpha=0.05`，并以真实 causal KV-cache continuation 读取下一个边界熵；
-- 检索仅在该 gate 已触发时发生；若候选池为空或 top-1 相似度低于 $\tau_{\mathrm{sim}}$，则
-  abstain，不注入；不搜索 layer、alpha、符号、top-k 或阈值；
-- 先按 `experience_id` 切分：bank-train 形成 action pool、风险 prototype 与
-  $\tau_{\mathrm{sim}}$；bank-heldout 在配置冻结后仅报告候选覆盖率、同题 pair 对齐相似度及
-  top-1 检索相似度分布，不能反向改变 action 定义或阈值；在线开发/确认集均不得与这些构造样本
-  重叠；
-- 代码实现前先运行**纯离线可行性审计**：报告每个过滤步骤后剩余的唯一
-  `experience_id` 数、action RMS 分布、source/target 对齐相似度和 $\tau_{\mathrm{sim}}$。
-  action pool 最低规模尚未由现有统计确定；在看到这项审计前不得实现或将阈值事后放宽。
+在完全相同的 gate、manifest、retrieval id、token budget 和 side-KV 接口下比较：
 
-**必要对照与判定**：保留同题、同一首次候选 boundary、相同风险 gate、最多一次的四组记录：
+1. `target-only`（Prefer）；
+2. `reference-only`（Avoid）；
+3. `contrast`（When facing + Prefer + Avoid）。
 
-1. `vanilla / entropy-only`：只记录触发与风险，不注入；两者的 completion 必须一致；
-2. `retrieved action`：使用 $a_{i^*}$；
-3. `reversed retrieved action`：使用 $-a_{i^*}$，检验方向依赖；
-4. `query-shuffled action`：先由 observation-only pass 为所有合格样本冻结真实 action id，
-   再以对 `sample_id` 的确定性 derangement 重排这些 action，保留 action 分布和范数、破坏
-   “当前状态—经验”的匹配关系，检验检索条件化而非任意扰动。
+它回答 Phase 1 的 reference failure mechanism 是否为 target success strategy 提供额外 guardrail，
+而非重新测试任意 residual 方向。没有 E1 的 matched-vs-shuffled 证据，不做此消融。
 
-所有 intervention condition 必须先复用同一份 observation-only assignment manifest：其中包含
-首次触发 boundary、风险分数、真实检索 action id、相似度和 abstain 原因。真实/反转/重排组只在
-这一个已冻结 boundary 改变 action；因此三组的注入前 prefix、触发集合和 action 范数可精确对齐。
+#### E3：风险触发时机消融（仅在 E1 通过后）
 
-真实 action 必须在按 `sample_id` 配对、至少 50 个共同事件上，使
-`ΔH_retrieved − ΔH_control` 对每一项动作对照的 bootstrap 95% CI 上界都小于 0；同时不能损害
-格式。只有这些机制标准通过，才观察 accuracy。若失败，结论只能是“当前的检索键/动作定义无效”，
-而非风险 gate 或整个 Phase 1 bank 无效。
-
-**数据纪律与停止条件**：现有 `dev-test` 已用于 Phase 2 smoke 与确认，不能重用来选择 H3。
-开始实现前必须审计 `calibration-val` 和剩余 evaluation split，预注册一个未看过的开发集及其
-独立确认集；若不足以满足配对事件下限，则先新建 split manifest，而不是在既有结果上调参。
-不在 H3 中进行聚类、文本检索、最终测试或 Phase 1 重审。
-
-**设计产物**：经验级 key/action manifest、构造 split manifest、预注册配置、按 sample ID 对齐的
-trace schema 和停止规则。只有这些设计审查完成且 split 审计通过后，才进入代码实现。
+同一条 matched memory 在风险 gate 的首次触发 boundary，与同生成中预算相同的确定性随机 delimiter
+比较。它回答高熵+risk 是不是比“随便找一个位置”更好的记忆访问时机。此阶段不增加记忆数量、
+不做 alpha/layer 网格、不把熵下降设为通过门槛。
 
 ### Phase 4：冻结配置后的最终评估
 
-**目的**：在从未参与任何构造或调参的 test 集上确认结论。
-
-**工作项**：
-
-- 锁定 split、bank、vector、layer、alpha、entropy threshold、检索配置；
-- 只运行一次完整 final-test；
-- 与 vanilla/entropy-only、条件化 retrieved action、反转 action、query-shuffled action、
-  MemGen Weaver 对照；已被否定的全局 centroid vector 仅作为历史负结果报告，不重新运行；
-- 报告 accuracy、token 数、trigger rate、延迟、memory artifact 大小、格式错误率和
-  intervention diagnostics。
-
-**验收标准**：
-
-- final-test 不参与任何选择；配置文件和 artifact hash 可完全复现；
-- 条件化真实 action 优于预注册的反转与 query-shuffled action 对照，且没有不可接受的
-  格式/延迟回归；
-- 结论按 effect size、置信区间和失败案例报告，不能只报告最优单次 seed。
-
-### Phase 5：MI side-KV 升级决策
-
-**进入条件**：Phase 4 表明条件化经验内容有真实收益，但 retrieved residual action 出现
-明显过干预、条件错配或表征分布破坏。
-
-**工作项**：
-
-- 用同一份 memory records 编译 target/reference canonical pre-RoPE KV banks；
-- 做 calibration-based layer/head 或 GQA KV-group selection；
-- 实现 side-bank attention，不修改原始 prompt/history cache；
-- 复用 Phase 3 selector，替换 `ResidualVectorIntegrator` 为 `SideKVIntegrator`。
-
-**验收标准**：
-
-- 与 vector 版本使用相同 bank、相同 split、相同门控预算；
-- RoPE canonical-key 单元测试通过，bank 不绑定构造时绝对位置；
-- 保留/改善正确率与稳定性，同时报告真实端到端 latency 和 KV footprint，而非只报告
-  理论缓存占用。
+仅在 E1 及必要的 E2/E3 开发结论通过后，锁定 bank、payload compiler、retriever、layer 24、单次
+触发预算和全部 manifest 规则，在从未参与选择的 `final-test` 运行一次。报告 vanilla、gate-only、
+matched-memory、shuffled-memory（以及已通过才纳入的字段/时机消融），同时给出 accuracy、格式、
+trigger rate、memory attention、检索分数、延迟、KV footprint、置信区间和失败案例。历史 residual
+vectors 不重跑，也不作为主对照。
 
 ## 6. 统一日志与诊断要求
 
@@ -428,13 +353,16 @@ trace schema 和停止规则。只有这些设计审查完成且 split 审计通
 ```text
 sample_id, split, generated_token_index, boundary_type,
 entropy_with_sink, entropy_without_sink, entropy_threshold,
-gate_value, retrieved_memory_id, retrieval_score,
-layer, alpha, delta_norm_ratio, logits_kl,
-injection_applied, generation_length, final_reward, output_path
+hidden_risk_score, gate_triggered, trigger_reason,
+retrieval_query_hash, retrieval_method, retrieved_memory_id, retrieval_score,
+memory_condition, memory_payload_hash, memory_token_count, memory_kv_layer,
+memory_attention_mass, logits_kl_baseline_to_memory,
+side_kv_applied, generation_length, final_reward, format_reward, output_path
 ```
 
-这些记录用于区分以下不同失败：熵门控错误、检索错误、经验质量差、向量方向错误、
-注入过强、或任务本身不适合该记忆。
+对 `shuffled-memory` 还必须记录 `matched_memory_id`、`assigned_memory_id` 和确定性 shuffle
+seed。它们用于区分触发错误、语义检索错误、payload 质量/泄漏问题、side-KV 没有被注意、内容
+错配、或任务本身不适合此类经验；不再将 residual norm/alpha 当作主路径诊断。
 
 ## 7. 实验纪律
 
@@ -450,7 +378,7 @@ injection_applied, generation_length, final_reward, output_path
 - 任何 bank artifact、split manifest 和结果必须带版本/hash；
 - 高熵仅代表“可能需要帮助”，绝不能在论文或日志中被表述为“模型确定出错”。
 
-## 8. 当前状态（2026-08-19）
+## 8. 当前状态（2026-08-20）
 
 已完成：
 
@@ -464,18 +392,21 @@ injection_applied, generation_length, final_reward, output_path
 - Phase 2 causal-cache 确认实验：真实全局 `recovery − persistence` vector 在 140 个配对事件上
   未优于 entropy-only、随机或反转对照，且相对反转向量显著更差；全局 centroid action 分支
   已关闭，详见本文件的 Phase 2 负结果；
-- 下一版仅保留风险 gate，提出了尚未实现的 H3：student-state top-1 检索式、同题
-  reference-persistence → target-recovery local-contrast action，且已规定 split、对照、停止规则与
-  确认门槛；
 - H3 的只读可行性审计脚本：重放冻结轨迹并统计同一 `experience_id` 内的
   reference-persistence → target-recovery local-contrast candidates、对齐相似度、action RMS 与
   leave-one-out 检索阈值；并检查最大对齐的选择增益、检索 top-1/top-2 margin、action 方向
-  effective rank 与检索集中度；它不生成回答、不注入向量，也不调用 AI；
+  effective rank 与检索集中度；结果为 23 个 bank-train / 9 个 held-out 候选，action 方向并不
+  共线（effective rank `13.75/23`），但 held-out top-1/top-2 margin 很小（中位数 `0.0059`），
+  说明 raw hidden state 可描述风险邻域却不能稳定选择具体 action；该分支已归档；
+- 研究主线已更新为风险触发的、语义检索的 Phase 1 经验内容 side-KV，而不是继续优化向量构造或
+  以降熵作为目标。
 
 尚未完成：
 
-- 审计未看过的 `calibration-val` / evaluation 剩余 split，并预注册 H3 的开发集和独立确认集；
-- 在服务器上运行 H3 的只读 action-bank 可行性审计；根据候选数量决定是否有条件进入 H3
-  intervention 实现，不能放宽同题 pair 条件来凑样本；
-- H3 通过机制验证后才进行冻结配置的最终评测；
-- MI side-KV bank 实现。
+- 对所有 `ai_approved + answer_correctness` record 构建并审计无泄漏 `MemoryRecord` payload；
+- 在不看 final-test 的前提下，冻结 semantic retriever（BM25 baseline / frozen embedding）和
+  payload token budget；
+- 实现并单测 layer-24 canonical side-KV compiler/integrator，先完成 E0 cache 与 attention 可见性
+  审计；
+- 在新的、未用于选择的 evaluation split 上完成 E1 matched-memory vs shuffled-memory 的单次、
+  同 manifest 因果实验；只有 E1 成立才做字段与时机消融并进入 final-test。

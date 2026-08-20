@@ -65,24 +65,13 @@ Teacher/Reviewer 记录、模型或 provenance 已变化的记录会在 `--resum
 和 `quarantined` 仅保留用于审计、误差分析或未来扩充稀缺类别。这里的 `AI review` 不得
 在论文或实验报告中表述为人工审核。
 
-当前正式的 Phase 2 主路径不再调用新的 AI。它只读取 `ai_approved_bank_records.jsonl`
-作为质量闸门，并按 `experience_id` 连接 `verified_experiences.jsonl` 中的原始 student
-`context`、成功 `trajectory` 与失败 `reference_trajectory`。Teacher / Pro 的自然语言经验、
-证据与机制描述不会输入 student，也不参与新的 Phase 2 标注。
+当前 Phase 2 不再调用新的 AI。它只读取 `ai_approved_bank_records.jsonl` 作为质量闸门，并按
+`experience_id` 连接 `verified_experiences.jsonl` 的原始 student 成功/失败轨迹。该阶段已经证明：
+第 24 层的 hidden state 能区分高熵后的 `recovery` / `persistence` 风险（held-out ROC-AUC
+`0.8053`），但 `recovery − persistence` 的全局 residual vector 不能作为有效动作；独立确认也
+否定了它。**不得**继续调整该 vector 的 alpha、layer、符号或样本量。
 
-下一轮采用最小的两阶段设计。第一阶段在固定第 24 层重放两侧原始轨迹的 sink-masked
-entropy，并将所有高熵边界按下一边界的熵分为 `recovery` / `persistence`；它完整报告
-`target/reference × recovery/persistence` 四格表。bank 按 `experience_id` 切为 train 与
-held-out，只有 held-out ROC-AUC 达到预设要求时，才从 bank-train 的两个状态中心编译一个
-`recovery − persistence` state vector。未来 entropy 只用于离线标签。
-
-第二阶段不再搜索 layer、vector 类型、alpha、slope 或注入次数：固定在第 24 层、固定
-`alpha=0.05`、固定 entropy soft-gate slope `0.10`、每条生成最多一次。在线仅在**第一个**
-高熵边界同时满足“更像 persistence 而非 recovery”的当前 hidden-state 风险分数时才注入。
-评测使用从未参与任何选择的 `dev-test`，比较 vanilla、entropy-only、真实向量、同范数
-随机向量及反向向量，并核验各条件首个决策前缀完全一致。
-
-运行时只需传入冻结的 Phase 1 目录：
+以下仅为复现实验历史 Phase 2 probe 的命令，**不应用于继续调参或作为当前主线运行**：
 
 ```bash
 bash scripts/experiments/gsm8k/run_phase2_entropy_risk_probe.sh \
@@ -100,21 +89,31 @@ bash scripts/experiments/gsm8k/run_phase2_entropy_risk_probe.sh \
 需要 50 个配对事件，且 CI 上界小于 0 才通过。bank-heldout 同时报告 ROC-AUC、PR-AUC 与
 persistence 正类比例，避免类别失衡下误读 PR-AUC。
 
-全局 `recovery − persistence` vector 已在独立确认中失败，不能继续调参或扩大运行。下一步仅可先做
-H3 的**离线**条件化 action 可行性审计：它不生成回答、不注入向量、不调用 AI，而是统计同一
-`experience_id` 内可形成的 reference-persistence → target-recovery pairs、state 对齐相似度、
-action RMS 与 leave-one-out 检索覆盖率。
+历史 H3 local-action audit 也已经完成：虽然能形成 23 个 bank-train / 9 个 held-out action，且
+方向不共线，但 held-out raw hidden-state top-1/top-2 routing margin 极低，不能稳定选择具体 action。
+该脚本保留为只读负向诊断，不构成后续线上实验入口。
 
 ```bash
 bash scripts/experiments/gsm8k/run_phase2_conditional_action_audit.sh \
   /absolute/path/to/gsm8k_phase1_verified-student-contrast_<tag>
 ```
 
-审计报告为 `conditional_action_feasibility_report.json`。若 bank-train action 少于两个，脚本仍会
-写出报告并标记 `insufficient_train_candidates_for_threshold`；这属于 H3 定义的可行性负结果，不应通过
-放宽 target/reference 配对条件来绕过。
+当前主线改为“风险触发 → 语义检索经验内容 → side-KV integration”。它继续复用 Phase 1 的
+`ai_approved + answer_correctness` records，但这一次 Teacher/Pro 已审核的经验抽象会成为**实际
+memory payload**，而不是只做 Phase 2 的质量标签。payload 仅允许通用的：适用情境、成功策略/验证、
+失败机制/警告信号；必须剔除原题、原始轨迹、`\boxed{}` 答案、原始 evidence quote 与实例特有数值。
+不再产生新的 Teacher/Pro 调用。
 
-在候选数量足够时，仍不可据此直接做在线注入。审计还会报告：同题内“取最大对齐”相对所有可配对
-状态的选择增益、held-out query 的 top-1/top-2 retrieval margin、训练 action 的两两方向 cosine 与
-effective rank，以及 held-out 检索是否集中到少数 action。若 action 高度共线、margin 接近零或检索
-高度集中，H3 会退化为全局向量的变体，应停止当前定义而不是扩大在线样本。
+下一轮尚未实现，因此目前没有新的服务器运行命令。实现顺序与实验门槛已固定：
+
+1. E0：审计 payload 无泄漏，并验证 layer-24 canonical side-KV 能附加而不改写原 cache，且有非零
+   memory attention mass；
+2. E1：先用 observation-only pass 冻结每题首次风险触发 boundary 和 matched memory id，再比较
+   `vanilla`、`gate-observation-only`、`matched-memory` 与同预算 `shuffled-memory`；所有条件使用
+   相同 sample、prefix、触发位置和单次预算；
+3. 仅当 matched memory 相比 shuffled/gate-only 有配对因果证据且格式不受损时，才做 target/reference
+   字段消融和随机位置时机消融，最后才进入 final-test。
+
+下一 boundary 熵、logits KL、memory attention、检索分数和延迟均会记录为诊断；主要问题是模型是否
+利用了匹配的经验内容并改善最终任务表现，而不是是否单纯降低熵。完整规范见
+[`experience_calibrated_steering_plan.md`](../../docs/codex/experience_calibrated_steering_plan.md)。
