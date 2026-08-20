@@ -89,9 +89,13 @@ def approved_record(experience_id: str = "experience-1") -> dict:
             },
         },
         "ai_review_gate": {
+            "schema_version": "phase1-ai-review-record-v2",
+            "prompt_version": "phase1-ai-review-v2-field-evidence-rubric",
             "route": "ai_approved",
             "review_provenance_sha256": "review-provenance",
             "ai_review": {
+                "decision": "approve",
+                "confidence": 0.9,
                 "field_assessments": {
                     "target": {
                         key: supported_assessment()
@@ -122,9 +126,45 @@ def approved_record(experience_id: str = "experience-1") -> dict:
                         "transferable_without_instance_leakage",
                     )
                 },
+                "issues": [],
             },
         },
     }
+
+
+def legacy_approved_record(experience_id: str = "experience-1") -> dict:
+    record = approved_record(experience_id)
+    supported_criteria = {
+        field: True
+        for field in (
+            "target_supported",
+            "reference_supported",
+            "target_reference_distinct",
+            "factually_consistent",
+            "failure_type_aligned",
+            "transferable_without_instance_leakage",
+        )
+    }
+    record["ai_review_gate"] = {
+        "schema_version": "phase1-ai-review-record-v1",
+        "prompt_version": "phase1-ai-review-v1-independent-evidence",
+        "route": "ai_approved",
+        "review_provenance_sha256": "legacy-review-provenance",
+        "routing_confidence_threshold": 0.85,
+        "automatic_gate": {"passed": True, "reasons": []},
+        "ai_review": {
+            "decision": "approve",
+            "confidence": 0.91,
+            "criteria": supported_criteria,
+            "evidence": {
+                "target": "The successful trajectory supports the strategy.",
+                "reference": "The failed trajectory supports the warning.",
+            },
+            "issues": [],
+            "uncertainty_reason": "",
+        },
+    }
+    return record
 
 
 def verified_experience(experience_id: str = "experience-1") -> dict:
@@ -233,6 +273,60 @@ class MemoryRecordTests(unittest.TestCase):
             "pro_target_verification_rule_not_supported",
             result.trace[0].reasons,
         )
+
+    def test_accepts_the_frozen_legacy_pro_review_with_all_quality_gates(self) -> None:
+        result = builder(self.tokenizer).build(
+            [legacy_approved_record()],
+            [verified_experience()],
+        )
+        self.assertEqual(len(result.records), 1)
+        self.assertEqual(result.trace[0].status, "accepted")
+        self.assertEqual(
+            result.report["accepted_review_profile_counts"],
+            {"legacy_independent_criteria_v1": 1},
+        )
+
+    def test_legacy_pro_review_fails_closed_on_a_false_criterion(self) -> None:
+        approved = legacy_approved_record()
+        approved["ai_review_gate"]["ai_review"]["criteria"][
+            "factually_consistent"
+        ] = False
+        result = builder(self.tokenizer).build([approved], [verified_experience()])
+        self.assertEqual(result.records, ())
+        self.assertIn(
+            "legacy_pro_factually_consistent_not_supported",
+            result.trace[0].reasons,
+        )
+
+    def test_legacy_pro_review_accepts_the_migrated_integrity_audit_shape(self) -> None:
+        approved = legacy_approved_record()
+        gate = approved["ai_review_gate"]
+        gate.pop("automatic_gate")
+        gate["deterministic_audit"] = {
+            "integrity_passed": True,
+            "reasons": ["semantic_warning_fixture"],
+            "integrity_reasons": [],
+            "semantic_warnings": ["semantic_warning_fixture"],
+        }
+        result = builder(self.tokenizer).build([approved], [verified_experience()])
+        self.assertEqual(len(result.records), 1)
+
+    def test_legacy_pro_review_fails_closed_below_frozen_confidence(self) -> None:
+        approved = legacy_approved_record()
+        approved["ai_review_gate"]["ai_review"]["confidence"] = 0.84
+        result = builder(self.tokenizer).build([approved], [verified_experience()])
+        self.assertEqual(result.records, ())
+        self.assertIn(
+            "legacy_pro_confidence_below_routing_threshold",
+            result.trace[0].reasons,
+        )
+
+    def test_unknown_pro_review_schema_is_not_shape_inferred(self) -> None:
+        approved = legacy_approved_record()
+        approved["ai_review_gate"]["schema_version"] = "unregistered-review-schema"
+        result = builder(self.tokenizer).build([approved], [verified_experience()])
+        self.assertEqual(result.records, ())
+        self.assertIn("unsupported_pro_review_schema", result.trace[0].reasons)
 
     def test_deduplicates_payloads_but_preserves_a_trace(self) -> None:
         first_approved = approved_record("experience-1")

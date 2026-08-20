@@ -13,6 +13,7 @@ E0 不调用新的 Teacher/Pro，不使用任务正确率，不实现或恢复 r
 ```text
 ApprovedMemorySourceSelector
   └─ 验证 ai_approved + answer_correctness + verified_failure + provenance
+      并按冻结 schema 严格验证 Pro review v1/v2
 
 PayloadSanitizer
   └─ 只做规范化和 fail-closed 泄漏检查，不改写语义
@@ -39,6 +40,15 @@ SideKVAttentionController
 记录构造对象位于 `memgen/experience/memory.py`，检索对象位于
 `memgen/experience/retrieval.py`；两者都不依赖 Torch/Transformers。模型相关对象位于
 `memgen/model/side_kv.py`，不修改原 Weaver/Trigger 类。
+
+Phase 1 已存在两种不可互换的 Pro-review artifact。早期冻结 bank 使用
+`phase1-ai-review-record-v1`：E0 要求 reviewer decision 为 `approve`、六项整体 criteria 全为
+`true`、confidence 不低于该记录的 `routing_confidence_threshold`，并重新检查当时的自动完整性
+审计。新 bank 使用 `phase1-ai-review-record-v2`：E0 要求八个字段和五个 pair assessment 全为
+`supported` 且各自 evidence 非空。只按精确 schema/prompt version 分派验证策略；未知版本不能
+依据相似字段自动推断。两种策略都不新增 Reviewer 调用，最终仍只允许
+`ai_approved + answer_correctness` 进入 memory pool。审计报告分别记录 selected/accepted review
+profile 数量。
 
 ## 3. Payload 契约
 

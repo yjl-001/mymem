@@ -26,6 +26,18 @@ MEMORY_RECORD_SCHEMA = "experience-memory-record-v1"
 MEMORY_BUILD_TRACE_SCHEMA = "experience-memory-build-trace-v1"
 MEMORY_BUILD_REPORT_SCHEMA = "experience-memory-build-report-v1"
 MEMORY_ARTIFACT_AUDIT_SCHEMA = "experience-memory-artifact-audit-v1"
+STRUCTURED_PRO_REVIEW_SCHEMA = "phase1-ai-review-record-v2"
+STRUCTURED_PRO_REVIEW_PROMPT = "phase1-ai-review-v2-field-evidence-rubric"
+LEGACY_PRO_REVIEW_SCHEMA = "phase1-ai-review-record-v1"
+LEGACY_PRO_REVIEW_PROMPT = "phase1-ai-review-v1-independent-evidence"
+LEGACY_PRO_REVIEW_CRITERIA = (
+    "target_supported",
+    "reference_supported",
+    "target_reference_distinct",
+    "factually_consistent",
+    "failure_type_aligned",
+    "transferable_without_instance_leakage",
+)
 PAYLOAD_FIELD_LINEAGE: dict[str, tuple[str, ...]] = {
     "when_facing": (
         "bank.target.situation_signature",
@@ -184,20 +196,244 @@ class Phase1MemorySource:
 
     approved_record: Mapping[str, Any]
     verified_experience: Mapping[str, Any]
+    review_validation_profile: str
 
     @property
     def experience_id(self) -> str:
         return str(self.approved_record.get("experience_id", ""))
 
 
+@dataclass(frozen=True)
+class ProReviewValidation:
+    """Result of validating one frozen Pro-review schema."""
+
+    profile: str | None
+    reasons: tuple[str, ...]
+
+    @property
+    def passed(self) -> bool:
+        return self.profile is not None and not self.reasons
+
+
+class ProReviewProfile(Protocol):
+    """Versioned validation strategy for an immutable Phase-1 Pro review."""
+
+    name: str
+
+    def matches(self, gate: Mapping[str, Any]) -> bool: ...
+
+    def rejection_reasons(
+        self,
+        gate: Mapping[str, Any],
+        review: Mapping[str, Any],
+    ) -> Sequence[str]: ...
+
+
+class StructuredFieldEvidenceReviewProfile:
+    """Validate the current v2 field-evidence Pro-review contract."""
+
+    name = "structured_field_evidence_v2"
+
+    def matches(self, gate: Mapping[str, Any]) -> bool:
+        return (
+            gate.get("schema_version") == STRUCTURED_PRO_REVIEW_SCHEMA
+            and gate.get("prompt_version") == STRUCTURED_PRO_REVIEW_PROMPT
+        )
+
+    def rejection_reasons(
+        self,
+        gate: Mapping[str, Any],
+        review: Mapping[str, Any],
+    ) -> Sequence[str]:
+        del gate
+        reasons: list[str] = []
+        if review.get("decision") != "approve":
+            reasons.append("structured_pro_decision_not_approve")
+        confidence = review.get("confidence")
+        if (
+            not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or not 0.0 <= float(confidence) <= 1.0
+        ):
+            reasons.append("structured_pro_confidence_invalid")
+        if not isinstance(review.get("issues"), list):
+            reasons.append("structured_pro_issues_invalid")
+
+        field_assessments = review.get("field_assessments")
+        if not isinstance(field_assessments, Mapping):
+            return reasons + ["missing_pro_field_assessments"]
+        for section, fields in TEACHER_BANK_REQUIRED_FIELDS.items():
+            assessments = field_assessments.get(section)
+            if not isinstance(assessments, Mapping):
+                reasons.append(f"missing_pro_{section}_assessments")
+                continue
+            for field_name in fields:
+                if field_name == "confidence":
+                    continue
+                assessment = assessments.get(field_name)
+                if not isinstance(assessment, Mapping):
+                    reasons.append(f"missing_pro_{section}_{field_name}_assessment")
+                    continue
+                if assessment.get("status") != "supported":
+                    reasons.append(f"pro_{section}_{field_name}_not_supported")
+                if not self._nonempty_string(assessment.get("evidence")):
+                    reasons.append(f"pro_{section}_{field_name}_evidence_missing")
+
+        pair_assessments = review.get("pair_assessments")
+        if not isinstance(pair_assessments, Mapping):
+            reasons.append("missing_pro_pair_assessments")
+        else:
+            for field_name in AI_REVIEW_PAIR_ASSESSMENTS:
+                assessment = pair_assessments.get(field_name)
+                if not isinstance(assessment, Mapping):
+                    reasons.append(f"missing_pro_pair_{field_name}_assessment")
+                    continue
+                if assessment.get("status") != "supported":
+                    reasons.append(f"pro_pair_{field_name}_not_supported")
+                if not self._nonempty_string(assessment.get("evidence")):
+                    reasons.append(f"pro_pair_{field_name}_evidence_missing")
+        return reasons
+
+    @staticmethod
+    def _nonempty_string(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+
+class LegacyCriteriaReviewProfile:
+    """Validate the frozen v1 Pro review without inventing v2 assessments."""
+
+    name = "legacy_independent_criteria_v1"
+
+    def matches(self, gate: Mapping[str, Any]) -> bool:
+        return (
+            gate.get("schema_version") == LEGACY_PRO_REVIEW_SCHEMA
+            and gate.get("prompt_version") == LEGACY_PRO_REVIEW_PROMPT
+        )
+
+    def rejection_reasons(
+        self,
+        gate: Mapping[str, Any],
+        review: Mapping[str, Any],
+    ) -> Sequence[str]:
+        reasons: list[str] = []
+        if review.get("decision") != "approve":
+            reasons.append("legacy_pro_decision_not_approve")
+
+        confidence = review.get("confidence")
+        threshold = gate.get("routing_confidence_threshold")
+        if not self._valid_probability(confidence):
+            reasons.append("legacy_pro_confidence_invalid")
+        if not self._valid_probability(threshold):
+            reasons.append("legacy_pro_routing_confidence_threshold_invalid")
+        elif self._valid_probability(confidence) and float(confidence) < float(
+            threshold
+        ):
+            reasons.append("legacy_pro_confidence_below_routing_threshold")
+
+        criteria = review.get("criteria")
+        if not isinstance(criteria, Mapping):
+            reasons.append("missing_legacy_pro_criteria")
+        else:
+            for field_name in LEGACY_PRO_REVIEW_CRITERIA:
+                value = criteria.get(field_name)
+                if value is not True:
+                    reasons.append(f"legacy_pro_{field_name}_not_supported")
+
+        evidence = review.get("evidence")
+        if not isinstance(evidence, Mapping):
+            reasons.append("missing_legacy_pro_evidence")
+        else:
+            for field_name in ("target", "reference"):
+                value = evidence.get(field_name)
+                if not isinstance(value, str) or not value.strip():
+                    reasons.append(f"missing_legacy_pro_{field_name}_evidence")
+        if not isinstance(review.get("issues"), list):
+            reasons.append("legacy_pro_issues_invalid")
+        if not isinstance(review.get("uncertainty_reason"), str):
+            reasons.append("legacy_pro_uncertainty_reason_invalid")
+
+        reasons.extend(self._audit_reasons(gate))
+        return reasons
+
+    @staticmethod
+    def _valid_probability(value: Any) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and 0.0 <= float(value) <= 1.0
+        )
+
+    @staticmethod
+    def _audit_reasons(gate: Mapping[str, Any]) -> list[str]:
+        deterministic = gate.get("deterministic_audit")
+        if isinstance(deterministic, Mapping):
+            reasons: list[str] = []
+            if deterministic.get("integrity_passed") is not True:
+                reasons.append("legacy_pro_integrity_audit_not_passed")
+            integrity_reasons = deterministic.get("integrity_reasons")
+            if not isinstance(integrity_reasons, Sequence) or isinstance(
+                integrity_reasons, (str, bytes)
+            ):
+                reasons.append("legacy_pro_integrity_reasons_invalid")
+            elif integrity_reasons:
+                reasons.append("legacy_pro_integrity_reasons_present")
+            return reasons
+
+        automatic = gate.get("automatic_gate")
+        if not isinstance(automatic, Mapping):
+            return ["missing_legacy_pro_deterministic_audit"]
+        reasons = []
+        if automatic.get("passed") is not True:
+            reasons.append("legacy_pro_automatic_gate_not_passed")
+        automatic_reasons = automatic.get("reasons")
+        if not isinstance(automatic_reasons, Sequence) or isinstance(
+            automatic_reasons, (str, bytes)
+        ):
+            reasons.append("legacy_pro_automatic_reasons_invalid")
+        elif automatic_reasons:
+            reasons.append("legacy_pro_automatic_reasons_present")
+        return reasons
+
+
+class ProReviewValidator:
+    """Dispatch validation only to explicitly supported frozen review schemas."""
+
+    def __init__(self, profiles: Sequence[ProReviewProfile] | None = None):
+        self.profiles = tuple(
+            profiles
+            or (
+                StructuredFieldEvidenceReviewProfile(),
+                LegacyCriteriaReviewProfile(),
+            )
+        )
+        if not self.profiles:
+            raise ValueError("ProReviewValidator requires at least one profile")
+
+    def validate(self, gate: Mapping[str, Any]) -> ProReviewValidation:
+        review = gate.get("ai_review")
+        if not isinstance(review, Mapping):
+            return ProReviewValidation(None, ("missing_pro_review",))
+        for profile in self.profiles:
+            if profile.matches(gate):
+                reasons = tuple(sorted(set(profile.rejection_reasons(gate, review))))
+                return ProReviewValidation(profile.name, reasons)
+        return ProReviewValidation(None, ("unsupported_pro_review_schema",))
+
+
 class ApprovedMemorySourceSelector:
     """Validate the immutable Phase-1 quality/provenance gate for E0."""
 
-    def __init__(self, *, allowed_experience_types: Sequence[str] = ("answer_correctness",)):
+    def __init__(
+        self,
+        *,
+        allowed_experience_types: Sequence[str] = ("answer_correctness",),
+        review_validator: ProReviewValidator | None = None,
+    ):
         allowed = frozenset(str(value) for value in allowed_experience_types)
         if not allowed:
             raise ValueError("allowed_experience_types must not be empty")
         self.allowed_experience_types = allowed
+        self.review_validator = review_validator or ProReviewValidator()
 
     def join(
         self,
@@ -224,7 +460,8 @@ class ApprovedMemorySourceSelector:
                 )
             seen_ids.add(experience_id)
             experience = experience_by_id.get(experience_id)
-            reasons = self._validation_reasons(approved, experience)
+            validation = self._validate_source(approved, experience)
+            reasons = validation.reasons
             if reasons:
                 trace.append(
                     MemoryBuildTrace(
@@ -236,31 +473,40 @@ class ApprovedMemorySourceSelector:
                 )
                 continue
             assert experience is not None
+            assert validation.review_profile is not None
             sources.append(
                 Phase1MemorySource(
                     approved_record=approved,
                     verified_experience=experience,
+                    review_validation_profile=validation.review_profile,
                 )
             )
         return sources, trace
 
-    def _validation_reasons(
+    @dataclass(frozen=True)
+    class SourceValidation:
+        reasons: tuple[str, ...]
+        review_profile: str | None
+
+    def _validate_source(
         self,
         approved: Mapping[str, Any],
         experience: Mapping[str, Any] | None,
-    ) -> list[str]:
+    ) -> SourceValidation:
         reasons: list[str] = []
         experience_id = str(approved.get("experience_id", ""))
         if experience is None:
-            return ["missing_verified_experience"]
+            return self.SourceValidation(("missing_verified_experience",), None)
         gate = approved.get("ai_review_gate")
+        review_profile: str | None = None
         if not isinstance(gate, Mapping) or gate.get("route") != "ai_approved":
             reasons.append("route_not_ai_approved")
-        review = gate.get("ai_review") if isinstance(gate, Mapping) else None
-        if not isinstance(review, Mapping):
-            reasons.append("missing_pro_review")
+        if isinstance(gate, Mapping):
+            review_validation = self.review_validator.validate(gate)
+            review_profile = review_validation.profile
+            reasons.extend(review_validation.reasons)
         else:
-            reasons.extend(self._unsupported_review_fields(review))
+            reasons.append("missing_pro_review")
         if approved.get("experience_type") not in self.allowed_experience_types:
             reasons.append("approved_experience_type_not_allowed")
         if experience.get("experience_type") not in self.allowed_experience_types:
@@ -304,38 +550,7 @@ class ApprovedMemorySourceSelector:
             reasons.append("missing_review_provenance_sha256")
         if not experience_id:
             reasons.append("missing_experience_id")
-        return sorted(set(reasons))
-
-    @staticmethod
-    def _unsupported_review_fields(review: Mapping[str, Any]) -> list[str]:
-        reasons: list[str] = []
-        field_assessments = review.get("field_assessments")
-        if not isinstance(field_assessments, Mapping):
-            return ["missing_pro_field_assessments"]
-        for section, fields in TEACHER_BANK_REQUIRED_FIELDS.items():
-            assessments = field_assessments.get(section)
-            if not isinstance(assessments, Mapping):
-                reasons.append(f"missing_pro_{section}_assessments")
-                continue
-            for field_name in fields:
-                if field_name == "confidence":
-                    continue
-                assessment = assessments.get(field_name)
-                if not isinstance(assessment, Mapping):
-                    reasons.append(f"missing_pro_{section}_{field_name}_assessment")
-                elif assessment.get("status") != "supported":
-                    reasons.append(f"pro_{section}_{field_name}_not_supported")
-        pair_assessments = review.get("pair_assessments")
-        if not isinstance(pair_assessments, Mapping):
-            reasons.append("missing_pro_pair_assessments")
-        else:
-            for field_name in AI_REVIEW_PAIR_ASSESSMENTS:
-                assessment = pair_assessments.get(field_name)
-                if not isinstance(assessment, Mapping):
-                    reasons.append(f"missing_pro_pair_{field_name}_assessment")
-                elif assessment.get("status") != "supported":
-                    reasons.append(f"pro_pair_{field_name}_not_supported")
-        return reasons
+        return self.SourceValidation(tuple(sorted(set(reasons))), review_profile)
 
 
 class PayloadSanitizer:
@@ -615,6 +830,7 @@ class MemoryBankBuilder:
         trace = list(selection_trace)
         records: list[MemoryRecord] = []
         seen_payload_hashes: dict[str, str] = {}
+        accepted_review_profiles: Counter[str] = Counter()
         source_index_by_id = {
             str(record.get("experience_id")): index
             for index, record in enumerate(approved)
@@ -649,6 +865,7 @@ class MemoryBankBuilder:
                 continue
             seen_payload_hashes[record.payload_hash] = record.memory_id
             records.append(record)
+            accepted_review_profiles[source.review_validation_profile] += 1
             trace.append(
                 MemoryBuildTrace(
                     source_index=source_index,
@@ -670,6 +887,16 @@ class MemoryBankBuilder:
             "input_verified_experience_count": len(verified),
             "selected_source_count": len(sources),
             "accepted_record_count": len(records),
+            "selected_review_profile_counts": dict(
+                sorted(
+                    Counter(
+                        source.review_validation_profile for source in sources
+                    ).items()
+                )
+            ),
+            "accepted_review_profile_counts": dict(
+                sorted(accepted_review_profiles.items())
+            ),
             "status_counts": dict(sorted(status_counts.items())),
             "rejection_reason_counts": dict(sorted(reason_counts.items())),
             "token_count": self._distribution(token_counts),
