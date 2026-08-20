@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -21,6 +21,7 @@ from memgen.experience.memory import (
     ApprovedMemorySourceSelector,
     MemoryArtifactAuditor,
     MemoryBankBuilder,
+    MemoryBuildResult,
     MemoryRecordCompiler,
     MemorySanitizerConfig,
     PayloadSanitizer,
@@ -85,6 +86,130 @@ def git_revision() -> str | None:
         return None
 
 
+@dataclass(frozen=True)
+class E0ArtifactPaths:
+    """Stable artifact locations shared by successful and failed compilation."""
+
+    output_dir: Path
+    trace: Path
+    payload_audit: Path
+    records: Path
+    bm25_index: Path
+    e0_report: Path
+
+    @classmethod
+    def create(cls, output_dir: Path) -> "E0ArtifactPaths":
+        resolved_output = output_dir.expanduser()
+        resolved_output.mkdir(parents=True, exist_ok=True)
+        return cls(
+            output_dir=resolved_output,
+            trace=resolved_output / "memory_compilation_trace.jsonl",
+            payload_audit=resolved_output / "payload_audit_report.json",
+            records=resolved_output / "memory_records.v1.jsonl",
+            bm25_index=resolved_output / "bm25_index.v1.json",
+            e0_report=resolved_output / "e0_report.json",
+        )
+
+
+def persist_no_survivor_diagnostics(
+    *,
+    paths: E0ArtifactPaths,
+    result: MemoryBuildResult,
+    approved_bank: Path,
+    verified_experiences: Path,
+    reasoner_name: str,
+    reasoner_revision: str,
+    tokenizer_revision: str,
+    sanitizer_config: MemorySanitizerConfig,
+    bm25_config: BM25Config,
+    analyzer_config: TextAnalyzerConfig,
+    layer: int,
+    dtype: str,
+    text_only: bool,
+) -> None:
+    """Persist actionable audit evidence before failing a zero-record build."""
+
+    write_jsonl(paths.trace, (item.to_dict() for item in result.trace))
+    created_at = datetime.now(timezone.utc).isoformat()
+    rejection_counts = dict(result.report.get("rejection_reason_counts", {}))
+    failure = {
+        "code": "no_runtime_safe_records",
+        "message": "No runtime-safe MemoryRecords survived E0 payload audit",
+        "rejection_reason_counts": rejection_counts,
+    }
+
+    audit_report = dict(result.report)
+    audit_report["pre_kv_text_record_set_sha256"] = audit_report.pop(
+        "record_set_sha256"
+    )
+    audit_report.update(
+        {
+            "created_at": created_at,
+            "status": "payload_audit_failed_no_records",
+            "failure": failure,
+            "inputs": {
+                "approved_bank_path": str(approved_bank.resolve()),
+                "approved_bank_sha256": file_sha256(approved_bank),
+                "verified_experiences_path": str(verified_experiences.resolve()),
+                "verified_experiences_sha256": file_sha256(verified_experiences),
+            },
+            "reasoner": {
+                "model_name": reasoner_name,
+                "model_revision": reasoner_revision,
+                "tokenizer_revision": tokenizer_revision,
+            },
+            "artifacts": {
+                "trace_sha256": file_sha256(paths.trace),
+                "records_sha256": None,
+                "bm25_index_sha256": None,
+            },
+        }
+    )
+    write_json(paths.payload_audit, audit_report)
+
+    e0_report = {
+        "schema_version": "experience-memory-e0-report-v1",
+        "created_at": created_at,
+        "status": "failed_no_runtime_safe_records",
+        "formal_e0_passed": False,
+        "compiler_git_revision": git_revision(),
+        "failure": failure,
+        "configuration": {
+            "sanitizer": asdict(sanitizer_config),
+            "bm25": asdict(bm25_config),
+            "analyzer": asdict(analyzer_config),
+            "layer": layer,
+            "dtype": dtype,
+            "text_only": text_only,
+        },
+        "artifacts": {
+            "memory_records": None,
+            "compilation_trace": {
+                "path": paths.trace.name,
+                "sha256": file_sha256(paths.trace),
+            },
+            "payload_audit": {
+                "path": paths.payload_audit.name,
+                "sha256": file_sha256(paths.payload_audit),
+            },
+            "bm25_index": None,
+            "side_kv": None,
+        },
+        "runtime_audit": {
+            "required": True,
+            "completed": False,
+            "blocked_by": "no_runtime_safe_records",
+        },
+        "artifact_set_sha256": canonical_json_sha256(
+            {
+                "trace": file_sha256(paths.trace),
+                "audit": file_sha256(paths.payload_audit),
+            }
+        ),
+    }
+    write_json(paths.e0_report, e0_report)
+
+
 def main() -> None:
     args = parse_args()
     if args.layer != 24:
@@ -135,16 +260,34 @@ def main() -> None:
         compiler=record_compiler,
     )
     result = builder.build(approved_records, verified_experiences)
+    paths = E0ArtifactPaths.create(args.output_dir)
     if not result.records:
-        raise RuntimeError("No runtime-safe MemoryRecords survived E0 payload audit")
+        persist_no_survivor_diagnostics(
+            paths=paths,
+            result=result,
+            approved_bank=args.approved_bank,
+            verified_experiences=args.verified_experiences,
+            reasoner_name=args.model,
+            reasoner_revision=resolved_model_revision,
+            tokenizer_revision=resolved_tokenizer_revision,
+            sanitizer_config=sanitizer_config,
+            bm25_config=BM25Config(k1=args.bm25_k1, b=args.bm25_b),
+            analyzer_config=TextAnalyzerConfig(),
+            layer=args.layer,
+            dtype=args.dtype,
+            text_only=args.text_only,
+        )
+        raise RuntimeError(
+            "No runtime-safe MemoryRecords survived E0 payload audit; "
+            f"inspect {paths.payload_audit} and {paths.trace}"
+        )
 
-    output_dir = args.output_dir.expanduser()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    trace_path = output_dir / "memory_compilation_trace.jsonl"
-    audit_path = output_dir / "payload_audit_report.json"
-    records_path = output_dir / "memory_records.v1.jsonl"
-    index_path = output_dir / "bm25_index.v1.json"
-    e0_report_path = output_dir / "e0_report.json"
+    output_dir = paths.output_dir
+    trace_path = paths.trace
+    audit_path = paths.payload_audit
+    records_path = paths.records
+    index_path = paths.bm25_index
+    e0_report_path = paths.e0_report
     write_jsonl(trace_path, (item.to_dict() for item in result.trace))
 
     records = list(result.records)
