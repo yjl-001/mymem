@@ -229,8 +229,8 @@ class MemoryRecordTests(unittest.TestCase):
         self.assertNotIn("FORBIDDEN_REVIEW_SENTINEL", record.sanitized_retrieval_key)
         self.assertNotIn("Reconsider only", record.sanitized_contrast_payload)
 
-    def test_numeric_literal_rejects_the_whole_record_without_redaction(self) -> None:
-        for literal in ("4", "four"):
+    def test_concrete_numeric_or_math_literal_rejects_without_redaction(self) -> None:
+        for literal in ("4", r"\frac"):
             with self.subTest(literal=literal):
                 approved = approved_record()
                 approved["bank"]["target"]["verification_rule"] = (
@@ -247,6 +247,26 @@ class MemoryRecordTests(unittest.TestCase):
                         for reason in result.trace[0].reasons
                     )
                 )
+
+    def test_generic_answer_language_and_number_words_are_not_leakage(self) -> None:
+        approved = approved_record()
+        approved["bank"]["target"]["verification_rule"] = (
+            "Check the final answer one more time for internal consistency."
+        )
+        result = builder(self.tokenizer).build([approved], [verified_experience()])
+        self.assertEqual(len(result.records), 1)
+
+    def test_explicit_boxed_answer_container_is_still_forbidden(self) -> None:
+        approved = approved_record()
+        approved["bank"]["target"]["verification_rule"] = (
+            r"Do not copy a \boxed{} result without checking it."
+        )
+        result = builder(self.tokenizer).build([approved], [verified_experience()])
+        self.assertEqual(result.records, ())
+        self.assertIn(
+            "bank.target.verification_rule:final_answer_marker",
+            result.trace[0].reasons,
+        )
 
     def test_long_source_quote_rejects_the_record(self) -> None:
         experience = verified_experience()

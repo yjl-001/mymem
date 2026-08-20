@@ -64,9 +64,11 @@ Avoid       = reference.competing_pattern + reference.failure_signal
 `reference.non_reuse_boundary` 仅保留于 Phase 1 provenance；E0-v1 不把它拼入 payload，避免把
 “何时不应复用失败模式”的例外语义错误渲染为在线 Avoid 指令。
 
-编译器只允许 NFKC、控制字符删除、空白折叠和完全重复句去重。任一必需字段包含数字/公式、
-最终答案标记、原题/轨迹长 quote、Teacher evidence 或 Pro evidence 时，整条 record 被拒绝。
-不得通过删除局部 literal 后继续使用剩余句子。
+编译器只允许 NFKC、控制字符删除、空白折叠和完全重复句去重。任一必需字段包含具体数字/公式、
+`\\boxed`/`\\fbox` 答案容器、原题/轨迹长 quote、Teacher evidence 或 Pro evidence 时，整条
+record 被拒绝。泛指的 “final answer” 和普通英文数量词本身不携带实例答案，不能仅凭这些词
+判为泄漏；仍由具体数字/数学符号与 source-overlap 审计阻止可复原实例内容。不得通过删除局部
+literal 后继续使用剩余句子。
 
 ## 4. Layer 与 KV 契约
 
