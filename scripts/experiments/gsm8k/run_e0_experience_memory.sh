@@ -60,11 +60,6 @@ if [[ -z "$PHASE1_DIR" ]]; then
 fi
 
 : "${MEMGEN_OUTPUT_ROOT:?MEMGEN_OUTPUT_ROOT must be set in .e0.server.env}"
-: "${MEMGEN_E0_MAX_PAYLOAD_TOKENS:?Freeze MEMGEN_E0_MAX_PAYLOAD_TOKENS in .e0.server.env}"
-if [[ ! "$MEMGEN_E0_MAX_PAYLOAD_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
-  echo "MEMGEN_E0_MAX_PAYLOAD_TOKENS must be a positive integer" >&2
-  exit 1
-fi
 
 APPROVED_BANK="$PHASE1_DIR/ai_approved_bank_records.jsonl"
 VERIFIED_EXPERIENCES="$PHASE1_DIR/verified_experiences.jsonl"
@@ -126,7 +121,6 @@ if [[ "$PRINT_CONFIG" == "1" ]]; then
   printf 'model_revision=%s\n' "$MODEL_REVISION"
   printf 'tokenizer_revision=%s\n' "$TOKENIZER_REVISION"
   printf 'dataset_revision=%s\n' "$DATASET_REVISION"
-  printf 'max_payload_tokens=%s\n' "$MEMGEN_E0_MAX_PAYLOAD_TOKENS"
   printf 'cuda_visible_devices=%s\n' "$CUDA_VISIBLE_DEVICES"
   printf 'dtype=%s\n' "$DTYPE"
   printf 'text_only=%s\n' "$TEXT_ONLY"
@@ -134,7 +128,7 @@ if [[ "$PRINT_CONFIG" == "1" ]]; then
 fi
 
 RUN_TAG="${MEMGEN_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
-RUN_ID="gsm8k_e0_experience-memory_layer24_budget${MEMGEN_E0_MAX_PAYLOAD_TOKENS}_${RUN_TAG}"
+RUN_ID="gsm8k_e0_experience-memory_layer24_${RUN_TAG}"
 RUN_DIR="$MEMGEN_OUTPUT_ROOT/e0/gsm8k/$RUN_ID"
 mkdir -p "$RUN_DIR"
 
@@ -145,7 +139,6 @@ COMPILE_ARGS=(
   --model "$MODEL"
   --model-revision "$MODEL_REVISION"
   --tokenizer-revision "$TOKENIZER_REVISION"
-  --max-payload-tokens "$MEMGEN_E0_MAX_PAYLOAD_TOKENS"
   --layer 24
   --dtype "$DTYPE"
   --device "$DEVICE"
@@ -159,7 +152,7 @@ if [[ "$TEXT_ONLY" != "1" && -z "$AUDIT_CASES" ]]; then
   AUDIT_CASES="$RUN_DIR/calibration_audit_cases.jsonl"
   python scripts/build_side_kv_audit_cases.py \
     --split-manifest "$SPLIT_MANIFEST" \
-    --memory-records "$RUN_DIR/memory_records.v1.jsonl" \
+    --memory-records "$RUN_DIR/memory_records.v2.jsonl" \
     --output "$AUDIT_CASES" \
     --model "$MODEL" \
     --model-revision "$MODEL_REVISION" \

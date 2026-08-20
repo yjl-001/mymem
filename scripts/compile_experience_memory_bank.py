@@ -48,14 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--tokenizer-revision")
-    parser.add_argument("--max-payload-tokens", type=int, required=True)
     parser.add_argument("--layer", type=int, default=24)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--bm25-k1", type=float, default=1.2)
     parser.add_argument("--bm25-b", type=float, default=0.75)
-    parser.add_argument("--source-overlap-ngram-tokens", type=int, default=8)
-    parser.add_argument("--evidence-overlap-ngram-tokens", type=int, default=6)
     parser.add_argument(
         "--text-only",
         action="store_true",
@@ -86,6 +83,21 @@ def git_revision() -> str | None:
         return None
 
 
+def resolve_model_sequence_limit(config: Any, tokenizer: Any) -> int:
+    """Resolve the real model/tokenizer context ceiling, ignoring HF sentinels."""
+
+    candidates = []
+    for value in (
+        getattr(config, "max_position_embeddings", None),
+        getattr(tokenizer, "model_max_length", None),
+    ):
+        if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 10**9:
+            candidates.append(value)
+    if not candidates:
+        raise ValueError("Unable to resolve a finite model sequence limit")
+    return min(candidates)
+
+
 @dataclass(frozen=True)
 class E0ArtifactPaths:
     """Stable artifact locations shared by successful and failed compilation."""
@@ -105,7 +117,7 @@ class E0ArtifactPaths:
             output_dir=resolved_output,
             trace=resolved_output / "memory_compilation_trace.jsonl",
             payload_audit=resolved_output / "payload_audit_report.json",
-            records=resolved_output / "memory_records.v1.jsonl",
+            records=resolved_output / "memory_records.v2.jsonl",
             bm25_index=resolved_output / "bm25_index.v1.json",
             e0_report=resolved_output / "e0_report.json",
         )
@@ -120,6 +132,7 @@ def persist_no_survivor_diagnostics(
     reasoner_name: str,
     reasoner_revision: str,
     tokenizer_revision: str,
+    model_sequence_limit: int,
     sanitizer_config: MemorySanitizerConfig,
     bm25_config: BM25Config,
     analyzer_config: TextAnalyzerConfig,
@@ -168,7 +181,7 @@ def persist_no_survivor_diagnostics(
     write_json(paths.payload_audit, audit_report)
 
     e0_report = {
-        "schema_version": "experience-memory-e0-report-v1",
+        "schema_version": "experience-memory-e0-report-v2",
         "created_at": created_at,
         "status": "failed_no_runtime_safe_records",
         "formal_e0_passed": False,
@@ -176,6 +189,7 @@ def persist_no_survivor_diagnostics(
         "failure": failure,
         "configuration": {
             "sanitizer": asdict(sanitizer_config),
+            "model_sequence_limit": model_sequence_limit,
             "bm25": asdict(bm25_config),
             "analyzer": asdict(analyzer_config),
             "layer": layer,
@@ -214,8 +228,6 @@ def main() -> None:
     args = parse_args()
     if args.layer != 24:
         raise ValueError("E0-v1 is frozen to layer 24")
-    if args.max_payload_tokens <= 0:
-        raise ValueError("--max-payload-tokens must be positive")
 
     try:
         import torch
@@ -236,21 +248,18 @@ def main() -> None:
         getattr(tokenizer, "init_kwargs", {}).get("_commit_hash")
         or tokenizer_revision_request
     )
+    model_sequence_limit = resolve_model_sequence_limit(config, tokenizer)
 
     approved_records = list(iter_jsonl(args.approved_bank))
     verified_experiences = list(iter_jsonl(args.verified_experiences))
-    sanitizer_config = MemorySanitizerConfig(
-        max_payload_tokens=args.max_payload_tokens,
-        source_overlap_ngram_tokens=args.source_overlap_ngram_tokens,
-        evidence_overlap_ngram_tokens=args.evidence_overlap_ngram_tokens,
-        forbid_numeric_literals=True,
-    )
+    sanitizer_config = MemorySanitizerConfig(forbid_numeric_literals=True)
     record_compiler = MemoryRecordCompiler(
         tokenizer=tokenizer,
         sanitizer=PayloadSanitizer(sanitizer_config),
         reasoner_name=args.model,
         reasoner_revision=resolved_model_revision,
         tokenizer_revision=resolved_tokenizer_revision,
+        model_sequence_limit=model_sequence_limit,
         kv_layer=args.layer,
     )
     builder = MemoryBankBuilder(
@@ -270,6 +279,7 @@ def main() -> None:
             reasoner_name=args.model,
             reasoner_revision=resolved_model_revision,
             tokenizer_revision=resolved_tokenizer_revision,
+            model_sequence_limit=model_sequence_limit,
             sanitizer_config=sanitizer_config,
             bm25_config=BM25Config(k1=args.bm25_k1, b=args.bm25_b),
             analyzer_config=TextAnalyzerConfig(),
@@ -353,7 +363,7 @@ def main() -> None:
 
     artifact_audit = MemoryArtifactAuditor(
         tokenizer=tokenizer,
-        expected_token_budget=args.max_payload_tokens,
+        expected_model_sequence_limit=model_sequence_limit,
         expected_kv_layer=args.layer,
         expected_kv_compiled=not args.text_only,
     ).assert_valid(records)
@@ -398,7 +408,7 @@ def main() -> None:
     write_json(audit_path, audit_report)
 
     e0_report = {
-        "schema_version": "experience-memory-e0-report-v1",
+        "schema_version": "experience-memory-e0-report-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": (
             "text_only_passed"
@@ -409,6 +419,7 @@ def main() -> None:
         "compiler_git_revision": git_revision(),
         "configuration": {
             "sanitizer": asdict(sanitizer_config),
+            "model_sequence_limit": model_sequence_limit,
             "bm25": asdict(bm25.config),
             "analyzer": asdict(analyzer.config),
             "layer": args.layer,

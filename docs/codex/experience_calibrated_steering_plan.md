@@ -41,14 +41,15 @@ online prompt + partial CoT ──► reasoning boundary ──► entropy-risk 
   改写原 prompt/history KV cache。
 
 当前首版固定在 layer 24，在线每条样本只允许在**首次**满足 trigger 的 reasoning boundary
-附加一条 memory。layer、预算和检索器一经 E0/E1 前冻结，就不得用 final-test accuracy 调整。
+附加一条 memory。layer 在 E0 前固定；E1 的容量和检索器在读取 E0 的长度/系统成本诊断后冻结，
+此后不得用 E1 或 final-test accuracy 调整。
 
 ## 3. 数据、质量与反泄漏约束
 
 | 数据 | 用途 | 不允许用途 |
 |---|---|---|
 | `bank-source` | rollout、verifier、Teacher/Pro 审核、MemoryRecord 与风险原型 | 线上结果选择、final-test |
-| `calibration-val` | payload 预算、cache 可行性、固定检索配置 | 写入 bank、final-test |
+| `calibration-val` | cache 可行性、E1 容量与固定检索配置 | 写入 bank、final-test |
 | 预注册 evaluation split | E1–E3 的开发性因果实验 | 改写 bank 或 payload 定义 |
 | `final-test` | 一次性确认 | 任意设计或配置选择 |
 
@@ -122,9 +123,10 @@ R(h_t)=\cos(h_t,\mu_{\mathrm{persistence}})-\cos(h_t,\mu_{\mathrm{recovery}}).
 **工作与输出**：
 
 1. 从 Pro 支持的 `situation/applicability`、target 策略/验证、reference 机制/信号构造 payload；
-2. 逐条检测并移除泄漏、原始 quote、实例 literal、重复和超过 token budget 的内容；
-3. 产生 versioned `MemoryRecord` JSONL、payload audit report、检索 key index 和 layer-24 side-KV bank；
-4. 单测 KV shape、canonical RoPE、cache 保持性；在运行时 trace 中证明实际附加的 memory 有非零
+2. 逐条拒绝显式答案容器、实例 literal、完整原文复制和重复；局部 overlap 仅作诊断；
+3. 记录完整 payload 的 token-length 分布，只以模型真实序列上限作为 E0 技术边界；
+4. 产生 versioned `MemoryRecord` JSONL、payload audit report、检索 key index 和 layer-24 side-KV bank；
+5. 单测 KV shape、canonical RoPE、cache 保持性；在运行时 trace 中证明实际附加的 memory 有非零
    attention mass。
 
 **通过条件**：payload audit 无泄漏；所有 KV/cache 单测通过；每次 side-KV 应用均能记录 memory
@@ -134,8 +136,9 @@ attention mass。E0 不得以任务正确率宣称效果。
 
 **问题**：模型的变化来自匹配的经验内容，还是任意额外文本/KV 扰动？
 
-**冻结前置项**：在 `calibration-val` 上冻结一个透明的检索 baseline（首版为 BM25 over sanitized
-retrieval keys）、top-1、payload token budget、layer 24、首次触发和每样本最多一次。冻结文本
+**冻结前置项**：根据 E0 的完整 payload 长度、KV footprint 和系统成本冻结 E1 全局容量；在
+`calibration-val` 上冻结一个透明的检索 baseline（首版为 BM25 over sanitized retrieval keys）、
+top-1、layer 24、首次触发和每样本最多一次。冻结文本
 embedding retriever 可在独立后续 ablation 中比较，但不以 E1 或 final-test accuracy 选择。
 
 先运行 `gate-observation-only` prepass，为每题生成不可变 assignment manifest：首次候选 boundary、

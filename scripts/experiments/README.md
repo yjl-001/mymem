@@ -125,9 +125,9 @@ bash scripts/experiments/gsm8k/run_e0_experience_memory.sh \
 未传第二个参数时，脚本会从 Phase 1 split manifest 的 `calibration-val` 自动构造 answer-blind
 机制审计 prefixes；也可显式传入满足同一审计 schema 的 JSONL。
 
-`.e0.server.env` 只保留 `MEMGEN_OUTPUT_ROOT`、`MEMGEN_E0_MAX_PAYLOAD_TOKENS` 和可选 GPU 编号。
-模型、model revision、tokenizer revision 与 dataset revision 全部从 Phase 1 artifacts 自动读取，
-不得手工重复配置。可先验证最终解析结果而不加载模型：
+`.e0.server.env` 只保留 `MEMGEN_OUTPUT_ROOT` 和可选 GPU 编号。E0 不使用人为 payload token
+budget；模型、model revision、tokenizer revision、真实序列上限与 dataset revision 从 Phase 1
+artifacts 和冻结 reasoner 配置自动读取，不得手工重复配置。可先验证最终解析结果而不加载模型：
 
 ```bash
 bash scripts/experiments/gsm8k/run_e0_experience_memory.sh \

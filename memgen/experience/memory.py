@@ -22,10 +22,10 @@ from memgen.experience.phase1 import (
 )
 
 
-MEMORY_RECORD_SCHEMA = "experience-memory-record-v1"
+MEMORY_RECORD_SCHEMA = "experience-memory-record-v2"
 MEMORY_BUILD_TRACE_SCHEMA = "experience-memory-build-trace-v1"
-MEMORY_BUILD_REPORT_SCHEMA = "experience-memory-build-report-v1"
-MEMORY_ARTIFACT_AUDIT_SCHEMA = "experience-memory-artifact-audit-v1"
+MEMORY_BUILD_REPORT_SCHEMA = "experience-memory-build-report-v2"
+MEMORY_ARTIFACT_AUDIT_SCHEMA = "experience-memory-artifact-audit-v2"
 STRUCTURED_PRO_REVIEW_SCHEMA = "phase1-ai-review-record-v2"
 STRUCTURED_PRO_REVIEW_PROMPT = "phase1-ai-review-v2-field-evidence-rubric"
 LEGACY_PRO_REVIEW_SCHEMA = "phase1-ai-review-record-v1"
@@ -91,16 +91,13 @@ class MemoryRecordRejected(ValueError):
 
 @dataclass(frozen=True)
 class MemorySanitizerConfig:
-    """Frozen policy for converting reviewed fields into online text."""
+    """Frozen hard checks plus non-blocking overlap diagnostic thresholds."""
 
-    max_payload_tokens: int
     source_overlap_ngram_tokens: int = 8
     evidence_overlap_ngram_tokens: int = 6
     forbid_numeric_literals: bool = True
 
     def __post_init__(self) -> None:
-        if self.max_payload_tokens <= 0:
-            raise ValueError("max_payload_tokens must be positive")
         if self.source_overlap_ngram_tokens < 2:
             raise ValueError("source_overlap_ngram_tokens must be at least 2")
         if self.evidence_overlap_ngram_tokens < 2:
@@ -123,12 +120,13 @@ class MemoryRecord:
     reasoner_revision: str
     tokenizer_revision: str
     sanitized_fields: Mapping[str, str]
+    payload_diagnostics: Mapping[str, Sequence[str]]
     sanitized_retrieval_key: str
     sanitized_contrast_payload: str
     payload_hash: str
     token_ids_sha256: str
     token_count: int
-    token_budget: int
+    model_sequence_limit: int
     kv_layer: int = 24
     canonical_pre_rope_kv: Mapping[str, Any] = field(
         default_factory=lambda: {
@@ -585,39 +583,74 @@ class PayloadSanitizer:
             ("target_trajectory", verified.get("trajectory")),
             ("reference_trajectory", verified.get("reference_trajectory")),
         ):
-            if self._has_ngram_overlap(
-                normalized,
-                raw,
-                self.config.source_overlap_ngram_tokens,
-            ):
-                reasons.append(f"{path}:overlaps_{label}")
+            if self._same_nonempty_text(normalized, raw):
+                reasons.append(f"{path}:copies_{label}")
 
         bank = source.approved_record.get("bank", {})
         evidence = bank.get("evidence", {}) if isinstance(bank, Mapping) else {}
         if isinstance(evidence, Mapping):
             for label in ("target_observation", "reference_observation"):
                 raw = evidence.get(label)
-                if self._same_nonempty_text(normalized, raw) or self._has_ngram_overlap(
-                    normalized,
-                    raw,
-                    self.config.evidence_overlap_ngram_tokens,
-                ):
-                    reasons.append(f"{path}:overlaps_bank_evidence_{label}")
+                if self._same_nonempty_text(normalized, raw):
+                    reasons.append(f"{path}:copies_bank_evidence_{label}")
 
         gate = source.approved_record.get("ai_review_gate", {})
         review = gate.get("ai_review", {}) if isinstance(gate, Mapping) else {}
         for evidence_text in self._review_evidence_texts(review):
-            if self._same_nonempty_text(normalized, evidence_text) or self._has_ngram_overlap(
-                normalized,
-                evidence_text,
-                self.config.evidence_overlap_ngram_tokens,
-            ):
-                reasons.append(f"{path}:overlaps_pro_evidence")
+            if self._same_nonempty_text(normalized, evidence_text):
+                reasons.append(f"{path}:copies_pro_evidence")
                 break
 
         if reasons:
             raise MemoryRecordRejected(reasons)
         return normalized
+
+    def overlap_diagnostics(
+        self,
+        *,
+        path: str,
+        normalized: str,
+        source: Phase1MemorySource,
+    ) -> tuple[str, ...]:
+        """Report partial text overlap without using it as a quality gate."""
+
+        diagnostics: list[str] = []
+        verified = source.verified_experience
+        for label, raw in (
+            ("context", verified.get("context")),
+            ("target_trajectory", verified.get("trajectory")),
+            ("reference_trajectory", verified.get("reference_trajectory")),
+        ):
+            if self._has_ngram_overlap(
+                normalized,
+                raw,
+                self.config.source_overlap_ngram_tokens,
+            ):
+                diagnostics.append(f"{path}:overlaps_{label}")
+
+        bank = source.approved_record.get("bank", {})
+        evidence = bank.get("evidence", {}) if isinstance(bank, Mapping) else {}
+        if isinstance(evidence, Mapping):
+            for label in ("target_observation", "reference_observation"):
+                if self._has_ngram_overlap(
+                    normalized,
+                    evidence.get(label),
+                    self.config.evidence_overlap_ngram_tokens,
+                ):
+                    diagnostics.append(f"{path}:overlaps_bank_evidence_{label}")
+
+        gate = source.approved_record.get("ai_review_gate", {})
+        review = gate.get("ai_review", {}) if isinstance(gate, Mapping) else {}
+        if any(
+            self._has_ngram_overlap(
+                normalized,
+                evidence_text,
+                self.config.evidence_overlap_ngram_tokens,
+            )
+            for evidence_text in self._review_evidence_texts(review)
+        ):
+            diagnostics.append(f"{path}:overlaps_pro_evidence")
+        return tuple(sorted(set(diagnostics)))
 
     @staticmethod
     def _same_nonempty_text(left: str, right: Any) -> bool:
@@ -653,6 +686,13 @@ class PayloadSanitizer:
         if not isinstance(review, Mapping):
             return []
         values: list[str] = []
+        legacy_evidence = review.get("evidence")
+        if isinstance(legacy_evidence, Mapping):
+            values.extend(
+                value
+                for value in legacy_evidence.values()
+                if isinstance(value, str)
+            )
         for section in ("field_assessments", "pair_assessments"):
             root = review.get(section)
             if not isinstance(root, Mapping):
@@ -679,15 +719,19 @@ class MemoryRecordCompiler:
         reasoner_name: str,
         reasoner_revision: str,
         tokenizer_revision: str,
+        model_sequence_limit: int,
         kv_layer: int = 24,
     ):
         if kv_layer <= 0:
             raise ValueError("kv_layer must be positive")
+        if model_sequence_limit <= 0:
+            raise ValueError("model_sequence_limit must be positive")
         self.tokenizer = tokenizer
         self.sanitizer = sanitizer
         self.reasoner_name = reasoner_name
         self.reasoner_revision = reasoner_revision
         self.tokenizer_revision = tokenizer_revision
+        self.model_sequence_limit = model_sequence_limit
         self.kv_layer = kv_layer
 
     def compile(self, source: Phase1MemorySource) -> MemoryRecord:
@@ -707,15 +751,24 @@ class MemoryRecordCompiler:
             raise MemoryRecordRejected(["missing_reviewed_bank"])
 
         sanitized_by_path: dict[str, str] = {}
+        diagnostics_by_path: dict[str, tuple[str, ...]] = {}
         reasons: list[str] = []
         for paths in PAYLOAD_FIELD_LINEAGE.values():
             for path in paths:
                 try:
-                    sanitized_by_path[path] = self.sanitizer.sanitize_field(
+                    normalized = self.sanitizer.sanitize_field(
                         path=path,
                         value=self._read_path(approved, path),
                         source=source,
                     )
+                    sanitized_by_path[path] = normalized
+                    diagnostics = self.sanitizer.overlap_diagnostics(
+                        path=path,
+                        normalized=normalized,
+                        source=source,
+                    )
+                    if diagnostics:
+                        diagnostics_by_path[path] = diagnostics
                 except MemoryRecordRejected as exc:
                     reasons.extend(exc.reasons)
         if reasons:
@@ -742,8 +795,8 @@ class MemoryRecordCompiler:
         ]
         if not token_ids:
             raise MemoryRecordRejected(["rendered_payload_has_no_tokens"])
-        if len(token_ids) > self.sanitizer.config.max_payload_tokens:
-            raise MemoryRecordRejected(["payload_exceeds_token_budget"])
+        if len(token_ids) > self.model_sequence_limit:
+            raise MemoryRecordRejected(["payload_exceeds_model_sequence_limit"])
 
         retrieval_key = " ".join(fields.values())
         payload_hash = canonical_json_sha256(
@@ -772,12 +825,13 @@ class MemoryRecordCompiler:
             reasoner_revision=self.reasoner_revision,
             tokenizer_revision=self.tokenizer_revision,
             sanitized_fields=fields,
+            payload_diagnostics=diagnostics_by_path,
             sanitized_retrieval_key=retrieval_key,
             sanitized_contrast_payload=payload,
             payload_hash=payload_hash,
             token_ids_sha256=canonical_json_sha256(token_ids),
             token_count=len(token_ids),
-            token_budget=self.sanitizer.config.max_payload_tokens,
+            model_sequence_limit=self.model_sequence_limit,
             kv_layer=self.kv_layer,
         )
 
@@ -877,6 +931,12 @@ class MemoryBankBuilder:
         token_counts = sorted(record.token_count for record in records)
         status_counts = Counter(item.status for item in trace)
         reason_counts = Counter(reason for item in trace for reason in item.reasons)
+        diagnostic_counts = Counter(
+            diagnostic
+            for record in records
+            for diagnostics in record.payload_diagnostics.values()
+            for diagnostic in diagnostics
+        )
         report = {
             "schema_version": MEMORY_BUILD_REPORT_SCHEMA,
             "input_approved_count": len(approved),
@@ -895,9 +955,19 @@ class MemoryBankBuilder:
             ),
             "status_counts": dict(sorted(status_counts.items())),
             "rejection_reason_counts": dict(sorted(reason_counts.items())),
+            "payload_diagnostic_counts": dict(sorted(diagnostic_counts.items())),
+            "records_with_payload_diagnostics": sum(
+                bool(record.payload_diagnostics) for record in records
+            ),
             "token_count": self._distribution(token_counts),
+            "model_sequence_limit": self.compiler.model_sequence_limit,
             "payload_hash_unique_count": len(seen_payload_hashes),
-            "policy": asdict(self.compiler.sanitizer.config),
+            "policy": {
+                "sanitizer": asdict(self.compiler.sanitizer.config),
+                "partial_overlap": "diagnostic_only",
+                "exact_source_or_evidence_copy": "reject",
+                "payload_length": "record_only_except_model_sequence_limit",
+            },
             "record_set_sha256": canonical_json_sha256(
                 [record.to_dict() for record in records]
             ),
@@ -931,16 +1001,16 @@ class MemoryArtifactAuditor:
         self,
         *,
         tokenizer: TokenizerLike,
-        expected_token_budget: int,
+        expected_model_sequence_limit: int,
         expected_kv_layer: int = 24,
         expected_kv_compiled: bool | None = None,
     ):
-        if expected_token_budget <= 0:
-            raise ValueError("expected_token_budget must be positive")
+        if expected_model_sequence_limit <= 0:
+            raise ValueError("expected_model_sequence_limit must be positive")
         if expected_kv_layer <= 0:
             raise ValueError("expected_kv_layer must be positive")
         self.tokenizer = tokenizer
-        self.expected_token_budget = expected_token_budget
+        self.expected_model_sequence_limit = expected_model_sequence_limit
         self.expected_kv_layer = expected_kv_layer
         self.expected_kv_compiled = expected_kv_compiled
 
@@ -973,7 +1043,7 @@ class MemoryArtifactAuditor:
             "violation_count": len(violations),
             "violations": violations,
             "violation_reason_counts": dict(sorted(reason_counts.items())),
-            "expected_token_budget": self.expected_token_budget,
+            "expected_model_sequence_limit": self.expected_model_sequence_limit,
             "expected_kv_layer": self.expected_kv_layer,
             "expected_kv_compiled": self.expected_kv_compiled,
             "record_set_sha256": canonical_json_sha256(
@@ -1038,6 +1108,25 @@ class MemoryArtifactAuditor:
                 )
                 if record.sanitized_retrieval_key != expected_retrieval_key:
                     reasons.append("retrieval_key_render_mismatch")
+        allowed_paths = {
+            path for paths in PAYLOAD_FIELD_LINEAGE.values() for path in paths
+        }
+        if not isinstance(record.payload_diagnostics, Mapping):
+            reasons.append("payload_diagnostics_invalid")
+        else:
+            for path, diagnostics in record.payload_diagnostics.items():
+                if path not in allowed_paths:
+                    reasons.append("payload_diagnostic_path_not_allowlisted")
+                if not isinstance(diagnostics, Sequence) or isinstance(
+                    diagnostics, (str, bytes)
+                ):
+                    reasons.append("payload_diagnostic_reasons_invalid")
+                elif any(
+                    not isinstance(value, str)
+                    or not value.startswith(f"{path}:overlaps_")
+                    for value in diagnostics
+                ):
+                    reasons.append("payload_diagnostic_reason_mismatch")
         if _FINAL_ANSWER_RE.search(record.sanitized_contrast_payload):
             reasons.append("payload_final_answer_marker")
         if _NUMERIC_LITERAL_RE.search(record.sanitized_contrast_payload):
@@ -1071,10 +1160,10 @@ class MemoryArtifactAuditor:
             reasons.append("token_ids_hash_mismatch")
         if record.token_count != len(token_ids):
             reasons.append("token_count_mismatch")
-        if record.token_budget != self.expected_token_budget:
-            reasons.append("token_budget_mismatch")
-        if not token_ids or len(token_ids) > self.expected_token_budget:
-            reasons.append("token_budget_violated")
+        if record.model_sequence_limit != self.expected_model_sequence_limit:
+            reasons.append("model_sequence_limit_mismatch")
+        if not token_ids or len(token_ids) > self.expected_model_sequence_limit:
+            reasons.append("model_sequence_limit_violated")
         if record.kv_layer != self.expected_kv_layer:
             reasons.append("kv_layer_mismatch")
         if not isinstance(record.canonical_pre_rope_kv, Mapping):

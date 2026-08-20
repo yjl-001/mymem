@@ -65,10 +65,10 @@ Avoid       = reference.competing_pattern + reference.failure_signal
 “何时不应复用失败模式”的例外语义错误渲染为在线 Avoid 指令。
 
 编译器只允许 NFKC、控制字符删除、空白折叠和完全重复句去重。任一必需字段包含具体数字/公式、
-`\\boxed`/`\\fbox` 答案容器、原题/轨迹长 quote、Teacher evidence 或 Pro evidence 时，整条
+`\\boxed`/`\\fbox` 答案容器，或完整复制原题、轨迹、Teacher evidence、Pro evidence 时，整条
 record 被拒绝。泛指的 “final answer” 和普通英文数量词本身不携带实例答案，不能仅凭这些词
-判为泄漏；仍由具体数字/数学符号与 source-overlap 审计阻止可复原实例内容。不得通过删除局部
-literal 后继续使用剩余句子。
+判为泄漏。局部 n-gram overlap 只写入 `payload_diagnostics` 和汇总报告，不再重复执行 Phase 1
+的抽象质量准入。编译器不得通过删除局部 literal 后继续使用剩余句子。
 
 ## 4. Layer 与 KV 契约
 
@@ -120,7 +120,7 @@ forward prefix[-1]  -> boundary query 首次读取 memory
 
 `compile_experience_memory_bank.py` 输出：
 
-- `memory_records.v1.jsonl`
+- `memory_records.v2.jsonl`
 - `memory_compilation_trace.jsonl`
 - `payload_audit_report.json`
 - `bm25_index.v1.json`
@@ -151,7 +151,8 @@ bash scripts/experiments/gsm8k/run_e0_experience_memory.sh \
 第二个参数可选；未提供时会从冻结 split manifest 的 `calibration-val` 自动生成 answer-blind
 audit cases。外部 case 文件也必须满足同一 schema 和来源审计。
 
-token budget 必须通过 `scripts/experiments/gsm8k/.e0.server.env` 的
-`MEMGEN_E0_MAX_PAYLOAD_TOKENS` 显式冻结。这个最小 env 还包含输出根目录和可选 GPU 编号；模型及
-数据 revision 从 Phase 1 artifacts 自动读取。budget 只能依据 payload 长度和系统成本审计选择，
-不能依据 E1 或 final-test accuracy。
+E0 不设置人为 payload token budget；它编译通过硬约束的完整 payload，记录
+`min/median/p95/max`，只以 reasoner/tokenizer 的真实序列上限作为技术边界。E1 使用的全局容量
+必须在读取 E0 长度、KV footprint 和系统成本后冻结，不能依据 E1 或 final-test accuracy 选择。
+`.e0.server.env` 因而只包含输出根目录和可选 GPU 编号；模型、序列上限及数据 revision 均从
+Phase 1 artifacts 和冻结 reasoner 配置自动读取。

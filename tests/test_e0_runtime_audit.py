@@ -12,7 +12,7 @@ from scripts.audit_side_kv_mechanism import validate_case, validate_compile_repo
 class CompileArtifactValidationTests(unittest.TestCase):
     def build_fixture(self, root: Path) -> tuple[Path, Path, Path]:
         artifact_names = {
-            "memory_records": "memory_records.v1.jsonl",
+            "memory_records": "memory_records.v2.jsonl",
             "compilation_trace": "memory_compilation_trace.jsonl",
             "payload_audit": "payload_audit_report.json",
             "bm25_index": "bm25_index.v1.json",

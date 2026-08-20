@@ -296,6 +296,12 @@ class CanonicalSideKVCompiler:
             )
         if canonical_json_sha256([int(value) for value in payload_ids]) != record.token_ids_sha256:
             raise ValueError(f"Tokenizer token-id hash drift for {record.memory_id}")
+        if len(prefix_ids) + len(payload_ids) > record.model_sequence_limit:
+            raise ValueError(
+                f"Compiled input exceeds model sequence limit for {record.memory_id}: "
+                f"input={len(prefix_ids) + len(payload_ids)}, "
+                f"limit={record.model_sequence_limit}"
+            )
         input_ids = torch.tensor(
             [prefix_ids + payload_ids],
             dtype=torch.long,

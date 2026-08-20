@@ -193,15 +193,20 @@ def verified_experience(experience_id: str = "experience-1") -> dict:
     }
 
 
-def builder(tokenizer: WhitespaceTokenizer, *, budget: int = 128) -> MemoryBankBuilder:
+def builder(
+    tokenizer: WhitespaceTokenizer,
+    *,
+    model_sequence_limit: int = 4096,
+) -> MemoryBankBuilder:
     return MemoryBankBuilder(
         selector=ApprovedMemorySourceSelector(),
         compiler=MemoryRecordCompiler(
             tokenizer=tokenizer,
-            sanitizer=PayloadSanitizer(MemorySanitizerConfig(max_payload_tokens=budget)),
+            sanitizer=PayloadSanitizer(MemorySanitizerConfig()),
             reasoner_name="Qwen/Qwen2.5-1.5B-Instruct",
             reasoner_revision="student-revision",
             tokenizer_revision="tokenizer-revision",
+            model_sequence_limit=model_sequence_limit,
         ),
     )
 
@@ -268,7 +273,7 @@ class MemoryRecordTests(unittest.TestCase):
             result.trace[0].reasons,
         )
 
-    def test_long_source_quote_rejects_the_record(self) -> None:
+    def test_exact_source_copy_rejects_the_record(self) -> None:
         experience = verified_experience()
         experience["trajectory"] = (
             "Carefully preserve every relation before applying the next supported operation."
@@ -277,9 +282,36 @@ class MemoryRecordTests(unittest.TestCase):
         approved["bank"]["target"]["transferable_decision"] = experience["trajectory"]
         result = builder(self.tokenizer).build([approved], [experience])
         self.assertEqual(result.records, ())
-        self.assertTrue(
-            any("overlaps_target_trajectory" in reason for reason in result.trace[0].reasons)
+        self.assertIn(
+            "bank.target.transferable_decision:copies_target_trajectory",
+            result.trace[0].reasons,
         )
+
+    def test_exact_teacher_evidence_copy_rejects_the_record(self) -> None:
+        approved = approved_record()
+        copied = approved["bank"]["target"]["transferable_decision"]
+        approved["bank"]["evidence"]["target_observation"] = copied
+        result = builder(self.tokenizer).build([approved], [verified_experience()])
+        self.assertEqual(result.records, ())
+        self.assertIn(
+            "bank.target.transferable_decision:copies_bank_evidence_target_observation",
+            result.trace[0].reasons,
+        )
+
+    def test_partial_source_overlap_is_recorded_but_does_not_reject(self) -> None:
+        approved = approved_record()
+        copied_phrase = approved["bank"]["target"]["verification_rule"]
+        experience = verified_experience()
+        experience["trajectory"] = f"Before continuing, {copied_phrase} Then conclude."
+        result = builder(self.tokenizer).build([approved], [experience])
+        self.assertEqual(len(result.records), 1)
+        diagnostics = result.records[0].payload_diagnostics
+        self.assertIn("bank.target.verification_rule", diagnostics)
+        self.assertIn(
+            "bank.target.verification_rule:overlaps_target_trajectory",
+            diagnostics["bank.target.verification_rule"],
+        )
+        self.assertEqual(result.report["records_with_payload_diagnostics"], 1)
 
     def test_requires_a_supported_pro_review_and_correct_type(self) -> None:
         approved = approved_record()
@@ -363,22 +395,24 @@ class MemoryRecordTests(unittest.TestCase):
             ["accepted", "rejected_duplicate_payload"],
         )
 
-    def test_token_budget_is_fail_closed(self) -> None:
-        result = builder(self.tokenizer, budget=3).build(
+    def test_real_model_sequence_limit_is_fail_closed(self) -> None:
+        result = builder(self.tokenizer, model_sequence_limit=3).build(
             [approved_record()], [verified_experience()]
         )
         self.assertEqual(result.records, ())
-        self.assertIn("payload_exceeds_token_budget", result.trace[0].reasons)
+        self.assertIn(
+            "payload_exceeds_model_sequence_limit",
+            result.trace[0].reasons,
+        )
 
     def test_reasoner_revision_drift_rejects_the_record(self) -> None:
         compiler = MemoryRecordCompiler(
             tokenizer=self.tokenizer,
-            sanitizer=PayloadSanitizer(
-                MemorySanitizerConfig(max_payload_tokens=128)
-            ),
+            sanitizer=PayloadSanitizer(MemorySanitizerConfig()),
             reasoner_name="Qwen/Qwen2.5-1.5B-Instruct",
             reasoner_revision="different-revision",
             tokenizer_revision="tokenizer-revision",
+            model_sequence_limit=4096,
         )
         result = MemoryBankBuilder(
             selector=ApprovedMemorySourceSelector(),
@@ -397,7 +431,7 @@ class MemoryRecordTests(unittest.TestCase):
         record = result.records[0]
         auditor = MemoryArtifactAuditor(
             tokenizer=self.tokenizer,
-            expected_token_budget=128,
+            expected_model_sequence_limit=4096,
         )
         self.assertEqual(auditor.assert_valid([record])["status"], "passed")
         self.assertEqual(MemoryRecord.from_dict(record.to_dict()), record)

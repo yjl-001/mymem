@@ -13,7 +13,7 @@ RUNNER = PROJECT_ROOT / "scripts/experiments/gsm8k/run_e0_experience_memory.sh"
 
 
 class E0RunnerConfigurationTests(unittest.TestCase):
-    def build_fixture(self, root: Path, *, token_budget: str = "128") -> tuple[Path, Path]:
+    def build_fixture(self, root: Path) -> tuple[Path, Path]:
         phase1_dir = root / "phase1"
         phase1_dir.mkdir()
         approved = {
@@ -40,7 +40,6 @@ class E0RunnerConfigurationTests(unittest.TestCase):
             "\n".join(
                 (
                     f'export MEMGEN_OUTPUT_ROOT="{root / "output"}"',
-                    f'export MEMGEN_E0_MAX_PAYLOAD_TOKENS="{token_budget}"',
                     'export MEMGEN_E0_CUDA_VISIBLE_DEVICES="3"',
                 )
             )
@@ -74,19 +73,9 @@ class E0RunnerConfigurationTests(unittest.TestCase):
             self.assertEqual(parsed["model_revision"], "model-commit")
             self.assertEqual(parsed["tokenizer_revision"], "tokenizer-commit")
             self.assertEqual(parsed["dataset_revision"], "dataset-commit")
-            self.assertEqual(parsed["max_payload_tokens"], "128")
+            self.assertNotIn("max_payload_tokens", parsed)
             self.assertEqual(parsed["cuda_visible_devices"], "3")
             self.assertEqual(parsed["dtype"], "bfloat16")
-
-    def test_rejects_a_non_numeric_payload_budget(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            phase1_dir, env_path = self.build_fixture(
-                Path(directory),
-                token_budget="auto",
-            )
-            result = self.run_config(phase1_dir, env_path)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("must be a positive integer", result.stderr)
 
 
 if __name__ == "__main__":
