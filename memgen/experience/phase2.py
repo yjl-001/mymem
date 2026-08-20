@@ -404,6 +404,17 @@ def leave_one_out_nearest_cosines(keys: Sequence[Sequence[float]]) -> list[float
     ]
 
 
+def ranked_cosine_matches(query: Sequence[float], keys: Sequence[Sequence[float]]) -> list[tuple[int, float]]:
+    """Return deterministic descending cosine matches as ``(index, score)``."""
+
+    if not keys:
+        raise ValueError("keys must be non-empty")
+    return sorted(
+        ((index, cosine_similarity(query, key)) for index, key in enumerate(keys)),
+        key=lambda item: (-item[1], item[0]),
+    )
+
+
 def deterministic_train_partition(identifier: str, *, seed: int, train_fraction: float) -> bool:
     """Return a stable per-experience train/holdout assignment.
 

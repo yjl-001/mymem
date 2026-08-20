@@ -15,6 +15,7 @@ from memgen.experience.phase2 import (
     leave_one_out_nearest_cosines,
     last_completion_boundary,
     phase1_mechanism_cluster,
+    ranked_cosine_matches,
     select_calibration_winner,
     select_max_cosine_event_pair,
     soft_entropy_gate,
@@ -189,6 +190,10 @@ class Phase2BoundaryAndGateTests(unittest.TestCase):
         self.assertAlmostEqual(nearest[1], 0.1104315261)
         self.assertAlmostEqual(nearest[2], 0.9938837347)
         self.assertIsNone(select_max_cosine_event_pair([], [(1, [1.0, 0.0])]))
+        self.assertEqual(
+            ranked_cosine_matches([1.0, 0.0], [[0.0, 1.0], [1.0, 0.0], [1.0, 0.0]]),
+            [(1, 1.0), (2, 1.0), (0, 0.0)],
+        )
 
     def test_anchor_accepts_exact_equation_spans_but_rejects_final_box(self) -> None:
         experiences, _ = build_verified_experiences(

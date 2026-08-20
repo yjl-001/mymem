@@ -39,6 +39,7 @@ from memgen.experience.phase2 import (
     entropy_quantile,
     entropy_transition_label,
     leave_one_out_nearest_cosines,
+    ranked_cosine_matches,
     select_max_cosine_event_pair,
     build_gsm8k_messages,
 )
@@ -208,6 +209,61 @@ def vector_rms(vector: Any) -> float:
     return value
 
 
+def action_direction_diagnostics(actions: list[list[float]]) -> dict[str, Any]:
+    """Describe whether a small action bank is diverse or effectively global."""
+
+    if not actions:
+        return {
+            "count": 0, "nonzero_count": 0, "effective_rank": None, "max_effective_rank": 0,
+            "pairwise_cosine": summary([]),
+        }
+    nonzero = [
+        action for action in actions
+        if sum(float(value) * float(value) for value in action) > 0.0
+    ]
+    if not nonzero:
+        return {
+            "count": len(actions), "nonzero_count": 0, "effective_rank": None, "max_effective_rank": 0,
+            "pairwise_cosine": summary([]),
+        }
+    similarities = [
+        [cosine_similarity(left, right) for right in nonzero]
+        for left in nonzero
+    ]
+    pairwise = [
+        similarities[row][column]
+        for row in range(len(similarities))
+        for column in range(row + 1, len(similarities))
+    ]
+    # Participation-ratio effective rank of the normalized action Gram matrix:
+    # (tr G)^2 / tr(G^2).  It is 1 for identical directions and n for mutually
+    # orthogonal directions, without introducing a NumPy/PyTorch dependency.
+    effective_rank = len(nonzero) ** 2 / sum(value * value for row in similarities for value in row)
+    return {
+        "count": len(actions), "nonzero_count": len(nonzero), "effective_rank": effective_rank,
+        "max_effective_rank": len(nonzero), "effective_rank_method": "gram_participation_ratio",
+        "pairwise_cosine": summary(pairwise),
+    }
+
+
+def selection_concentration(selected_indices: list[int], candidate_ids: list[str]) -> dict[str, Any]:
+    """Summarize whether held-out queries collapse onto a few train actions."""
+
+    if not selected_indices:
+        return {
+            "query_count": 0, "unique_selected_action_count": 0, "herfindahl_index": None,
+            "effective_selected_action_count": None, "max_selected_count": 0, "selected_counts": {},
+        }
+    counts: Counter[str] = Counter(candidate_ids[index] for index in selected_indices)
+    probabilities = [count / len(selected_indices) for count in counts.values()]
+    herfindahl = sum(probability * probability for probability in probabilities)
+    return {
+        "query_count": len(selected_indices), "unique_selected_action_count": len(counts),
+        "herfindahl_index": herfindahl, "effective_selected_action_count": 1.0 / herfindahl,
+        "max_selected_count": max(counts.values()), "selected_counts": dict(sorted(counts.items())),
+    }
+
+
 def write_report(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -355,9 +411,15 @@ def main() -> None:
             eligibility_by_partition[f"{partition}_reference_persistence_experiences"] += 1
         if target:
             eligibility_by_partition[f"{partition}_target_recovery_experiences"] += 1
+        reference_states = [(event.boundary_rank, states_by_event[event].tolist()) for event in reference]
+        target_states = [(event.boundary_rank, states_by_event[event].tolist()) for event in target]
+        all_cross_pair_cosines = [
+            cosine_similarity(reference_state, target_state)
+            for _, reference_state in reference_states
+            for _, target_state in target_states
+        ]
         selected_pair = select_max_cosine_event_pair(
-            [(event.boundary_rank, states_by_event[event].tolist()) for event in reference],
-            [(event.boundary_rank, states_by_event[event].tolist()) for event in target],
+            reference_states, target_states,
         )
         if selected_pair is None:
             continue
@@ -378,34 +440,63 @@ def main() -> None:
             "target_entropy": target_event.entropy,
             "target_next_entropy": target_event.next_entropy,
             "state_alignment_cosine": alignment_similarity,
+            "within_experience_cross_pair_count": len(all_cross_pair_cosines),
+            "within_experience_cross_pair_mean_cosine": (
+                sum(all_cross_pair_cosines) / len(all_cross_pair_cosines) if all_cross_pair_cosines else None
+            ),
+            "max_alignment_minus_cross_pair_mean": (
+                alignment_similarity - sum(all_cross_pair_cosines) / len(all_cross_pair_cosines)
+                if all_cross_pair_cosines else None
+            ),
             "raw_action_rms": action_rms,
             "status": "eligible_conditional_action",
             "_key": key,
+            "_action": action.tolist(),
         }
         candidates.append(candidate)
-        trace.append({key: value for key, value in candidate.items() if key != "_key"})
+        trace.append({key: value for key, value in candidate.items() if key not in {"_key", "_action"}})
         eligibility_by_partition[f"{partition}_eligible_action_experiences"] += 1
 
     train_candidates = [candidate for candidate in candidates if candidate["partition"] == "train"]
     holdout_candidates = [candidate for candidate in candidates if candidate["partition"] == "holdout"]
     train_keys = [candidate["_key"] for candidate in train_candidates]
+    train_actions = [candidate["_action"] for candidate in train_candidates]
     leave_one_out = leave_one_out_nearest_cosines(train_keys)
     similarity_threshold = entropy_quantile(leave_one_out, 0.05) if leave_one_out else None
     holdout_top1: list[float] = []
+    holdout_top2: list[float] = []
+    holdout_top1_margin: list[float] = []
+    holdout_top1_minus_mean: list[float] = []
+    holdout_selected_indices: list[int] = []
     holdout_accepted = 0
     for candidate in holdout_candidates:
         if not train_keys:
             break
-        score = max(cosine_similarity(candidate["_key"], key) for key in train_keys)
-        holdout_top1.append(score)
-        if similarity_threshold is not None and score >= similarity_threshold:
+        matches = ranked_cosine_matches(candidate["_key"], train_keys)
+        top_index, top_score = matches[0]
+        holdout_top1.append(top_score)
+        holdout_selected_indices.append(top_index)
+        holdout_top1_minus_mean.append(top_score - sum(score for _, score in matches) / len(matches))
+        if len(matches) > 1:
+            second_score = matches[1][1]
+            holdout_top2.append(second_score)
+            holdout_top1_margin.append(top_score - second_score)
+        if similarity_threshold is not None and top_score >= similarity_threshold:
             holdout_accepted += 1
+
+    train_leave_one_out_margin: list[float] = []
+    for index, key in enumerate(train_keys):
+        other_keys = [other for other_index, other in enumerate(train_keys) if other_index != index]
+        if len(other_keys) < 2:
+            continue
+        matches = ranked_cosine_matches(key, other_keys)
+        train_leave_one_out_margin.append(matches[0][1] - matches[1][1])
 
     output_dir = args.output_dir.expanduser()
     trace_path = output_dir / "conditional_action_candidate_trace.jsonl"
     write_jsonl(trace_path, trace)
     report = {
-        "schema_version": "phase2-conditional-action-feasibility-v1",
+        "schema_version": "phase2-conditional-action-feasibility-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "complete" if similarity_threshold is not None else "insufficient_train_candidates_for_threshold",
         "purpose": "offline_only_no_vector_artifact_no_online_injection",
@@ -449,19 +540,42 @@ def main() -> None:
             "train": summary([float(candidate["state_alignment_cosine"]) for candidate in train_candidates]),
             "holdout": summary([float(candidate["state_alignment_cosine"]) for candidate in holdout_candidates]),
         },
+        "max_alignment_selection_gain": {
+            "within_experience_cross_pair_count": summary([
+                float(candidate["within_experience_cross_pair_count"]) for candidate in candidates
+            ]),
+            "within_experience_cross_pair_mean_cosine": summary([
+                float(candidate["within_experience_cross_pair_mean_cosine"])
+                for candidate in candidates
+                if candidate["within_experience_cross_pair_mean_cosine"] is not None
+            ]),
+            "selected_max_minus_cross_pair_mean": summary([
+                float(candidate["max_alignment_minus_cross_pair_mean"])
+                for candidate in candidates
+                if candidate["max_alignment_minus_cross_pair_mean"] is not None
+            ]),
+        },
         "raw_action_rms": {
             "all": summary([float(candidate["raw_action_rms"]) for candidate in candidates]),
             "train": summary([float(candidate["raw_action_rms"]) for candidate in train_candidates]),
             "holdout": summary([float(candidate["raw_action_rms"]) for candidate in holdout_candidates]),
             "zero_count": sum(float(candidate["raw_action_rms"]) == 0.0 for candidate in candidates),
         },
+        "train_action_direction_diversity": action_direction_diagnostics(train_actions),
         "retrieval_feasibility": {
             "train_leave_one_out_nearest_cosine": summary(leave_one_out),
+            "train_leave_one_out_top1_minus_top2": summary(train_leave_one_out_margin),
             "similarity_threshold_q05": similarity_threshold,
             "holdout_top1_to_train_cosine": summary(holdout_top1),
+            "holdout_top2_to_train_cosine": summary(holdout_top2),
+            "holdout_top1_minus_top2": summary(holdout_top1_margin),
+            "holdout_top1_minus_mean_train_cosine": summary(holdout_top1_minus_mean),
             "holdout_above_threshold_count": holdout_accepted if similarity_threshold is not None else 0,
             "holdout_above_threshold_rate": (
                 holdout_accepted / len(holdout_top1) if similarity_threshold is not None and holdout_top1 else None
+            ),
+            "holdout_selected_train_action_concentration": selection_concentration(
+                holdout_selected_indices, [str(candidate["experience_id"]) for candidate in train_candidates]
             ),
         },
         "trace": {"path": trace_path.name, "sha256": file_sha256(trace_path)},

@@ -469,7 +469,8 @@ injection_applied, generation_length, final_reward, output_path
   确认门槛；
 - H3 的只读可行性审计脚本：重放冻结轨迹并统计同一 `experience_id` 内的
   reference-persistence → target-recovery local-contrast candidates、对齐相似度、action RMS 与
-  leave-one-out 检索阈值；它不生成回答、不注入向量，也不调用 AI；
+  leave-one-out 检索阈值；并检查最大对齐的选择增益、检索 top-1/top-2 margin、action 方向
+  effective rank 与检索集中度；它不生成回答、不注入向量，也不调用 AI；
 
 尚未完成：
 

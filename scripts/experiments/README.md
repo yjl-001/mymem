@@ -113,3 +113,8 @@ bash scripts/experiments/gsm8k/run_phase2_conditional_action_audit.sh \
 审计报告为 `conditional_action_feasibility_report.json`。若 bank-train action 少于两个，脚本仍会
 写出报告并标记 `insufficient_train_candidates_for_threshold`；这属于 H3 定义的可行性负结果，不应通过
 放宽 target/reference 配对条件来绕过。
+
+在候选数量足够时，仍不可据此直接做在线注入。审计还会报告：同题内“取最大对齐”相对所有可配对
+状态的选择增益、held-out query 的 top-1/top-2 retrieval margin、训练 action 的两两方向 cosine 与
+effective rank，以及 held-out 检索是否集中到少数 action。若 action 高度共线、margin 接近零或检索
+高度集中，H3 会退化为全局向量的变体，应停止当前定义而不是扩大在线样本。
