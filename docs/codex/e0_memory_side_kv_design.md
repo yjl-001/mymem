@@ -139,5 +139,7 @@ bash scripts/experiments/gsm8k/run_e0_experience_memory.sh \
 第二个参数可选；未提供时会从冻结 split manifest 的 `calibration-val` 自动生成 answer-blind
 audit cases。外部 case 文件也必须满足同一 schema 和来源审计。
 
-token budget 必须通过 `.server.env` 的 `MEMGEN_E0_MAX_PAYLOAD_TOKENS` 显式冻结。它只能依据
-payload 长度和系统成本审计选择，不能依据 E1 或 final-test accuracy。
+token budget 必须通过 `scripts/experiments/gsm8k/.e0.server.env` 的
+`MEMGEN_E0_MAX_PAYLOAD_TOKENS` 显式冻结。这个最小 env 还包含输出根目录和可选 GPU 编号；模型及
+数据 revision 从 Phase 1 artifacts 自动读取。budget 只能依据 payload 长度和系统成本审计选择，
+不能依据 E1 或 final-test accuracy。

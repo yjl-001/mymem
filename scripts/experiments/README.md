@@ -16,8 +16,8 @@
 cp scripts/experiments/server.env.example scripts/experiments/.server.env
 ```
 
-编辑 `.server.env` 中的输出根目录、GPU 与 checkpoint 路径。它只包含服务器本地信息，
-已被 Git 忽略。
+编辑 `.server.env` 中的输出根目录、GPU 与 checkpoint 路径。它只服务训练和 Phase 1，
+并已被 Git 忽略。当前 E0 使用下文单独的最小配置，不读取这个共享文件。
 
 之后每次运行只需同步代码并执行对应脚本：
 
@@ -83,11 +83,9 @@ bash scripts/experiments/gsm8k/run_phase2_entropy_risk_probe.sh \
 `answer_correctness` evidence；`format_compliance` 等类型保留给后续条件化/类型化实验，避免
 格式监督淹没主推理向量。
 
-确认时不改变任何干预参数：将 `.server.env` 中
-`MEMGEN_PHASE2_RISK_EVAL_OFFSET=100`、`MEMGEN_PHASE2_RISK_EVAL_LIMIT=0`，只运行未看过的
-`dev-test` 后缀。汇总会按 sample ID 对 real/control 的实际熵转移做 bootstrap CI；每个对照至少
-需要 50 个配对事件，且 CI 上界小于 0 才通过。bank-heldout 同时报告 ROC-AUC、PR-AUC 与
-persistence 正类比例，避免类别失衡下误读 PR-AUC。
+这些 Phase 2 脚本及其旧参数仅用于复现已经关闭的负向路线。active env 模板不再列出
+vector alpha、gate slope、layer grid 或 injection grid；若必须复现实验，应从对应历史提交恢复
+当时的配置，不得把这些参数带回当前主线继续搜索。
 
 历史 H3 local-action audit 也已经完成：虽然能形成 23 个 bank-train / 9 个 held-out action，且
 方向不共线，但 held-out raw hidden-state top-1/top-2 routing margin 极低，不能稳定选择具体 action。
@@ -117,6 +115,9 @@ E0-v1 已进入实现与服务器机制审计阶段；E1 仍未实现。顺序�
 E0-v1 的实现入口现为：
 
 ```bash
+cp scripts/experiments/gsm8k/e0.server.env.example \
+  scripts/experiments/gsm8k/.e0.server.env
+
 bash scripts/experiments/gsm8k/run_e0_experience_memory.sh \
   /absolute/path/to/phase1-run-dir
 ```
@@ -124,9 +125,23 @@ bash scripts/experiments/gsm8k/run_e0_experience_memory.sh \
 未传第二个参数时，脚本会从 Phase 1 split manifest 的 `calibration-val` 自动构造 answer-blind
 机制审计 prefixes；也可显式传入满足同一审计 schema 的 JSONL。
 
-`MEMGEN_E0_MAX_PAYLOAD_TOKENS` 必须在服务器的 `.server.env` 中显式冻结。若只需要先查看
-payload/BM25 的拒收率和长度分布，可临时设置 `MEMGEN_E0_TEXT_ONLY=1`；这种运行不包含 KV/cache
-机制审计，不能标记为正式 E0 通过。详细对象与 artifact 契约见
+`.e0.server.env` 只保留 `MEMGEN_OUTPUT_ROOT`、`MEMGEN_E0_MAX_PAYLOAD_TOKENS` 和可选 GPU 编号。
+模型、model revision、tokenizer revision 与 dataset revision 全部从 Phase 1 artifacts 自动读取，
+不得手工重复配置。可先验证最终解析结果而不加载模型：
+
+```bash
+bash scripts/experiments/gsm8k/run_e0_experience_memory.sh \
+  --print-config /absolute/path/to/phase1-run-dir
+```
+
+若只需要先查看 payload/BM25 的拒收率和长度分布，使用：
+
+```bash
+bash scripts/experiments/gsm8k/run_e0_experience_memory.sh \
+  --text-only /absolute/path/to/phase1-run-dir
+```
+
+这种运行不包含 KV/cache 机制审计，不能标记为正式 E0 通过。详细对象与 artifact 契约见
 [`e0_memory_side_kv_design.md`](../../docs/codex/e0_memory_side_kv_design.md)。
 
 下一 boundary 熵、logits KL、memory attention、检索分数和延迟均会记录为诊断；主要问题是模型是否

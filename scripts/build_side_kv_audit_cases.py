@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report-output", type=Path)
     parser.add_argument("--model", required=True)
     parser.add_argument("--model-revision", required=True)
+    parser.add_argument("--tokenizer-revision")
     parser.add_argument("--dataset-revision", required=True)
     parser.add_argument("--logical-split", default="calibration-val")
     parser.add_argument("--case-count", type=int, default=8)
@@ -109,7 +110,11 @@ def main() -> None:
         split="train",
         revision=args.dataset_revision,
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.model_revision)
+    tokenizer_revision = args.tokenizer_revision or args.model_revision
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        revision=tokenizer_revision,
+    )
     tokenizer.chat_template = CONVERSATION_TEMPLATE
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -202,6 +207,10 @@ def main() -> None:
             "model": args.model,
             "model_revision": str(
                 getattr(model.config, "_commit_hash", None) or args.model_revision
+            ),
+            "tokenizer_revision": str(
+                getattr(tokenizer, "init_kwargs", {}).get("_commit_hash")
+                or tokenizer_revision
             ),
             "dataset_revision": args.dataset_revision,
             "max_new_tokens": args.max_new_tokens,
