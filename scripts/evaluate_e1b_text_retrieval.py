@@ -31,6 +31,8 @@ from memgen.experience.phase1 import (
     text_sha256,
 )
 from scripts.e1_staged_common import (
+    PairedConditionComparison,
+    PairedConditionDiagnostics,
     effect_is_positive,
     load_hashed_manifest,
     paired_condition_effect,
@@ -175,6 +177,13 @@ def main() -> None:
             ):
                 assert choice is not None
                 memory_record = record_by_id[choice.memory_id]
+                if (
+                    memory_record.payload_hash != choice.payload_hash
+                    or memory_record.token_count != choice.token_count
+                ):
+                    raise ValueError(
+                        f"Text memory metadata drift for {choice.memory_id}"
+                    )
                 memory_text = render_single_experience(memory_record)
                 treatment_prompt_ids = prompt_token_ids(
                     tokenizer, question=question, memory_text=memory_text
@@ -212,29 +221,48 @@ def main() -> None:
                 print(f"[e1b-eval] {position}/{len(assignments)}", flush=True)
 
     conditions_summary = summarize_conditions(output_records, conditions)
-    accuracy_effects = {
-        "matched_vs_no_memory": paired_condition_effect(
-            output_records,
-            treatment="matched_text",
-            control="no_memory",
-            field="final_reward",
-            resamples=args.bootstrap_resamples,
+    diagnostic_builder = PairedConditionDiagnostics(
+        output_records, bootstrap_resamples=args.bootstrap_resamples
+    )
+    paired_diagnostics = diagnostic_builder.summarize(
+        (
+            PairedConditionComparison(
+                "matched_vs_no_memory", "matched_text", "no_memory"
+            ),
+            PairedConditionComparison(
+                "shuffled_vs_no_memory", "shuffled_text", "no_memory"
+            ),
+            PairedConditionComparison(
+                "matched_vs_shuffled", "matched_text", "shuffled_text"
+            ),
+        )
+    )
+    accuracy_effects = paired_diagnostics["accuracy_effects"]
+    format_effects = paired_diagnostics["format_effects"]
+    shuffle = manifest["configuration"]["shuffle"]
+    component_integrity = {
+        "assignment_manifest_frozen_and_answer_blind": (
+            manifest.get("status") == "frozen"
+            and manifest.get("answer_or_reward_used") is False
         ),
-        "matched_vs_shuffled": paired_condition_effect(
-            output_records,
-            treatment="matched_text",
-            control="shuffled_text",
-            field="final_reward",
-            resamples=args.bootstrap_resamples,
+        "all_samples_have_matched_and_shuffled_memory": all(
+            assignment.assigned for assignment in assignments
+        ),
+        "all_assignment_samples_evaluated_once": (
+            len(output_records) == len(assignments)
+            and len({record["sample_id"] for record in output_records})
+            == len(assignments)
+        ),
+        "matched_shuffled_memory_multisets_equal": (
+            shuffle["matched_memory_multiset_sha256"]
+            == shuffle["shuffled_memory_multiset_sha256"]
+        ),
+        "first_response_never_in_second_prompt": all(
+            record["preanswer_used_in_second_prompt"] is False
+            for record in output_records
         ),
     }
-    format_effect = paired_condition_effect(
-        output_records,
-        treatment="matched_text",
-        control="no_memory",
-        field="format_valid",
-        resamples=args.bootstrap_resamples,
-    )
+    component_diagnostic_ready = all(component_integrity.values())
     acceptance = {
         "matched_accuracy_above_no_memory": effect_is_positive(
             accuracy_effects["matched_vs_no_memory"]
@@ -243,12 +271,16 @@ def main() -> None:
             accuracy_effects["matched_vs_shuffled"]
         ),
         "matched_format_not_below_no_memory": (
-            float(format_effect["mean_treatment_minus_control"]) >= 0.0
+            float(
+                format_effects["matched_vs_no_memory"][
+                    "mean_treatment_minus_control"
+                ]
+            )
+            >= 0.0
         ),
-        "first_response_never_in_second_prompt": all(
-            record["preanswer_used_in_second_prompt"] is False
-            for record in output_records
-        ),
+        "first_response_never_in_second_prompt": component_integrity[
+            "first_response_never_in_second_prompt"
+        ],
     }
     margins = [
         float(item.retrieval_query["top1_top2_margin"])
@@ -262,6 +294,26 @@ def main() -> None:
         )
         for record in output_records
     ]
+    exact_prompt_records = [
+        record
+        for record in output_records
+        if record["conditions"]["matched_text"]["prompt_token_count"]
+        == record["conditions"]["shuffled_text"]["prompt_token_count"]
+    ]
+    exact_prompt_sensitivity = {
+        "paired_sample_count": len(exact_prompt_records),
+        "matched_vs_shuffled_accuracy": (
+            paired_condition_effect(
+                exact_prompt_records,
+                treatment="matched_text",
+                control="shuffled_text",
+                field="final_reward",
+                resamples=args.bootstrap_resamples,
+            )
+            if len(exact_prompt_records) >= 2
+            else None
+        ),
+    }
     summary = {
         "schema_version": E1B_SUMMARY_SCHEMA,
         "created_at": utc_now(),
@@ -277,7 +329,16 @@ def main() -> None:
         },
         "conditions": conditions_summary,
         "accuracy_effects": accuracy_effects,
-        "matched_vs_no_memory_format": format_effect,
+        "diagnostic_answer_effects": paired_diagnostics[
+            "diagnostic_answer_effects"
+        ],
+        "format_effects": format_effects,
+        "strict_accuracy_transition_diagnostics": (
+            paired_diagnostics["strict_accuracy_transition_diagnostics"]
+        ),
+        "completion_difference_diagnostics": paired_diagnostics[
+            "completion_difference_diagnostics"
+        ],
         "retrieval_diagnostics": {
             "mean_top1_score": sum(
                 float(item.retrieval_query["top1_score"]) for item in assignments
@@ -287,7 +348,7 @@ def main() -> None:
             ),
         },
         "pairing_diagnostics": {
-            "shuffle": manifest["configuration"]["shuffle"],
+            "shuffle": shuffle,
             "exact_prompt_token_count_match_count": sum(
                 value == 0 for value in prompt_token_differences
             ),
@@ -297,6 +358,13 @@ def main() -> None:
             "max_absolute_prompt_token_count_difference": max(
                 prompt_token_differences
             ),
+            "exact_prompt_token_count_sensitivity": exact_prompt_sensitivity,
+        },
+        "component_diagnostic": {
+            "status": "ready" if component_diagnostic_ready else "invalid",
+            "e1c_component_diagnostic_allowed": component_diagnostic_ready,
+            "formal_task_pass_required_for_diagnostic": False,
+            "integrity": component_integrity,
         },
         "acceptance": acceptance,
     }

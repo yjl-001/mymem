@@ -11,8 +11,9 @@ E1-v1 同时使用了 Phase 1 payload、BM25 top-1、风险 gate 和单步 side-
 - memory attention mass 约为 `0.38`，说明 side path 活跃，但内容区分度不足。
 
 因此，E1-v1 只证明“当前组合未产生准确率收益”，不能直接否定 Phase 1 经验、BM25 或 side-KV。
-后续按 E1-A/B/C/D 分阶段检验，每个阶段都设置 matched、shuffled/random 与 no-memory 对照；任何阶段
-失败都停止向后解释，不用下游结果反调上游配置。
+后续按 E1-A/B/C/D 分阶段检验，每个阶段都设置 matched、shuffled/random 与 no-memory 对照。阶段未满足
+预注册任务判据时，不把下游机制结果解释成上游任务收益，也不用下游结果反调上游配置；但如果已经获得
+明确的机制正对照，可以继续运行后续组件诊断，以定位经验选择或表示通道的问题。组件诊断不等于正式通过。
 
 ## 2. 共享冻结项
 
@@ -59,6 +60,44 @@ constrained k-medoids：
 representative 相对 no-memory 的 paired GSM8K accuracy 与严格格式差；三份随机目录报告经验集合效应
 对抽样的敏感度。代表目录优于 no-memory 且格式不下降，才认为“Phase 1 经验集合有可利用信息”。
 
+### 3.4 calibration-val 结果与当前解释
+
+首轮 100 条 `calibration-val` 结果如下：
+
+| 条件 | GSM8K accuracy | 严格格式准确率 |
+|---|---:|---:|
+| `no_memory` | 0.15 | 0.36 |
+| `representative_bank_text` | 0.14 | 0.61 |
+| `random_bank_text_seed17` | 0.17 | 0.67 |
+| `random_bank_text_seed42` | 0.20 | 0.66 |
+| `random_bank_text_seed73` | 0.15 | 0.55 |
+
+代表目录未满足预注册的 accuracy 判据，因此 E1-A 的正式状态保持 `did_not_pass`。但所有经验目录都明显
+提高严格格式准确率，说明文本经验被模型读取，payload 中的操作性指令能够稳定改变生成行为。这是经验
+可消费性的正对照，足以支持继续把 E1-B/E1-C 作为检索和表示通道的组件诊断；它不能单独证明经验中的
+数学策略改善了推理，也不能据此进入 gate timing 或 final-test。
+
+逐样本审计还显示，`random_bank_text_seed42` 的 14 个 accuracy 收益中，9 个是“原数值正确但未使用
+boxed 格式”的格式修复，只有 5 个改变了错误数值；9 个损失中有 7 个把原本正确数值改错。因此其
+`+0.05` accuracy 点估计主要由格式合规驱动，且置信区间包含零。后续继续保留 GSM8K accuracy，但在
+当前组件开发阶段把它作为风险与诊断指标，不以本轮小样本结果反向修改经验生成规则。
+
+当前登记的经验库风险为：
+
+1. 抽象粒度不稳定：`When facing` 往往保留较窄题型，`Prefer` 又可能过于通用，未形成一致的“适用条件—
+   可执行动作—验证规则”层级；问题不只是单向的“不够具体”或“不够抽象”。
+2. payload 中反复出现 boxed、verifier、expected answer 等格式/审核语言，容易让最显著的可观测收益集中在
+   格式，而稀释数学策略信号。
+3. 受 2048-token 预算约束的 `k=5` representative 聚类高度不均衡，最大簇覆盖 `97/161` 条记录且簇内
+   距离较大；TF-IDF medoid 的词面中心性不等于经验效用。
+4. E1-A 把同一目录用于所有题，必然包含大量不适用经验；正确经验也可能因为没有检索和适用性过滤而产生
+   负迁移。
+5. 约 1180 个额外 prompt token 可能对小模型造成注意力稀释；这与经验内容质量在当前 no-memory 对照中
+   尚未完全分离。
+
+这些风险留待 E1-B 的 matched-vs-shuffled 结果和后续经验库生成迭代共同处理；本轮不新增 Teacher/Pro
+调用，也不为了追逐 calibration accuracy 调整经验内容。
+
 ## 4. E1-B：BM25 是否能选出更有用的经验
 
 ### 4.1 两遍 answer-blind assignment
@@ -90,6 +129,11 @@ BM25 top-1 返回 matched `memory_id`。对全部 matched ID 做确定性全局 
 主要检验 matched-text 是否同时优于 shuffled-text 和 no-memory；严格格式不得低于 no-memory。
 manifest 冻结 question hash、`y0` token/hash、sanitized query/hash、BM25 score、matched/shuffled ID、
 payload hash 与精确 prompt token 数。
+
+正式任务判据仍使用严格 GSM8K reward，不因 calibration 结果改写。组件诊断同时报告
+`diagnostic_answer_accuracy`、严格 reward 翻转中的 format-only/answer-content 分解，以及三组条件间的
+token-level completion divergence。只要 assignment、无自配对 shuffle、answer-blind query 和 artifact
+provenance 完整，即允许 E1-C 原样消费该 manifest；这不要求 E1-B 已在 accuracy 上正式通过。
 
 ## 5. E1-C：side-KV 通道是否保留经验内容的作用
 
@@ -145,6 +189,11 @@ slot 是 payload 中一个 tokenizer token 在 layer 24 得到的一组 canonica
 E1-B matched-text 效果作为可达到的文本上界。若文本有效而 side-KV 无效，结论应归因于表示/传输通道，
 不能归因于经验内容或检索器。
 
+由于 E1-A 已观察到稳定格式效应，E1-C 额外把格式作为内容传递正对照：分别计算 matched-text 和
+matched-side-KV 相对 no-memory 的格式差。只有文本差为正时，才判断 side-KV 是否复现同方向格式效应；
+若文本条件在该批 top-1 assignment 上没有正格式效应，则报告 `no_positive_text_control`，不把它误判为
+side-KV 传输失败。机制完整性、格式正对照传递和正式任务收益分别报告，互不替代。
+
 ## 6. E1-D：gate 时机（暂不实现）
 
 只有 E1-A、E1-B、E1-C 均给出正证据后，才恢复 entropy+risk gate，比较 prompt-end persistent 与
@@ -156,7 +205,8 @@ completion 中触发后的 persistent side path。E1-D 只优化“何时开始�
 1. 已运行的 `dev-test` 前 100 条 E1-v1 仅作为诊断，不再用于配置选择或独立确认；
 2. E1-A/B/C 首先在 `calibration-val` 完成机制与方向验证；
 3. 配置冻结后，只在未触碰的 `dev-test` offset 100 之后做一次确认；
-4. 任一阶段未通过，记录该组件结论并停止进入依赖它的下一阶段；
+4. 任一阶段未通过预注册任务判据，记录正式状态；已有有效机制正对照时可以继续下游组件诊断，但不得据此
+   进入 E1-D、final-test 或声称完整方法获得任务收益；
 5. 全过程不运行 `final-test`，不新增 Teacher/Pro 调用，不恢复 residual-vector 路线。
 
 ## 8. 服务器执行顺序
@@ -177,7 +227,7 @@ bash scripts/experiments/gsm8k/run_e1a_bank_utility.sh \
   "$PHASE1_DIR" "$E0_DIR"
 ```
 
-检查 `evaluation/e1a_summary.json`。只有方向和机制符合预注册假设后再运行 E1-B：
+检查 `evaluation/e1a_summary.json`。E1-A 的格式正对照已经允许 E1-B 继续作为组件诊断：
 
 ```bash
 MEMGEN_RUN_TAG=e1b-calibration-v1 \
@@ -186,8 +236,29 @@ bash scripts/experiments/gsm8k/run_e1b_text_retrieval.sh \
   "$PHASE1_DIR" "$E0_DIR"
 ```
 
-E1-B 会先写入 answer-blind `assignment_manifest.json`，再读取 gold answer 做文本条件评测。只有
-`formal_e1b_passed=true` 才允许把对应运行目录交给 E1-C：
+完成后检查正式状态、组件 handoff 和格式/数值分离诊断：
+
+```bash
+E1B_RUN_DIR="$MEMGEN_OUTPUT_ROOT/e1/gsm8k/<实际的-e1b-运行目录>"
+jq '{
+  status,
+  formal_e1b_passed,
+  component_diagnostic,
+  conditions,
+  accuracy_effects,
+  diagnostic_answer_effects,
+  format_effects,
+  strict_accuracy_transition_diagnostics,
+  completion_difference_diagnostics,
+  retrieval_diagnostics,
+  pairing_diagnostics
+}' "$E1B_RUN_DIR/evaluation/e1b_summary.json"
+```
+
+E1-B 会先写入 answer-blind `assignment_manifest.json`，再读取 gold answer 做文本条件评测。运行目录只需
+满足 `component_diagnostic.e1c_component_diagnostic_allowed=true` 即可交给 E1-C；若
+`formal_e1b_passed=false`，E1-C 会明确标记为 component-diagnostic mode，不会把结果解释成 E1-B 正式
+通过：
 
 ```bash
 E1B_RUN_DIR="$MEMGEN_OUTPUT_ROOT/e1/gsm8k/<实际的-e1b-运行目录>"
@@ -196,7 +267,28 @@ bash scripts/experiments/gsm8k/run_e1c_side_kv_channel.sh \
   "$PHASE1_DIR" "$E0_DIR" "$E1B_RUN_DIR"
 ```
 
-E1-C 脚本和 Python runner 都会校验 E1-B summary、results hash、assignment hash 和 E0 side-KV
-manifest；不满足时直接停止，不创建替代 assignment。冻结配置确认时使用
+完成后分别检查正式任务判据、side-KV 机制和格式正对照传递：
+
+```bash
+E1C_RUN_DIR="$MEMGEN_OUTPUT_ROOT/e1/gsm8k/<实际的-e1c-运行目录>"
+jq '{
+  status,
+  formal_e1c_passed,
+  source_e1b_formal_passed,
+  component_diagnostic,
+  conditions,
+  accuracy_effects,
+  diagnostic_answer_effects,
+  format_effects,
+  format_positive_control_transfer,
+  completion_difference_diagnostics,
+  exact_slot_count_sensitivity,
+  mechanism_diagnostics,
+  acceptance
+}' "$E1C_RUN_DIR/evaluation/e1c_summary.json"
+```
+
+E1-C 脚本和 Python runner 都会校验 E1-B component handoff、summary/results hash、assignment hash 和
+E0 side-KV manifest；不满足时直接停止，不创建替代 assignment。冻结配置确认时使用
 `--logical-split dev-test --offset 100`，不要覆盖已有 calibration 目录。E1-A 确认运行还必须通过
 `--catalog-manifest <calibration-run/catalog_manifest.json>` 复用原目录，不重新聚类。

@@ -27,9 +27,9 @@ E1A_SUMMARY_SCHEMA = "experience-memory-e1a-summary-v1"
 E1B_ASSIGNMENT_SCHEMA = "experience-memory-e1b-assignment-v1"
 E1B_MANIFEST_SCHEMA = "experience-memory-e1b-assignment-manifest-v1"
 E1B_RESULTS_SCHEMA = "experience-memory-e1b-results-v1"
-E1B_SUMMARY_SCHEMA = "experience-memory-e1b-summary-v1"
+E1B_SUMMARY_SCHEMA = "experience-memory-e1b-summary-v2"
 E1C_RESULTS_SCHEMA = "experience-memory-e1c-results-v1"
-E1C_SUMMARY_SCHEMA = "experience-memory-e1c-summary-v1"
+E1C_SUMMARY_SCHEMA = "experience-memory-e1c-summary-v2"
 
 E1A_RANDOM_SEEDS = (17, 42, 73)
 E1A_CATALOG_TOKEN_BUDGET = 2048

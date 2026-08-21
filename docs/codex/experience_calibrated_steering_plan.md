@@ -159,6 +159,14 @@ E1-A 的 medoid 必须是真实 MemoryRecord，不使用生成式聚类总结；
 读取 gold answer。E1-C 的 memory K/V 不写入 native cache，从最后一个 prompt token 开始在每个
 decode step 持续可见，并固定对 memory logits 使用 `-log(valid_slot_count)` 归一化。
 
+E1-A 在首轮 100 条 `calibration-val` 上未满足预注册 accuracy 判据：no-memory、representative 和三份
+random bank 的 accuracy 分别为 `0.15/0.14/0.17/0.20/0.15`。但经验条件的严格格式准确率分别达到
+`0.61/0.67/0.66/0.55`，相对 no-memory 的 `0.36` 均有明显提高。这证明经验文本可被模型消费并产生
+稳定行为效应，可作为继续诊断 retriever 和 side-KV 的机制正对照；它不证明数学策略已经提高推理正确率。
+逐样本审计显示 random-seed42 的 accuracy 点收益主要来自正确数值的格式修复，经验抽象粒度、审核/格式
+语言占比、`k=5` 聚类覆盖和全局目录负迁移均登记为风险。E1-B/E1-C 因此可以继续作为组件诊断，但在
+经验内容风险解除且任务收益确认前，不恢复 E1-D gate、不进入 final-test，也不声称 E1-A 正式通过。
+
 每个阶段都包含 no-memory 与错配/随机对照并使用 sample-level paired 统计。具体 manifest、条件、
 机制不变量和停止规则见 [E1 设计](e1_experience_memory_design.md)。
 
@@ -203,9 +211,11 @@ side_kv_applied, generation_length, final_reward, format_reward, output_path
 
 ## 8. 当前交接点
 
-E0 已完成并冻结；E1-v1 已完成且当前组合未通过。当前依次实现并运行 E1-A（固定多经验文本目录）、
-E1-B（完整 preanswer query 的 BM25 文本检索）和 E1-C（复用相同 assignment 的 persistent
-side-KV）。先在 `calibration-val` 运行，配置冻结后只在 `dev-test` offset 100 之后做一次确认。
+E0 已完成并冻结；E1-v1 已完成且当前组合未通过。E1-A 首轮 `calibration-val` 已完成：格式行为给出
+经验可消费性的正证据，但预注册 accuracy 判据未通过，经验内容风险已经登记。当前继续运行 E1-B（完整
+preanswer query 的 BM25 文本检索）和 E1-C（复用相同 assignment 的 persistent side-KV）作为组件诊断；
+在经验库生成策略调整前，不把它们外推为完整方法的任务收益。配置冻结后只在 `dev-test` offset 100 之后
+做一次独立确认。
 
 在 E1-A/B/C 得到逐组件证据前，不实现 gate timing、不扩展 memory 数量、不搜索 layer/注入强度，
 不进入 E2/E3 或 `final-test`。

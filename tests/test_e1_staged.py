@@ -14,6 +14,14 @@ from memgen.experience.e1_staged import (
     render_experience_catalog,
 )
 from memgen.experience.phase1 import canonical_json_sha256
+from scripts.e1_staged_common import (
+    PairedConditionComparison,
+    PairedConditionDiagnostics,
+    completion_difference_summary,
+    format_transfer_diagnostic,
+    strict_accuracy_transition_diagnostics,
+    summarize_conditions,
+)
 from scripts.evaluate_e1c_side_kv_channel import compact_trace_artifact
 
 
@@ -199,6 +207,114 @@ class PersistentTraceArtifactTests(unittest.TestCase):
         self.assertTrue(artifact["native_cache_length_matches_real_tokens"])
         self.assertTrue(artifact["memory_id_constant"])
         self.assertTrue(artifact["normalization_constant"])
+
+
+class StagedDiagnosticSummaryTests(unittest.TestCase):
+    @staticmethod
+    def _condition(
+        *, reward: bool, format_valid: bool, answer_correct: bool, token: int
+    ) -> dict[str, object]:
+        return {
+            "final_reward": float(reward),
+            "format_valid": format_valid,
+            "generation_length": 1,
+            "prompt_token_count": 8,
+            "completion_token_ids": [token],
+            "completion_token_ids_sha256": canonical_json_sha256([token]),
+            "verifier": {"diagnostic_answer_correct": answer_correct},
+        }
+
+    def test_strict_transitions_separate_format_and_answer_content(self) -> None:
+        rows = [
+            {
+                "sample_id": "format-gain",
+                "conditions": {
+                    "control": self._condition(
+                        reward=False, format_valid=False, answer_correct=True, token=1
+                    ),
+                    "treatment": self._condition(
+                        reward=True, format_valid=True, answer_correct=True, token=2
+                    ),
+                },
+            },
+            {
+                "sample_id": "answer-gain",
+                "conditions": {
+                    "control": self._condition(
+                        reward=False, format_valid=True, answer_correct=False, token=3
+                    ),
+                    "treatment": self._condition(
+                        reward=True, format_valid=True, answer_correct=True, token=4
+                    ),
+                },
+            },
+            {
+                "sample_id": "format-loss",
+                "conditions": {
+                    "control": self._condition(
+                        reward=True, format_valid=True, answer_correct=True, token=5
+                    ),
+                    "treatment": self._condition(
+                        reward=False, format_valid=False, answer_correct=True, token=6
+                    ),
+                },
+            },
+            {
+                "sample_id": "answer-loss",
+                "conditions": {
+                    "control": self._condition(
+                        reward=True, format_valid=True, answer_correct=True, token=7
+                    ),
+                    "treatment": self._condition(
+                        reward=False, format_valid=True, answer_correct=False, token=8
+                    ),
+                },
+            },
+        ]
+        transitions = strict_accuracy_transition_diagnostics(
+            rows, treatment="treatment", control="control"
+        )
+        self.assertEqual(transitions["format_only_gain_count"], 1)
+        self.assertEqual(transitions["diagnostic_answer_gain_count"], 1)
+        self.assertEqual(transitions["format_only_loss_count"], 1)
+        self.assertEqual(transitions["diagnostic_answer_loss_count"], 1)
+        differences = completion_difference_summary(
+            rows, treatment="treatment", control="control"
+        )
+        self.assertEqual(differences["different_completion_count"], 4)
+        summary = summarize_conditions(rows, ("control", "treatment"))
+        self.assertEqual(summary["control"]["diagnostic_answer_accuracy"], 0.75)
+        self.assertEqual(summary["treatment"]["diagnostic_answer_accuracy"], 0.75)
+        diagnostic_builder = PairedConditionDiagnostics(
+            rows, bootstrap_resamples=100
+        )
+        paired = diagnostic_builder.summarize(
+            (
+                PairedConditionComparison(
+                    "treatment_vs_control", "treatment", "control"
+                ),
+            )
+        )
+        self.assertEqual(
+            paired["strict_accuracy_transition_diagnostics"][
+                "treatment_vs_control"
+            ]["format_only_gain_count"],
+            1,
+        )
+
+    def test_format_transfer_requires_a_positive_text_control(self) -> None:
+        observed = format_transfer_diagnostic(
+            text_effect={"mean_treatment_minus_control": 0.2},
+            side_kv_effect={"mean_treatment_minus_control": 0.1},
+        )
+        self.assertEqual(observed["status"], "observed")
+        self.assertTrue(observed["positive_direction_transferred"])
+        unavailable = format_transfer_diagnostic(
+            text_effect={"mean_treatment_minus_control": 0.0},
+            side_kv_effect={"mean_treatment_minus_control": 0.1},
+        )
+        self.assertEqual(unavailable["status"], "no_positive_text_control")
+        self.assertIsNone(unavailable["positive_direction_transferred"])
 
 
 if __name__ == "__main__":

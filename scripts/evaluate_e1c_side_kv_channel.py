@@ -33,7 +33,10 @@ from memgen.experience.phase1 import (
     text_sha256,
 )
 from scripts.e1_staged_common import (
+    PairedConditionComparison,
+    PairedConditionDiagnostics,
     effect_is_positive,
+    format_transfer_diagnostic,
     load_hashed_manifest,
     paired_condition_effect,
     processed_solution,
@@ -118,14 +121,21 @@ def main() -> None:
     if any(not assignment.assigned for assignment in assignments):
         raise ValueError("E1-C requires complete matched/shuffled E1-B assignments")
     e1b_run = json.loads(args.e1b_run_report.read_text(encoding="utf-8"))
-    if e1b_run.get("results", {}).get("sha256") != file_sha256(args.e1b_results):
-        raise ValueError("E1-B results do not match their run report")
-    e1b_summary = json.loads(args.e1b_summary.read_text(encoding="utf-8"))
     if (
-        e1b_summary.get("schema_version") != E1B_SUMMARY_SCHEMA
-        or e1b_summary.get("formal_e1b_passed") is not True
+        e1b_run.get("status") != "completed"
+        or e1b_run.get("results", {}).get("sha256")
+        != file_sha256(args.e1b_results)
+        or e1b_run.get("inputs", {}).get("assignment_manifest_sha256")
+        != file_sha256(args.assignment_manifest)
     ):
-        raise ValueError("E1-C is only permitted after formal E1-B passes")
+        raise ValueError("E1-B artifacts do not match their run report")
+    e1b_summary = json.loads(args.e1b_summary.read_text(encoding="utf-8"))
+    if e1b_summary.get("schema_version") != E1B_SUMMARY_SCHEMA:
+        raise ValueError("E1-C requires the current E1-B summary schema")
+    component_handoff = e1b_summary.get("component_diagnostic", {})
+    if component_handoff.get("e1c_component_diagnostic_allowed") is not True:
+        raise ValueError("E1-B artifacts are not valid for E1-C component diagnosis")
+    source_e1b_formal_passed = e1b_summary.get("formal_e1b_passed") is True
     if (
         e1b_summary.get("provenance", {}).get(
             "assignment_manifest_logical_sha256"
@@ -134,7 +144,7 @@ def main() -> None:
         or e1b_summary.get("provenance", {}).get("results_sha256")
         != file_sha256(args.e1b_results)
     ):
-        raise ValueError("E1-B passing summary does not authenticate these artifacts")
+        raise ValueError("E1-B summary does not authenticate these artifacts")
     e1b_records = read_jsonl(args.e1b_results)
     if any(record.get("schema_version") != E1B_RESULTS_SCHEMA for record in e1b_records):
         raise ValueError("Unexpected E1-B results schema")
@@ -261,6 +271,14 @@ def main() -> None:
                         device=args.device,
                         dtype=next(model.parameters()).dtype,
                     )
+                    if (
+                        memory.payload_hash != choice.payload_hash
+                        or memory.valid_slot_count != choice.kv_valid_slot_count
+                        or memory.layer_number != layer
+                    ):
+                        raise ValueError(
+                            f"Side-KV metadata drift for {choice.memory_id}"
+                        )
                     started = time.perf_counter()
                     generated = runtime.generate_prompt_with_persistent_memory(
                         prompt_token_ids=base_prompt_ids,
@@ -313,36 +331,79 @@ def main() -> None:
         controller.close()
 
     condition_summary = summarize_conditions(output_records, conditions)
-    accuracy_effects = {
-        "matched_side_kv_vs_no_memory": paired_condition_effect(
-            output_records,
-            treatment="matched_persistent_side_kv",
-            control="no_memory",
-            field="final_reward",
-            resamples=args.bootstrap_resamples,
+    diagnostic_builder = PairedConditionDiagnostics(
+        output_records, bootstrap_resamples=args.bootstrap_resamples
+    )
+    paired_diagnostics = diagnostic_builder.summarize(
+        (
+            PairedConditionComparison(
+                "matched_side_kv_vs_no_memory",
+                "matched_persistent_side_kv",
+                "no_memory",
+            ),
+            PairedConditionComparison(
+                "shuffled_side_kv_vs_no_memory",
+                "shuffled_persistent_side_kv",
+                "no_memory",
+            ),
+            PairedConditionComparison(
+                "matched_side_kv_vs_shuffled_side_kv",
+                "matched_persistent_side_kv",
+                "shuffled_persistent_side_kv",
+            ),
+            PairedConditionComparison(
+                "matched_side_kv_vs_matched_text",
+                "matched_persistent_side_kv",
+                "matched_text",
+            ),
+            PairedConditionComparison(
+                "matched_text_vs_no_memory", "matched_text", "no_memory"
+            ),
+        )
+    )
+    accuracy_effects = paired_diagnostics["accuracy_effects"]
+    format_effects = paired_diagnostics["format_effects"]
+    format_transfer = format_transfer_diagnostic(
+        text_effect=format_effects["matched_text_vs_no_memory"],
+        side_kv_effect=format_effects["matched_side_kv_vs_no_memory"],
+    )
+    exact_slot_sample_ids = {
+        assignment.sample_id
+        for assignment in assignments
+        if assignment.shuffled_memory is not None
+        and assignment.matched_memory.kv_valid_slot_count
+        == assignment.shuffled_memory.kv_valid_slot_count
+    }
+    exact_slot_records = [
+        record
+        for record in output_records
+        if record["sample_id"] in exact_slot_sample_ids
+    ]
+    exact_slot_sensitivity = {
+        "paired_sample_count": len(exact_slot_records),
+        "matched_vs_shuffled_accuracy": (
+            paired_condition_effect(
+                exact_slot_records,
+                treatment="matched_persistent_side_kv",
+                control="shuffled_persistent_side_kv",
+                field="final_reward",
+                resamples=args.bootstrap_resamples,
+            )
+            if len(exact_slot_records) >= 2
+            else None
         ),
-        "matched_side_kv_vs_shuffled_side_kv": paired_condition_effect(
-            output_records,
-            treatment="matched_persistent_side_kv",
-            control="shuffled_persistent_side_kv",
-            field="final_reward",
-            resamples=args.bootstrap_resamples,
-        ),
-        "matched_side_kv_vs_matched_text": paired_condition_effect(
-            output_records,
-            treatment="matched_persistent_side_kv",
-            control="matched_text",
-            field="final_reward",
-            resamples=args.bootstrap_resamples,
+        "matched_vs_shuffled_format": (
+            paired_condition_effect(
+                exact_slot_records,
+                treatment="matched_persistent_side_kv",
+                control="shuffled_persistent_side_kv",
+                field="format_valid",
+                resamples=args.bootstrap_resamples,
+            )
+            if len(exact_slot_records) >= 2
+            else None
         ),
     }
-    format_effect = paired_condition_effect(
-        output_records,
-        treatment="matched_persistent_side_kv",
-        control="no_memory",
-        field="format_valid",
-        resamples=args.bootstrap_resamples,
-    )
     side_rows = [
         record["conditions"][condition]["side_kv"]
         for record in output_records
@@ -374,7 +435,12 @@ def main() -> None:
             accuracy_effects["matched_side_kv_vs_shuffled_side_kv"]
         ),
         "matched_side_kv_format_not_below_no_memory": (
-            float(format_effect["mean_treatment_minus_control"]) >= 0.0
+            float(
+                format_effects["matched_side_kv_vs_no_memory"][
+                    "mean_treatment_minus_control"
+                ]
+            )
+            >= 0.0
         ),
     }
     summary = {
@@ -382,10 +448,27 @@ def main() -> None:
         "created_at": utc_now(),
         "status": "passed" if all(acceptance.values()) else "did_not_pass",
         "formal_e1c_passed": all(acceptance.values()),
+        "source_e1b_formal_passed": source_e1b_formal_passed,
         "sample_count": len(output_records),
         "conditions": condition_summary,
         "accuracy_effects": accuracy_effects,
-        "matched_side_kv_vs_no_memory_format": format_effect,
+        "diagnostic_answer_effects": paired_diagnostics[
+            "diagnostic_answer_effects"
+        ],
+        "format_effects": format_effects,
+        "format_positive_control_transfer": format_transfer,
+        "strict_accuracy_transition_diagnostics": (
+            paired_diagnostics["strict_accuracy_transition_diagnostics"]
+        ),
+        "completion_difference_diagnostics": paired_diagnostics[
+            "completion_difference_diagnostics"
+        ],
+        "exact_slot_count_sensitivity": exact_slot_sensitivity,
+        "component_diagnostic": {
+            "status": "passed" if mechanism_passed else "failed",
+            "persistent_side_kv_mechanism_passed": mechanism_passed,
+            "formal_task_pass_required_for_diagnostic": False,
+        },
         "mechanism_diagnostics": {
             "normalization": E1C_MEMORY_SCORE_NORMALIZATION,
             "all_runtime_invariants_passed": mechanism_passed,
@@ -405,6 +488,30 @@ def main() -> None:
                 ]
                 for record in output_records
             ) / len(output_records),
+            "mean_matched_first_step_logits_kl": sum(
+                record["conditions"]["matched_persistent_side_kv"]["side_kv"][
+                    "first_step_logits_kl_baseline_to_memory"
+                ]
+                for record in output_records
+            ) / len(output_records),
+            "mean_shuffled_first_step_logits_kl": sum(
+                record["conditions"]["shuffled_persistent_side_kv"]["side_kv"][
+                    "first_step_logits_kl_baseline_to_memory"
+                ]
+                for record in output_records
+            ) / len(output_records),
+            "matched_first_step_top1_changed_count": sum(
+                record["conditions"]["matched_persistent_side_kv"]["side_kv"][
+                    "first_step_top1_changed"
+                ]
+                for record in output_records
+            ),
+            "shuffled_first_step_top1_changed_count": sum(
+                record["conditions"]["shuffled_persistent_side_kv"]["side_kv"][
+                    "first_step_top1_changed"
+                ]
+                for record in output_records
+            ),
         },
         "acceptance": acceptance,
     }
@@ -417,8 +524,10 @@ def main() -> None:
         "inputs": {
             "assignment_manifest_sha256": file_sha256(args.assignment_manifest),
             "e1b_results_sha256": file_sha256(args.e1b_results),
+            "e1b_run_report_sha256": file_sha256(args.e1b_run_report),
             "e1b_summary_sha256": file_sha256(args.e1b_summary),
             "side_kv_manifest_sha256": file_sha256(args.side_kv_manifest),
+            "split_manifest_sha256": file_sha256(args.split_manifest),
         },
         "results": {"path": results_path.name, "sha256": file_sha256(results_path)},
     })

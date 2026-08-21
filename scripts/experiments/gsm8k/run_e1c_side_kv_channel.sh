@@ -29,9 +29,12 @@ SPLIT_MANIFEST="$PHASE1_DIR/split_manifest.json"
 for FILE in "$ASSIGNMENT_MANIFEST" "$E1B_RESULTS" "$E1B_RUN_REPORT" "$E1B_SUMMARY" "$SIDE_KV_MANIFEST" "$SPLIT_MANIFEST"; do
   [[ -s "$FILE" ]] || { echo "Missing frozen input: $FILE" >&2; exit 1; }
 done
-if [[ "$(jq -r '.formal_e1b_passed' "$E1B_SUMMARY")" != "true" ]]; then
-  echo "E1-C stopped because formal_e1b_passed is not true." >&2
+if [[ "$(jq -r '.component_diagnostic.e1c_component_diagnostic_allowed' "$E1B_SUMMARY")" != "true" ]]; then
+  echo "E1-C stopped because the E1-B component handoff is not valid." >&2
   exit 3
+fi
+if [[ "$(jq -r '.formal_e1b_passed' "$E1B_SUMMARY")" != "true" ]]; then
+  echo "E1-B did not formally pass task accuracy; running E1-C in component-diagnostic mode." >&2
 fi
 
 LOGICAL_SPLIT="$(jq -r '.logical_split' "$ASSIGNMENT_MANIFEST")"

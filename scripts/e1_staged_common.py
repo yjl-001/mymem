@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -115,16 +116,32 @@ def summarize_conditions(
     summary: dict[str, dict[str, Any]] = {}
     for condition in conditions:
         rows = [record["conditions"][condition] for record in records]
+        diagnostic_answers = [
+            row.get("verifier", {}).get("diagnostic_answer_correct")
+            for row in rows
+        ]
         summary[condition] = {
             "sample_count": len(rows),
             "accuracy": sum(float(row["final_reward"]) for row in rows) / len(rows),
             "format_accuracy": sum(bool(row["format_valid"]) for row in rows) / len(rows),
+            "diagnostic_answer_accuracy": sum(
+                value is True for value in diagnostic_answers
+            ) / len(rows),
+            "diagnostic_answer_coverage": sum(
+                value is not None for value in diagnostic_answers
+            ) / len(rows),
             "mean_generation_length": sum(int(row["generation_length"]) for row in rows)
             / len(rows),
             "mean_prompt_token_count": sum(int(row["prompt_token_count"]) for row in rows)
             / len(rows),
         }
     return summary
+
+
+def _binary_metric(row: Mapping[str, Any], field: str) -> bool | float:
+    if field == "diagnostic_answer_correct":
+        return row.get("verifier", {}).get("diagnostic_answer_correct") is True
+    return row[field]
 
 
 def paired_condition_effect(
@@ -138,16 +155,212 @@ def paired_condition_effect(
 ) -> dict[str, Any]:
     return paired_binary_effect(
         {
-            str(record["sample_id"]): record["conditions"][treatment][field]
+            str(record["sample_id"]): _binary_metric(
+                record["conditions"][treatment], field
+            )
             for record in records
         },
         {
-            str(record["sample_id"]): record["conditions"][control][field]
+            str(record["sample_id"]): _binary_metric(
+                record["conditions"][control], field
+            )
             for record in records
         },
         seed=seed,
         resamples=resamples,
     )
+
+
+def completion_difference_summary(
+    records: Sequence[Mapping[str, Any]], *, treatment: str, control: str
+) -> dict[str, Any]:
+    """Report token-level completion divergence for a paired condition."""
+
+    different = 0
+    for record in records:
+        treatment_row = record["conditions"][treatment]
+        control_row = record["conditions"][control]
+        treatment_hash = treatment_row.get("completion_token_ids_sha256")
+        control_hash = control_row.get("completion_token_ids_sha256")
+        if treatment_hash is None or control_hash is None:
+            changed = treatment_row.get("completion_token_ids") != control_row.get(
+                "completion_token_ids"
+            )
+        else:
+            changed = treatment_hash != control_hash
+        different += bool(changed)
+    count = len(records)
+    return {
+        "paired_sample_count": count,
+        "different_completion_count": different,
+        "different_completion_rate": different / count,
+    }
+
+
+def strict_accuracy_transition_diagnostics(
+    records: Sequence[Mapping[str, Any]], *, treatment: str, control: str
+) -> dict[str, int]:
+    """Partition strict reward flips into format and answer-content changes.
+
+    ``diagnostic_answer_correct`` is best-effort and never replaces the formal
+    GSM8K verifier.  The partition exists to reveal when a strict reward change
+    is explained by adding or losing the required box around the same likely
+    correct answer.
+    """
+
+    counts = {
+        "paired_sample_count": len(records),
+        "strict_treatment_gain_count": 0,
+        "strict_treatment_loss_count": 0,
+        "format_only_gain_count": 0,
+        "format_only_loss_count": 0,
+        "diagnostic_answer_gain_count": 0,
+        "diagnostic_answer_loss_count": 0,
+        "mixed_or_unclassified_gain_count": 0,
+        "mixed_or_unclassified_loss_count": 0,
+    }
+    for record in records:
+        treatment_row = record["conditions"][treatment]
+        control_row = record["conditions"][control]
+        treatment_reward = bool(treatment_row["final_reward"])
+        control_reward = bool(control_row["final_reward"])
+        treatment_answer = treatment_row.get("verifier", {}).get(
+            "diagnostic_answer_correct"
+        )
+        control_answer = control_row.get("verifier", {}).get(
+            "diagnostic_answer_correct"
+        )
+        treatment_format = bool(treatment_row["format_valid"])
+        control_format = bool(control_row["format_valid"])
+
+        if treatment_reward and not control_reward:
+            counts["strict_treatment_gain_count"] += 1
+            if (
+                control_answer
+                and treatment_answer
+                and not control_format
+                and treatment_format
+            ):
+                counts["format_only_gain_count"] += 1
+            elif control_answer is False and treatment_answer is True:
+                counts["diagnostic_answer_gain_count"] += 1
+            else:
+                counts["mixed_or_unclassified_gain_count"] += 1
+        elif control_reward and not treatment_reward:
+            counts["strict_treatment_loss_count"] += 1
+            if (
+                control_answer
+                and treatment_answer
+                and control_format
+                and not treatment_format
+            ):
+                counts["format_only_loss_count"] += 1
+            elif control_answer is True and treatment_answer is False:
+                counts["diagnostic_answer_loss_count"] += 1
+            else:
+                counts["mixed_or_unclassified_loss_count"] += 1
+    return counts
+
+
+def format_transfer_diagnostic(
+    *, text_effect: Mapping[str, Any], side_kv_effect: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Compare the direction of an observed text-format effect with side-KV."""
+
+    text_delta = float(text_effect["mean_treatment_minus_control"])
+    side_kv_delta = float(side_kv_effect["mean_treatment_minus_control"])
+    positive_text_control = text_delta > 0.0
+    if positive_text_control:
+        transfer_observed: bool | None = side_kv_delta > 0.0
+        status = "observed" if transfer_observed else "not_observed"
+    else:
+        transfer_observed = None
+        status = "no_positive_text_control"
+    return {
+        "status": status,
+        "positive_text_control_present": positive_text_control,
+        "text_minus_no_memory": text_delta,
+        "side_kv_minus_no_memory": side_kv_delta,
+        "side_kv_minus_text": side_kv_delta - text_delta,
+        "positive_direction_transferred": transfer_observed,
+    }
+
+
+@dataclass(frozen=True)
+class PairedConditionComparison:
+    """Named treatment/control pair shared by E1-B and E1-C reports."""
+
+    name: str
+    treatment: str
+    control: str
+
+    def __post_init__(self) -> None:
+        if not self.name or not self.treatment or not self.control:
+            raise ValueError("Paired condition comparison fields must be non-empty")
+        if self.treatment == self.control:
+            raise ValueError("Treatment and control conditions must differ")
+
+
+class PairedConditionDiagnostics:
+    """Build the standard task, format, content, and divergence diagnostics."""
+
+    def __init__(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        *,
+        bootstrap_resamples: int,
+    ):
+        if not records or bootstrap_resamples <= 0:
+            raise ValueError("Paired diagnostics require records and resamples")
+        self.records = tuple(records)
+        self.bootstrap_resamples = bootstrap_resamples
+
+    def summarize(
+        self, comparisons: Sequence[PairedConditionComparison]
+    ) -> dict[str, dict[str, Any]]:
+        if not comparisons or len({item.name for item in comparisons}) != len(
+            comparisons
+        ):
+            raise ValueError("Paired diagnostic names must be non-empty and unique")
+        output: dict[str, dict[str, Any]] = {
+            "accuracy_effects": {},
+            "diagnostic_answer_effects": {},
+            "format_effects": {},
+            "strict_accuracy_transition_diagnostics": {},
+            "completion_difference_diagnostics": {},
+        }
+        for comparison in comparisons:
+            common = {
+                "treatment": comparison.treatment,
+                "control": comparison.control,
+            }
+            output["accuracy_effects"][comparison.name] = paired_condition_effect(
+                self.records,
+                field="final_reward",
+                resamples=self.bootstrap_resamples,
+                **common,
+            )
+            output["diagnostic_answer_effects"][comparison.name] = (
+                paired_condition_effect(
+                    self.records,
+                    field="diagnostic_answer_correct",
+                    resamples=self.bootstrap_resamples,
+                    **common,
+                )
+            )
+            output["format_effects"][comparison.name] = paired_condition_effect(
+                self.records,
+                field="format_valid",
+                resamples=self.bootstrap_resamples,
+                **common,
+            )
+            output["strict_accuracy_transition_diagnostics"][comparison.name] = (
+                strict_accuracy_transition_diagnostics(self.records, **common)
+            )
+            output["completion_difference_diagnostics"][comparison.name] = (
+                completion_difference_summary(self.records, **common)
+            )
+        return output
 
 
 def effect_is_positive(effect: Mapping[str, Any]) -> bool:
