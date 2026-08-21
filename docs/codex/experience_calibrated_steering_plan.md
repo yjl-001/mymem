@@ -107,6 +107,10 @@ R(h_t)=\cos(h_t,\mu_{\mathrm{persistence}})-\cos(h_t,\mu_{\mathrm{recovery}}).
 - 同题 reference-persistence → target-recovery 的 raw-state local action 仅有 23 个 bank-train 和
   9 个 held-out 候选。虽然 action directions 不共线（effective rank `13.75/23`），但 held-out
   top-1/top-2 routing margin 的中位数仅 `0.0059`，不足以稳定选择具体 action。该分支已关闭。
+- E0 已正式通过：192 条合格来源中 161 条形成完整 MemoryRecord；8/8 answer-blind runtime cases
+  通过，平均 memory attention mass `0.3331`、平均 first-step logits KL `0.00507`，最大 canonical
+  RoPE score 相对误差 `0.00109`。native cache prefix/length 与 disabled-path parity 均通过；E0
+  未读取任务正确率。
 
 结论：风险 gate 可以作为访问经验的时机；它不能直接提供一个通用 residual 纠偏方向，也不能
 承担具体经验检索键的职责。
@@ -206,12 +210,9 @@ side_kv_applied, generation_length, final_reward, format_reward, output_path
 
 ## 8. 当前交接点
 
-下一步是实现 E0，而不是继续运行 Phase 2 或 H3 vector/action 脚本：
-
-1. 定义并生成无泄漏的 `MemoryRecord`；
-2. 完成 layer-24 side-KV 编译、RoPE/cache 单测和 attention 可见性审计；
-3. 固定 E1 的 BM25 baseline、预算与新的 evaluation split；
-4. 实施同 manifest 的 matched-memory / shuffled-memory 因果评测。
+E0 已完成并冻结。当前执行 E1：先在 `dev-test` 运行 answer-blind observation-only prepass，冻结
+BM25 top-1 与确定性 shuffled assignment，再用同一 manifest 运行四条件配对评测。具体 artifact、
+对照和服务器入口见 [E1 设计](e1_experience_memory_design.md)。
 
 在 E1 得到 matched-memory 的独立因果证据前，不扩展 memory 数量、不搜索 layer/注入强度，
 不进入 E2/E3 或 final-test。

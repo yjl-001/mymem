@@ -47,6 +47,18 @@ from memgen.experience.retrieval import (
     TextAnalyzer,
     TextAnalyzerConfig,
 )
+from memgen.experience.e1 import (
+    E1_ASSIGNMENT_SCHEMA,
+    E1_CONDITIONS,
+    E1_MANIFEST_SCHEMA,
+    E1_RESULTS_SCHEMA,
+    E1_SUMMARY_SCHEMA,
+    E1Assignment,
+    GateObservation,
+    MatchedMemoryDeranger,
+    MemoryChoice,
+    paired_binary_effect,
+)
 
 __all__ = [
     "TEACHER_BANK_REQUIRED_FIELDS",
@@ -88,4 +100,14 @@ __all__ = [
     "RetrievalQueryConfig",
     "TextAnalyzer",
     "TextAnalyzerConfig",
+    "E1_ASSIGNMENT_SCHEMA",
+    "E1_CONDITIONS",
+    "E1_MANIFEST_SCHEMA",
+    "E1_RESULTS_SCHEMA",
+    "E1_SUMMARY_SCHEMA",
+    "E1Assignment",
+    "GateObservation",
+    "MatchedMemoryDeranger",
+    "MemoryChoice",
+    "paired_binary_effect",
 ]

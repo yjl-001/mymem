@@ -60,6 +60,7 @@ env/
 .env.*.local
 scripts/experiments/.server.env
 scripts/experiments/gsm8k/.e0.server.env
+scripts/experiments/gsm8k/.e1.server.env
 
 # Weights & Biases
 wandb/

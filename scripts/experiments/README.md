@@ -147,3 +147,22 @@ bash scripts/experiments/gsm8k/run_e0_experience_memory.sh \
 下一 boundary 熵、logits KL、memory attention、检索分数和延迟均会记录为诊断；主要问题是模型是否
 利用了匹配的经验内容并改善最终任务表现，而不是是否单纯降低熵。完整规范见
 [`experience_calibrated_steering_plan.md`](../../docs/codex/experience_calibrated_steering_plan.md)。
+
+E0 正式通过后，E1 使用三个冻结输入：Phase 1 run、正式 E0 run，以及已通过 held-out 风险诊断的
+entropy-risk artifact。服务器本地配置仍只保留 output root 和可选 GPU：
+
+```bash
+cp scripts/experiments/gsm8k/e1.server.env.example \
+  scripts/experiments/gsm8k/.e1.server.env
+
+bash scripts/experiments/gsm8k/run_e1_experience_memory.sh \
+  --limit 100 \
+  /absolute/path/to/phase1-run \
+  /absolute/path/to/formal-e0-run \
+  /absolute/path/to/phase2-entropy-risk-state-delta-answer_correctness.pt
+```
+
+可先用 `--print-config` 检查从 artifacts 解析出的 revisions 和 split，而不加载模型。E1 首版固定
+BM25 top-1、96-token partial-CoT window、layer 24、首次联合 entropy-risk trigger、单条 memory 和
+单次注入；matched/shuffled 只改变 memory ID。完整接口见
+[`e1_experience_memory_design.md`](../../docs/codex/e1_experience_memory_design.md)。
