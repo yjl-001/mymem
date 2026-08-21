@@ -115,6 +115,67 @@ class SideKVAttentionTrace:
 
 
 @dataclass(frozen=True)
+class QwenAttentionCall:
+    """Normalized arguments for one active Qwen attention invocation."""
+
+    hidden_states: torch.Tensor
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None
+    attention_mask: torch.Tensor | None
+    past_key_value: Any | None
+    cache_position: torch.LongTensor | None
+
+
+class QwenAttentionProtocol:
+    """Validate and normalize the supported Hugging Face Qwen interfaces.
+
+    Transformers 4.55 names the layer-local cache ``past_key_value`` while
+    4.56+ names it ``past_key_values``.  Newer releases also omit
+    ``cache_position`` from the attention signature.  The tensor semantics are
+    unchanged, so the side-KV implementation normalizes only these explicit
+    protocol differences instead of depending on a package-version branch.
+    """
+
+    CACHE_PARAMETER_NAMES = ("past_key_value", "past_key_values")
+    REQUIRED_PARAMETER_NAMES = (
+        "hidden_states",
+        "position_embeddings",
+        "attention_mask",
+    )
+
+    def __init__(self, forward: Any):
+        self.signature = inspect.signature(forward)
+        parameters = self.signature.parameters
+        missing = [
+            name for name in self.REQUIRED_PARAMETER_NAMES if name not in parameters
+        ]
+        cache_parameters = [
+            name for name in self.CACHE_PARAMETER_NAMES if name in parameters
+        ]
+        if missing or len(cache_parameters) != 1:
+            raise ValueError(
+                "Selected attention forward signature is incompatible with side-KV: "
+                f"signature={self.signature}, missing={missing}, "
+                f"cache_parameters={cache_parameters}"
+            )
+        self.cache_parameter = cache_parameters[0]
+        self.has_cache_position = "cache_position" in parameters
+
+    def bind(self, args: Sequence[Any], kwargs: Mapping[str, Any]) -> QwenAttentionCall:
+        bound = self.signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        arguments = bound.arguments
+        return QwenAttentionCall(
+            hidden_states=arguments["hidden_states"],
+            position_embeddings=arguments["position_embeddings"],
+            attention_mask=arguments["attention_mask"],
+            past_key_value=arguments[self.cache_parameter],
+            cache_position=(
+                arguments.get("cache_position") if self.has_cache_position else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class CompiledSideKVBank:
     """Padded tensor bank plus its content-addressed manifest."""
 
@@ -539,8 +600,10 @@ class SideKVAttentionController:
         self.module = getattr(layers[layer_number - 1], "self_attn", None)
         if self.module is None:
             raise ValueError("Selected decoder block has no self_attn")
-        self._validate_attention_protocol()
-        implementation = getattr(getattr(self.module, "config", None), "_attn_implementation", None)
+        self._attention_protocol = self._validate_attention_protocol()
+        implementation = getattr(
+            getattr(self.module, "config", None), "_attn_implementation", None
+        )
         if implementation != "eager":
             raise ValueError("SideKVAttentionController requires eager attention")
         self._original_forward = self.module.forward
@@ -550,11 +613,14 @@ class SideKVAttentionController:
         controller = self
 
         def patched_forward(module_self: Any, *args: Any, **kwargs: Any):
-            return controller._forward(module_self, *args, **kwargs)
+            if controller._active_memory is None:
+                return controller._original_forward(*args, **kwargs)
+            call = controller._attention_protocol.bind(args, kwargs)
+            return controller._forward(module_self, call)
 
         self.module.forward = types.MethodType(patched_forward, self.module)
 
-    def _validate_attention_protocol(self) -> None:
+    def _validate_attention_protocol(self) -> QwenAttentionProtocol:
         required_attributes = (
             "q_proj",
             "k_proj",
@@ -569,18 +635,7 @@ class SideKVAttentionController:
         missing = [name for name in required_attributes if not hasattr(self.module, name)]
         if missing:
             raise ValueError(f"Selected attention module lacks side-KV protocol: {missing}")
-        parameters = inspect.signature(self.module.forward).parameters
-        required_parameters = {
-            "hidden_states",
-            "position_embeddings",
-            "attention_mask",
-            "past_key_value",
-            "cache_position",
-        }
-        if not required_parameters.issubset(parameters):
-            raise ValueError(
-                "Selected attention forward signature is incompatible with side-KV"
-            )
+        return QwenAttentionProtocol(self.module.forward)
 
     @property
     def traces(self) -> tuple[SideKVAttentionTrace, ...]:
@@ -627,27 +682,16 @@ class SideKVAttentionController:
     def _forward(
         self,
         module: Any,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attention_mask: torch.Tensor | None = None,
-        past_key_value: Any | None = None,
-        cache_position: torch.LongTensor | None = None,
-        **kwargs: Any,
+        call: QwenAttentionCall,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         memory = self._active_memory
         if memory is None:
-            return self._original_forward(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-                past_key_value=past_key_value,
-                cache_position=cache_position,
-                **kwargs,
-            )
+            raise RuntimeError("Active side-KV forward has no memory")
         if module.training:
             raise RuntimeError("Side-KV E0/E1 integration is inference-only")
-        if position_embeddings is None:
+        if call.position_embeddings is None:
             raise ValueError("Side-KV Qwen integration requires position_embeddings")
+        hidden_states = call.hidden_states
         batch_size, query_length, _ = hidden_states.shape
         if self.require_batch_size_one and batch_size != 1:
             raise ValueError("Side-KV E0/E1 integration requires batch size one")
@@ -665,16 +709,20 @@ class SideKVAttentionController:
         value_states = module.v_proj(hidden_states).view(
             batch_size, query_length, num_kv_heads, head_dim
         ).transpose(1, 2)
-        cos, sin = position_embeddings
+        cos, sin = call.position_embeddings
         query_rotated, key_rotated = apply_rotary_pos_emb(
             query_pre,
             key_pre,
             cos,
             sin,
         )
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_rotated, value_states = past_key_value.update(
+        if call.past_key_value is not None:
+            cache_kwargs = {
+                "sin": sin,
+                "cos": cos,
+                "cache_position": call.cache_position,
+            }
+            key_rotated, value_states = call.past_key_value.update(
                 key_rotated,
                 value_states,
                 module.layer_idx,
@@ -687,8 +735,11 @@ class SideKVAttentionController:
             query_rotated,
             native_keys.transpose(2, 3),
         ) * float(module.scaling)
-        if attention_mask is not None:
-            native_scores = native_scores + attention_mask[:, :, :, : native_keys.shape[-2]]
+        if call.attention_mask is not None:
+            native_scores = (
+                native_scores
+                + call.attention_mask[:, :, :, : native_keys.shape[-2]]
+            )
 
         memory_keys = memory.keys.to(device=query_pre.device, dtype=query_pre.dtype)
         memory_values = memory.values.to(device=query_pre.device, dtype=query_pre.dtype)

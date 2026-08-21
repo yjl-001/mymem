@@ -89,22 +89,62 @@ if torch is not None:
             return "native-forward"
 
 
+    class FakePluralCacheAttention(FakeAttention):
+        def forward(
+            self,
+            hidden_states,
+            position_embeddings=None,
+            attention_mask=None,
+            past_key_values=None,
+            cache_position=None,
+            **kwargs,
+        ):
+            del (
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                cache_position,
+                kwargs,
+            )
+            return "native-forward"
+
+
+    class FakePluralCacheWithoutPositionAttention(FakeAttention):
+        def forward(
+            self,
+            hidden_states,
+            position_embeddings=None,
+            attention_mask=None,
+            past_key_values=None,
+            **kwargs,
+        ):
+            del (
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                kwargs,
+            )
+            return "native-forward"
+
+
     class FakeBlock(nn.Module):
-        def __init__(self) -> None:
+        def __init__(self, attention_type=FakeAttention) -> None:
             super().__init__()
-            self.self_attn = FakeAttention()
+            self.self_attn = attention_type()
 
 
     class FakeBackbone(nn.Module):
-        def __init__(self) -> None:
+        def __init__(self, attention_type=FakeAttention) -> None:
             super().__init__()
-            self.layers = nn.ModuleList([FakeBlock()])
+            self.layers = nn.ModuleList([FakeBlock(attention_type)])
 
 
     class FakeModel(nn.Module):
-        def __init__(self) -> None:
+        def __init__(self, attention_type=FakeAttention) -> None:
             super().__init__()
-            self.model = FakeBackbone()
+            self.model = FakeBackbone(attention_type)
 
 
     class FakeCache:
@@ -125,54 +165,65 @@ class SideKVControllerTests(unittest.TestCase):
     def test_memory_uses_a_side_path_without_extending_the_native_cache(self) -> None:
         from memgen.model.side_kv import SideKVAttentionController, SideKVMemory
 
-        torch.manual_seed(7)
-        model = FakeModel().eval()
-        attention = model.model.layers[0].self_attn
-        controller = SideKVAttentionController(
-            model=model,
-            layer_number=1,
-            audit_canonical_rope=True,
+        protocols = (
+            (FakeAttention, "past_key_value", True),
+            (FakePluralCacheAttention, "past_key_values", True),
+            (FakePluralCacheWithoutPositionAttention, "past_key_values", False),
         )
-        native_keys = torch.randn(1, 2, 3, 2)
-        native_values = torch.randn(1, 2, 3, 2)
-        prefix_keys = native_keys.clone()
-        cache = FakeCache(native_keys, native_values)
-        memory = SideKVMemory(
-            memory_id="memory-fixture",
-            payload_hash="payload",
-            keys=torch.randn(2, 2, 2),
-            values=torch.randn(2, 2, 2),
-            slot_mask=torch.tensor([True, True]),
-            layer_number=1,
-        )
-        hidden = torch.randn(1, 1, 8)
-        cos = torch.ones(1, 1, 2)
-        sin = torch.zeros(1, 1, 2)
-        mask = torch.zeros(1, 1, 1, 4)
-        try:
-            with controller.use_memory(memory):
-                output, weights = attention(
-                    hidden_states=hidden,
-                    position_embeddings=(cos, sin),
-                    attention_mask=mask,
-                    past_key_value=cache,
-                    cache_position=torch.tensor([3]),
+        for attention_type, cache_parameter, has_cache_position in protocols:
+            with self.subTest(attention_type=attention_type.__name__):
+                torch.manual_seed(7)
+                model = FakeModel(attention_type).eval()
+                attention = model.model.layers[0].self_attn
+                controller = SideKVAttentionController(
+                    model=model,
+                    layer_number=1,
+                    audit_canonical_rope=True,
                 )
-            self.assertEqual(tuple(output.shape), (1, 1, 8))
-            self.assertEqual(tuple(weights.shape), (1, 4, 1, 6))
-            self.assertEqual(cache.keys.shape[-2], 4)
-            self.assertTrue(torch.equal(cache.keys[..., :3, :], prefix_keys))
-            self.assertEqual(len(controller.traces), 1)
-            trace = controller.traces[0]
-            self.assertEqual(trace.native_key_length, 4)
-            self.assertEqual(trace.memory_slot_count, 2)
-            self.assertGreater(trace.memory_attention_mass, 0.0)
-            self.assertLess(trace.memory_attention_mass, 1.0)
-            self.assertIsNotNone(trace.canonical_rope_score_relative_error)
-            self.assertLessEqual(trace.canonical_rope_score_relative_error, 1e-6)
-            self.assertEqual(attention(hidden_states=hidden), "native-forward")
-        finally:
-            controller.close()
+                native_keys = torch.randn(1, 2, 3, 2)
+                native_values = torch.randn(1, 2, 3, 2)
+                prefix_keys = native_keys.clone()
+                cache = FakeCache(native_keys, native_values)
+                memory = SideKVMemory(
+                    memory_id="memory-fixture",
+                    payload_hash="payload",
+                    keys=torch.randn(2, 2, 2),
+                    values=torch.randn(2, 2, 2),
+                    slot_mask=torch.tensor([True, True]),
+                    layer_number=1,
+                )
+                hidden = torch.randn(1, 1, 8)
+                cos = torch.ones(1, 1, 2)
+                sin = torch.zeros(1, 1, 2)
+                mask = torch.zeros(1, 1, 1, 4)
+                call_kwargs = {cache_parameter: cache}
+                if has_cache_position:
+                    call_kwargs["cache_position"] = torch.tensor([3])
+                try:
+                    with controller.use_memory(memory):
+                        output, weights = attention(
+                            hidden_states=hidden,
+                            position_embeddings=(cos, sin),
+                            attention_mask=mask,
+                            **call_kwargs,
+                        )
+                    self.assertEqual(tuple(output.shape), (1, 1, 8))
+                    self.assertEqual(tuple(weights.shape), (1, 4, 1, 6))
+                    self.assertEqual(cache.keys.shape[-2], 4)
+                    self.assertTrue(torch.equal(cache.keys[..., :3, :], prefix_keys))
+                    self.assertEqual(len(controller.traces), 1)
+                    trace = controller.traces[0]
+                    self.assertEqual(trace.native_key_length, 4)
+                    self.assertEqual(trace.memory_slot_count, 2)
+                    self.assertGreater(trace.memory_attention_mass, 0.0)
+                    self.assertLess(trace.memory_attention_mass, 1.0)
+                    self.assertIsNotNone(trace.canonical_rope_score_relative_error)
+                    self.assertLessEqual(
+                        trace.canonical_rope_score_relative_error, 1e-6
+                    )
+                    self.assertEqual(attention(hidden_states=hidden), "native-forward")
+                finally:
+                    controller.close()
 
     def test_context_manager_clears_memory_after_an_exception(self) -> None:
         from memgen.model.side_kv import SideKVAttentionController, SideKVMemory
