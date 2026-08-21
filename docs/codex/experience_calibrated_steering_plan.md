@@ -40,9 +40,10 @@ online prompt + partial CoT ──► reasoning boundary ──► entropy-risk 
 - `SideKVIntegrator`：在固定的 layer 使当前 query 可 attention 到 memory KV；不得覆盖、重建或
   改写原 prompt/history KV cache。
 
-当前首版固定在 layer 24，在线每条样本只允许在**首次**满足 trigger 的 reasoning boundary
-附加一条 memory。layer 在 E0 前固定；E1 的容量和检索器在读取 E0 的长度/系统成本诊断后冻结，
-此后不得用 E1 或 final-test accuracy 调整。
+layer 24 已由 E0 固定。原先“首次满足 trigger 时单步附加一条 memory”的 E1-v1 已完成诊断但未产生
+任务收益；后续不再把经验内容、检索、表示通道和 gate 时机捆绑验证。E1-A/B/C 分别冻结经验目录、
+BM25 assignment 和 persistent side-KV 接口，E1-D 才恢复 gate。任何配置都不得用 `final-test`
+accuracy 调整。
 
 ## 3. 数据、质量与反泄漏约束
 
@@ -136,38 +137,30 @@ R(h_t)=\cos(h_t,\mu_{\mathrm{persistence}})-\cos(h_t,\mu_{\mathrm{recovery}}).
 **通过条件**：payload audit 无泄漏；所有 KV/cache 单测通过；每次 side-KV 应用均能记录 memory
 attention mass。E0 不得以任务正确率宣称效果。
 
-### E1：匹配经验内容是否具有因果作用
+### E1：分离经验内容、检索、side-KV 与 gate
 
-**问题**：模型的变化来自匹配的经验内容，还是任意额外文本/KV 扰动？
+E1-v1 在 `dev-test` 前 100 条上同时测试 BM25、风险 gate 和单步 side-KV。33 条 assigned 样本中，
+matched、shuffled、gate-only 均为 `6/33`；matched/shuffled 都改变了 `21/33` 条 completion，但首
+token 均未改变，两者之间只有 `6/33` 条 completion 不同。memory attention mass 为正，说明机制
+进入计算，但当前组合主要产生内容不敏感的轨迹扰动。该结果不用于配置选择，也不能单独否定 bank、
+retriever 或 side-KV。
 
-**冻结前置项**：根据 E0 的完整 payload 长度、KV footprint 和系统成本冻结 E1 全局容量；在
-`calibration-val` 上冻结一个透明的检索 baseline（首版为 BM25 over sanitized retrieval keys）、
-top-1、layer 24、首次触发和每样本最多一次。冻结文本
-embedding retriever 可在独立后续 ablation 中比较，但不以 E1 或 final-test accuracy 选择。
+后续采用四级验证阶梯：
 
-先运行 `gate-observation-only` prepass，为每题生成不可变 assignment manifest：首次候选 boundary、
-entropy、risk score、trigger、retrieval query hash、matched memory id/score、token budget 与 abstain
-reason。所有条件都复用此 manifest。
-
-| 条件 | 处理 | 需要回答的问题 |
+| 阶段 | 固定处理 | 主要问题 |
 |---|---|---|
-| `vanilla` | 无 gate、无 memory | 原始模型会怎样？ |
-| `gate-observation-only` | 相同 gate，但不附加 memory | gate 本身是否改变生成？必须与 vanilla completion 一致。 |
-| `matched-memory` | 在冻结 boundary 附加检索到的 top-1 side KV | 匹配经验是否有用？ |
-| `shuffled-memory` | 对 triggered sample 的 matched ids 作确定性 derangement | 是否只是任意同预算 memory 都有效？ |
+| `E1-A` | 无 retriever/gate；同一份 2048-token k-medoids 代表经验目录追加到所有题 | Phase 1 经验集合整体是否包含模型可利用的信息？ |
+| `E1-B` | no-memory 首次完整回答只用于 `question + sanitized preanswer` query；BM25 top-1 文本重答 | 检索到的经验是否优于 shuffled 和 no-memory？ |
+| `E1-C` | 原样复用 E1-B memory IDs；prompt-end persistent side-KV 与相同 ID 的文本条件比较 | side-KV 是否保留了经验内容的作用？ |
+| `E1-D` | 仅在 A/B/C 通过后恢复 entropy+risk gate | 风险 gate 是否提供更好的开始时机？ |
 
-`matched` 和 `shuffled` 必须使用同一题、同一 prefix、同一 trigger 集合、相同 side-KV layer、
-相同 memory 条数与 token budget；只允许 memory id 不同。记录 deterministic shuffle seed。
+E1-A 的 medoid 必须是真实 MemoryRecord，不使用生成式聚类总结；随机 bank 使用三个预注册种子且与
+代表 bank 等条数、近似等 token budget。E1-B 的第一次回答不进入第二次 prompt，assignment 阶段不
+读取 gold answer。E1-C 的 memory K/V 不写入 native cache，从最后一个 prompt token 开始在每个
+decode step 持续可见，并固定对 memory logits 使用 `-log(valid_slot_count)` 归一化。
 
-**判定顺序**：
-
-1. 检查 memory attention mass、retrieval score 与 logits KL，确认 payload 真正进入计算；
-2. 以 sample ID 配对、bootstrap CI 比较 `matched-memory` 对 `shuffled-memory` 和
-   `gate-observation-only` 的 GSM8K accuracy；格式准确率不得低于 vanilla；
-3. 报告下一 boundary 熵、生成长度、延迟和失败案例作为诊断，而非进入通过条件。
-
-若 E1 失败，结论只限于当前 payload / BM25 retrieval / side-KV integration 的组合无效；不能把
-失败归因于整个 Phase 1 bank 或风险 trigger。
+每个阶段都包含 no-memory 与错配/随机对照并使用 sample-level paired 统计。具体 manifest、条件、
+机制不变量和停止规则见 [E1 设计](e1_experience_memory_design.md)。
 
 ### E2：target/reference 字段的贡献（仅 E1 通过后）
 
@@ -179,7 +172,7 @@ reason。所有条件都复用此 manifest。
 
 该实验回答失败经验是否为成功策略提供额外 guardrail；它不重新测试 residual vector。
 
-### E3：风险触发时机的贡献（仅 E1 通过后）
+### E3：风险触发时机的贡献（对应 E1-D，仅 E1-A/B/C 通过后）
 
 同一条 matched memory 分别在风险 gate 的首次触发 boundary 与同生成内的确定性随机 delimiter
 附加。两组的 memory、预算和生成条件相同。该实验回答高熵+risk 是否提供了有价值的访问时机。
@@ -210,9 +203,9 @@ side_kv_applied, generation_length, final_reward, format_reward, output_path
 
 ## 8. 当前交接点
 
-E0 已完成并冻结。当前执行 E1：先在 `dev-test` 运行 answer-blind observation-only prepass，冻结
-BM25 top-1 与确定性 shuffled assignment，再用同一 manifest 运行四条件配对评测。具体 artifact、
-对照和服务器入口见 [E1 设计](e1_experience_memory_design.md)。
+E0 已完成并冻结；E1-v1 已完成且当前组合未通过。当前依次实现并运行 E1-A（固定多经验文本目录）、
+E1-B（完整 preanswer query 的 BM25 文本检索）和 E1-C（复用相同 assignment 的 persistent
+side-KV）。先在 `calibration-val` 运行，配置冻结后只在 `dev-test` offset 100 之后做一次确认。
 
-在 E1 得到 matched-memory 的独立因果证据前，不扩展 memory 数量、不搜索 layer/注入强度，
-不进入 E2/E3 或 final-test。
+在 E1-A/B/C 得到逐组件证据前，不实现 gate timing、不扩展 memory 数量、不搜索 layer/注入强度，
+不进入 E2/E3 或 `final-test`。

@@ -217,6 +217,16 @@ class MemoryContinuationResult:
     first_step_top1_changed: bool
 
 
+@dataclass(frozen=True)
+class PersistentMemoryGenerationResult:
+    """Prompt-end generation with one static memory visible through EOS."""
+
+    completion_token_ids: tuple[int, ...]
+    attention_traces: tuple[SideKVAttentionTrace, ...]
+    first_step_logits_kl: float
+    first_step_top1_changed: bool
+
+
 class GreedyE1Runtime:
     """Deterministic batch-one generation used by every E1 condition."""
 
@@ -265,6 +275,49 @@ class GreedyE1Runtime:
             if eos is not None and next_token == eos:
                 break
         return tuple(ids[prompt_length:])
+
+    @torch.inference_mode()
+    def generate_prompt_split_vanilla(
+        self, prompt_token_ids: Sequence[int]
+    ) -> tuple[int, ...]:
+        """Generate natively while splitting prefill before the last prompt token.
+
+        E1-C uses this as a cache-segmentation parity control for prompt-end
+        side-KV.  It must match :meth:`generate_vanilla` token for token.
+        """
+
+        prompt = list(prompt_token_ids)
+        if len(prompt) < 2:
+            raise ValueError("Split prefill requires at least two prompt tokens")
+        before_last = self._tensor(prompt[:-1])
+        prefill = self.model(
+            input_ids=before_last,
+            attention_mask=torch.ones_like(before_last),
+            use_cache=True,
+            return_dict=True,
+        )
+        past = prefill.past_key_values
+        current = self._tensor([prompt[-1]])
+        completion: list[int] = []
+        eos = self.tokenizer.eos_token_id
+        while len(completion) < self.max_new_tokens:
+            live_length = len(prompt) + len(completion)
+            output = self.model(
+                input_ids=current,
+                attention_mask=torch.ones(
+                    (1, live_length), dtype=torch.long, device=self.device
+                ),
+                past_key_values=past,
+                use_cache=True,
+                return_dict=True,
+            )
+            next_token = int(output.logits[:, -1, :].argmax(dim=-1).item())
+            completion.append(next_token)
+            past = output.past_key_values
+            if eos is not None and next_token == eos:
+                break
+            current = self._tensor([next_token])
+        return tuple(completion)
 
     @torch.inference_mode()
     def generate_observation_only(
@@ -408,6 +461,99 @@ class GreedyE1Runtime:
         return MemoryContinuationResult(
             completion_token_ids=tuple(ids[prompt_token_count:]),
             attention_trace=controller.traces[0],
+            first_step_logits_kl=logits_kl(baseline_logits, treatment_logits),
+            first_step_top1_changed=bool(
+                baseline_logits.argmax(dim=-1).item()
+                != treatment_logits.argmax(dim=-1).item()
+            ),
+        )
+
+    @torch.inference_mode()
+    def generate_prompt_with_persistent_memory(
+        self,
+        *,
+        prompt_token_ids: Sequence[int],
+        memory: SideKVMemory,
+        controller: SideKVAttentionController,
+    ) -> PersistentMemoryGenerationResult:
+        """Keep side-KV active from the final prompt token through decoding.
+
+        ``prompt[:-1]`` is prefetched without memory.  The final prompt token is
+        evaluated twice from cloned native caches: once for the no-memory
+        first-step diagnostic and once with treatment.  Only the treatment
+        cache is continued, while memory K/V remain outside the HF cache.
+        """
+
+        prompt = list(prompt_token_ids)
+        if len(prompt) < 2:
+            raise ValueError("Persistent side-KV requires at least two prompt tokens")
+        before_last = self._tensor(prompt[:-1])
+        last_prompt_token = self._tensor([prompt[-1]])
+        prefill = self.model(
+            input_ids=before_last,
+            attention_mask=torch.ones_like(before_last),
+            use_cache=True,
+            return_dict=True,
+        )
+        prompt_mask = torch.ones(
+            (1, len(prompt)), dtype=torch.long, device=self.device
+        )
+        baseline = self.model(
+            input_ids=last_prompt_token,
+            attention_mask=prompt_mask,
+            past_key_values=clone_cache(prefill.past_key_values),
+            use_cache=True,
+            return_dict=True,
+        )
+
+        controller.clear_traces()
+        completion: list[int] = []
+        eos = self.tokenizer.eos_token_id
+        with controller.use_memory(memory):
+            treatment = self.model(
+                input_ids=last_prompt_token,
+                attention_mask=prompt_mask,
+                past_key_values=clone_cache(prefill.past_key_values),
+                use_cache=True,
+                return_dict=True,
+            )
+            treatment_logits = treatment.logits[:, -1, :]
+            next_token = int(treatment_logits.argmax(dim=-1).item())
+            completion.append(next_token)
+            past = treatment.past_key_values
+            while len(completion) < self.max_new_tokens:
+                if eos is not None and completion[-1] == eos:
+                    break
+                live_ids = prompt + completion
+                output = self.model(
+                    input_ids=self._tensor([completion[-1]]),
+                    attention_mask=torch.ones(
+                        (1, len(live_ids)), dtype=torch.long, device=self.device
+                    ),
+                    past_key_values=past,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                next_token = int(output.logits[:, -1, :].argmax(dim=-1).item())
+                completion.append(next_token)
+                past = output.past_key_values
+
+        traces = controller.traces
+        if len(traces) != len(completion):
+            raise RuntimeError(
+                "Persistent side-KV requires one layer trace per generated token"
+            )
+        expected_native_lengths = tuple(
+            len(prompt) + index for index in range(len(completion))
+        )
+        if tuple(trace.native_key_length for trace in traces) != expected_native_lengths:
+            raise RuntimeError("Persistent side-KV native cache length drifted")
+        if any(trace.memory_id != memory.memory_id for trace in traces):
+            raise RuntimeError("Persistent side-KV memory ID changed during generation")
+        baseline_logits = baseline.logits[:, -1, :]
+        return PersistentMemoryGenerationResult(
+            completion_token_ids=tuple(completion),
+            attention_traces=traces,
             first_step_logits_kl=logits_kl(baseline_logits, treatment_logits),
             first_step_top1_changed=bool(
                 baseline_logits.argmax(dim=-1).item()

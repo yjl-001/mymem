@@ -162,6 +162,54 @@ if torch is not None:
 
 @unittest.skipIf(torch is None, "Torch is required for side-KV tensor tests")
 class SideKVControllerTests(unittest.TestCase):
+    def test_log_slot_normalization_reduces_memory_count_prior(self) -> None:
+        from memgen.model.side_kv import SideKVAttentionController, SideKVMemory
+
+        torch.manual_seed(9)
+        model = FakeModel().eval()
+        attention = model.model.layers[0].self_attn
+        memory = SideKVMemory(
+            memory_id="memory-fixture",
+            payload_hash="payload",
+            keys=torch.randn(2, 3, 2),
+            values=torch.randn(2, 3, 2),
+            slot_mask=torch.tensor([True, True, True]),
+            layer_number=1,
+        )
+        hidden = torch.randn(1, 1, 8)
+        position_embeddings = (torch.ones(1, 1, 2), torch.zeros(1, 1, 2))
+
+        plain = SideKVAttentionController(model=model, layer_number=1)
+        try:
+            with plain.use_memory(memory):
+                attention(
+                    hidden_states=hidden,
+                    position_embeddings=position_embeddings,
+                    attention_mask=torch.zeros(1, 1, 1, 1),
+                )
+            plain_mass = plain.traces[0].memory_attention_mass
+            self.assertEqual(plain.traces[0].memory_score_normalization, "none")
+        finally:
+            plain.close()
+
+        normalized = SideKVAttentionController(
+            model=model,
+            layer_number=1,
+            memory_score_normalization="log_valid_slots",
+        )
+        try:
+            with normalized.use_memory(memory):
+                attention(
+                    hidden_states=hidden,
+                    position_embeddings=position_embeddings,
+                    attention_mask=torch.zeros(1, 1, 1, 1),
+                )
+            trace = normalized.traces[0]
+            self.assertEqual(trace.memory_score_normalization, "log_valid_slots")
+            self.assertLess(trace.memory_attention_mass, plain_mass)
+        finally:
+            normalized.close()
+
     def test_memory_uses_a_side_path_without_extending_the_native_cache(self) -> None:
         from memgen.model.side_kv import SideKVAttentionController, SideKVMemory
 

@@ -18,8 +18,8 @@
 ```text
 MemGen：在线控制框架
 FlashMem：何时值得考虑干预
-SEAL：第一版如何以最低复杂度注入
-MI：当 vector 过于全局时，如何升级为 query-dependent side-KV memory
+SEAL：已完成并关闭的 residual-vector 假设
+MI：当前用于验证经验内容传输的 query-dependent side-KV memory
 ```
 
 ## 2. MemGen：在线生成式 latent token
@@ -201,20 +201,35 @@ target 相比 reference 的 query-key alignment，逐层保留 top-k unit，再�
 离线构造文本中曾处的绝对位置。若直接把已旋转 key 当可复用 bank 保存，换一个长度或位置
 的上下文可能使 attention score 不稳定。
 
-## 6. 从 SEAL MVP 升级到 MI 的决策
+### 5.4 本仓库当前 side-KV 契约
 
-两种接口可共享同一份带 provenance 的 experience record、split、entropy gate、检索结果和
-评测 trace；差异仅在 latent artifact 与 integrator：
+E0 已将每条审核 payload 编译为 layer-24 canonical pre-RoPE K/V，并验证 GQA head 映射、共享
+RoPE phase、native cache prefix/length 与非零 attention mass。memory slot 是一个 payload token
+在 layer 24 的一组 K/V 向量；memory slot 永远不作为真实 token 写入 HuggingFace cache。
 
-| 条件 | 继续使用 SEAL-style vector | 升级尝试 MI side-KV |
+E1-v1 只在 completion trigger token 上让 memory 可见一次。该机制能改变后续 completion，但
+matched 与 shuffled 的任务结果及首步 KL 几乎相同，因此后续 E1-C 改为 prompt-end persistent
+side path：从最后一个 prompt token 到 EOS，每一步 query 都 joint-attend native KV 和同一份静态
+memory KV。为抵消多 slot bank 自然获得更大总 softmax 质量，固定使用
+`memory_scores -= log(valid_slot_count)`；该归一化不是可调 alpha。
+
+## 6. 当前决策：关闭 residual vector，分阶段验证 MI-style side-KV
+
+全局 `recovery - persistence` residual vector 已在独立确认中无效；同题 raw-state local action 的
+检索 margin 也不足。该结论关闭了继续搜索 alpha、layer、符号和样本量的路线，不构成阻止文本经验
+或 side-KV 的理由，因为 vector 与结构化 payload 的容量、路由和交互机制不同。
+
+当前依次回答四个可归因问题：
+
+| 阶段 | 通道 | 要隔离的问题 |
 |---|---|---|
-| Phase 2 vector + entropy gate 不优于随机对照 | 先修 evidence、layer、强度或 gate，不进入 MI | 不适用 |
-| 全局 vector 有收益且稳定 | 先完成簇级 vector/retrieval | 可作为后续效率/条件性对照 |
-| 经验相关但经常过干预或错配 | 仅靠降低 alpha 会损失有效触发 | 首要升级信号：让 query 自适应读 bank |
-| 需要表达长规则、事实或多个相互竞争的经验 | vector 容量不足 | MI 更合适 |
+| E1-A | 固定多经验文本目录 | Phase 1 经验集合是否有可利用信息？ |
+| E1-B | completion-aware BM25 + 单条文本 | 检索器是否选出比 shuffled 更有用的经验？ |
+| E1-C | 复用 E1-B IDs 的 persistent side-KV | latent K/V 通道是否保留文本经验的作用？ |
+| E1-D | entropy+risk gate | 在内容、检索和通道成立后，何时开始可见更好？ |
 
-因此，SEAL 是本项目验证“经验方向是否存在”的最小接口；MI 是验证“同一经验是否应以
-query-dependent attention 而非全局平移来承载”的下一阶段接口。
+因此，FlashMem 风格 gate 暂时从 A/B/C 移除，避免把失败归因混在一起；只有前三阶段通过后才恢复。
+具体冻结协议见 [E1 分阶段设计](e1_experience_memory_design.md)。
 
 ## 7. 术语防混淆
 

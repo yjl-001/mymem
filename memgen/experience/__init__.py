@@ -59,6 +59,21 @@ from memgen.experience.e1 import (
     MemoryChoice,
     paired_binary_effect,
 )
+from memgen.experience.e1_staged import (
+    E1A_CATALOG_MANIFEST_SCHEMA,
+    E1A_CATALOG_TOKEN_BUDGET,
+    E1A_RANDOM_SEEDS,
+    E1B_MANIFEST_SCHEMA,
+    E1C_MEMORY_SCORE_NORMALIZATION,
+    CompletionAwareRetrievalQueryBuilder,
+    ConstrainedKMedoidsCatalogBuilder,
+    E1BRetrievalAssignment,
+    E1BRetrievalDeranger,
+    ExperienceCatalog,
+    build_memory_augmented_messages,
+    render_experience_catalog,
+    render_single_experience,
+)
 
 __all__ = [
     "TEACHER_BANK_REQUIRED_FIELDS",
@@ -110,4 +125,17 @@ __all__ = [
     "MatchedMemoryDeranger",
     "MemoryChoice",
     "paired_binary_effect",
+    "E1A_CATALOG_MANIFEST_SCHEMA",
+    "E1A_CATALOG_TOKEN_BUDGET",
+    "E1A_RANDOM_SEEDS",
+    "E1B_MANIFEST_SCHEMA",
+    "E1C_MEMORY_SCORE_NORMALIZATION",
+    "CompletionAwareRetrievalQueryBuilder",
+    "ConstrainedKMedoidsCatalogBuilder",
+    "E1BRetrievalAssignment",
+    "E1BRetrievalDeranger",
+    "ExperienceCatalog",
+    "build_memory_augmented_messages",
+    "render_experience_catalog",
+    "render_single_experience",
 ]
