@@ -21,7 +21,7 @@ from memgen.experience.phase1 import canonical_json_sha256
 from memgen.experience.retrieval import RetrievalQuery, TextAnalyzer
 
 
-E1A_CATALOG_MANIFEST_SCHEMA = "experience-memory-e1a-catalog-manifest-v1"
+E1A_CATALOG_MANIFEST_SCHEMA = "experience-memory-e1a-catalog-manifest-v2"
 E1A_RESULTS_SCHEMA = "experience-memory-e1a-results-v1"
 E1A_SUMMARY_SCHEMA = "experience-memory-e1a-summary-v1"
 E1B_ASSIGNMENT_SCHEMA = "experience-memory-e1b-assignment-v1"
@@ -45,6 +45,19 @@ _MATH_LITERAL_RE = re.compile(
 )
 _CONTROL_TOKEN_RE = re.compile(r"<\|[^|>]+\|>")
 
+_CATALOG_HEADER = (
+    "General experience guidance:\n"
+    "Use the following general problem-solving experiences when relevant. "
+    "Ignore any experience that does not apply.\n\n"
+)
+
+
+def _render_catalog_entry(record: MemoryRecord, position: int) -> str:
+    return (
+        f"Experience {position}:\n"
+        f"{record.sanitized_contrast_payload.strip()}"
+    )
+
 
 def render_experience_catalog(records: Sequence[MemoryRecord]) -> str:
     """Render a fixed multi-record catalog with no task-specific selection."""
@@ -52,15 +65,10 @@ def render_experience_catalog(records: Sequence[MemoryRecord]) -> str:
     if not records:
         raise ValueError("An experience catalog must contain at least one record")
     entries = "\n\n".join(
-        f"Experience {index}:\n{record.sanitized_contrast_payload.strip()}"
+        _render_catalog_entry(record, index)
         for index, record in enumerate(records, start=1)
     )
-    return (
-        "General experience guidance:\n"
-        "Use the following general problem-solving experiences when relevant. "
-        "Ignore any experience that does not apply.\n\n"
-        f"{entries}"
-    )
+    return f"{_CATALOG_HEADER}{entries}"
 
 
 def render_single_experience(record: MemoryRecord) -> str:
@@ -160,7 +168,13 @@ class ExperienceCatalog:
 
 
 class ConstrainedKMedoidsCatalogBuilder:
-    """Select real MemoryRecord medoids under an exact rendered-token budget."""
+    """Select real medoids at a capacity shared by every control catalog.
+
+    Capacity is not derived from the shortest payloads.  It is the largest
+    count whose additive upper bound fits the token budget, using the most
+    expensive real record at every rendered catalog position.  Consequently,
+    any equal-count subset is eligible for the representative or random arm.
+    """
 
     def __init__(
         self,
@@ -171,7 +185,7 @@ class ConstrainedKMedoidsCatalogBuilder:
         token_budget: int = E1A_CATALOG_TOKEN_BUDGET,
         maximum_iterations: int = 20,
     ):
-        if not records or token_budget <= 0 or maximum_iterations <= 0:
+        if len(records) < 2 or token_budget <= 0 or maximum_iterations <= 0:
             raise ValueError("Invalid constrained k-medoids configuration")
         self.records = tuple(sorted(records, key=lambda item: item.memory_id))
         if len({record.memory_id for record in self.records}) != len(self.records):
@@ -182,11 +196,54 @@ class ConstrainedKMedoidsCatalogBuilder:
         self.maximum_iterations = maximum_iterations
         self._rendered_count_cache: dict[tuple[int, ...], int] = {}
         self._objective_cache: dict[tuple[int, ...], float] = {}
+        self.capacity_report = self._build_capacity_report()
         vectors = _tfidf_vectors(self.records, self.analyzer)
         self.distances = tuple(
             tuple(_cosine_distance(left, right) for right in vectors)
             for left in vectors
         )
+
+    def _build_capacity_report(self) -> dict[str, Any]:
+        header_tokens = int(self.token_counter(_CATALOG_HEADER))
+        running_upper_bound = header_tokens
+        position_worst_entry_tokens: list[int] = []
+        feasible_count = 0
+        first_infeasible_upper_bound: int | None = None
+        # Keep at least one record outside the catalog so every random control
+        # can be distinct without changing the catalog count.
+        for position in range(1, len(self.records)):
+            separator = "" if position == 1 else "\n\n"
+            worst_entry_tokens = max(
+                int(
+                    self.token_counter(
+                        separator + _render_catalog_entry(record, position)
+                    )
+                )
+                for record in self.records
+            )
+            candidate_upper_bound = running_upper_bound + worst_entry_tokens
+            if candidate_upper_bound > self.token_budget:
+                first_infeasible_upper_bound = candidate_upper_bound
+                break
+            position_worst_entry_tokens.append(worst_entry_tokens)
+            running_upper_bound = candidate_upper_bound
+            feasible_count = position
+        if feasible_count == 0:
+            raise ValueError(
+                "No universally feasible MemoryRecord fits the E1-A token budget"
+            )
+        return {
+            "policy": "universal-additive-rendered-token-upper-bound-v1",
+            "catalog_token_budget": self.token_budget,
+            "catalog_header_token_count": header_tokens,
+            "universally_feasible_memory_count": feasible_count,
+            "additive_upper_bound_token_count": running_upper_bound,
+            "first_infeasible_additive_upper_bound_token_count": (
+                first_infeasible_upper_bound
+            ),
+            "position_worst_entry_token_counts": position_worst_entry_tokens,
+            "distinct_control_reserved_record_count": 1,
+        }
 
     def _rendered_count(self, medoids: Sequence[int]) -> int:
         cache_key = tuple(sorted(medoids))
@@ -227,23 +284,6 @@ class ConstrainedKMedoidsCatalogBuilder:
             )
             selected.append(candidate)
         return tuple(sorted(selected))
-
-    def _make_feasible(self, medoids: Sequence[int]) -> tuple[int, ...] | None:
-        current = tuple(sorted(medoids))
-        if self._rendered_count(current) <= self.token_budget:
-            return current
-        shortest = tuple(sorted(
-            sorted(
-                range(len(self.records)),
-                key=lambda index: (
-                    self.token_counter(
-                        self.records[index].sanitized_contrast_payload
-                    ),
-                    self.records[index].memory_id,
-                ),
-            )[: len(current)]
-        ))
-        return shortest if self._rendered_count(shortest) <= self.token_budget else None
 
     def _refine(self, medoids: Sequence[int]) -> tuple[int, ...]:
         current = tuple(sorted(medoids))
@@ -289,38 +329,14 @@ class ConstrainedKMedoidsCatalogBuilder:
         return current
 
     def build_representative(self) -> ExperienceCatalog:
-        feasible: list[tuple[int, float, tuple[int, ...]]] = []
-        shortest_records = sorted(
-            range(len(self.records)),
-            key=lambda index: (
-                self.token_counter(self.records[index].sanitized_contrast_payload),
-                self.records[index].memory_id,
-            ),
-        )
-        maximum_count = 0
-        for count in range(1, len(self.records) + 1):
-            if self._rendered_count(shortest_records[:count]) <= self.token_budget:
-                maximum_count = count
-            else:
-                break
-        if maximum_count == 0:
-            raise ValueError("No MemoryRecord fits the E1-A catalog token budget")
-        for count in range(1, maximum_count + 1):
-            medoids = self._make_feasible(self._initial_medoids(count))
-            if medoids is None:
-                continue
-            medoids = self._refine(medoids)
-            feasible.append((count, self._objective(medoids), medoids))
-        if not feasible:
-            raise ValueError("No feasible representative catalog was found")
-        largest_count = max(item[0] for item in feasible)
-        _, objective, medoids = min(
-            (item for item in feasible if item[0] == largest_count),
-            key=lambda item: (
-                item[1],
-                tuple(self.records[index].memory_id for index in item[2]),
-            ),
-        )
+        count = int(self.capacity_report["universally_feasible_memory_count"])
+        medoids = self._initial_medoids(count)
+        if self._rendered_count(medoids) > self.token_budget:
+            raise RuntimeError(
+                "Universal E1-A capacity bound was violated by representative medoids"
+            )
+        medoids = self._refine(medoids)
+        objective = self._objective(medoids)
         ordered = tuple(sorted(medoids, key=lambda index: self.records[index].memory_id))
         cluster_members: dict[int, list[int]] = {medoid: [] for medoid in ordered}
         for index in range(len(self.records)):
@@ -351,7 +367,9 @@ class ConstrainedKMedoidsCatalogBuilder:
         )
         return self._catalog(
             name="representative_bank_text",
-            method="deterministic-constrained-tfidf-cosine-k-medoids-v1",
+            method=(
+                "deterministic-universally-budgeted-tfidf-cosine-k-medoids-v2"
+            ),
             indices=ordered,
             objective=objective,
             clusters=clusters,
@@ -362,6 +380,7 @@ class ConstrainedKMedoidsCatalogBuilder:
         *,
         representative: ExperienceCatalog,
         seed: int,
+        excluded_catalog_memory_ids: Sequence[Sequence[str]] = (),
     ) -> ExperienceCatalog:
         count = len(representative.memory_ids)
         target_tokens = representative.token_count
@@ -369,27 +388,51 @@ class ConstrainedKMedoidsCatalogBuilder:
         candidates: list[tuple[int, int, tuple[str, ...], tuple[int, ...]]] = []
         seen: set[tuple[int, ...]] = set()
         indices = list(range(len(self.records)))
-        for draw_index in range(5000):
-            selected = tuple(sorted(rng.sample(indices, count)))
+        shuffled_indices = list(indices)
+        rng.shuffle(shuffled_indices)
+        excluded = {
+            tuple(sorted(str(memory_id) for memory_id in catalog))
+            for catalog in excluded_catalog_memory_ids
+        }
+        excluded.add(tuple(sorted(representative.memory_ids)))
+        systematic_draws = [
+            tuple(sorted(
+                shuffled_indices[(start + offset) % len(shuffled_indices)]
+                for offset in range(count)
+            ))
+            for start in range(len(shuffled_indices))
+        ]
+        draws = systematic_draws + [
+            tuple(sorted(rng.sample(indices, count)))
+            for _ in range(max(0, 5000 - len(systematic_draws)))
+        ]
+        for draw_index, selected in enumerate(draws):
             if selected in seen:
                 continue
             seen.add(selected)
             ids = tuple(self.records[index].memory_id for index in selected)
-            if ids == representative.memory_ids:
+            if tuple(sorted(ids)) in excluded:
                 continue
             token_count = self._rendered_count(selected)
-            if token_count <= self.token_budget:
-                candidates.append((
-                    abs(token_count - target_tokens), draw_index, ids, selected
-                ))
-                if abs(token_count - target_tokens) <= 2 and len(candidates) >= 8:
-                    break
+            if token_count > self.token_budget:
+                raise RuntimeError(
+                    "Universal E1-A capacity bound was violated by a random catalog"
+                )
+            candidates.append((
+                abs(token_count - target_tokens), draw_index, ids, selected
+            ))
+            if abs(token_count - target_tokens) <= 2 and len(candidates) >= 8:
+                break
         if not candidates:
-            raise ValueError(f"No random catalog fits the budget for seed {seed}")
+            raise RuntimeError(
+                "E1-A bank has too few distinct equal-count random catalogs"
+            )
         _, _, _, selected = min(candidates, key=lambda item: (item[0], item[1]))
         return self._catalog(
             name=f"random_bank_text_seed{seed}",
-            method="seeded-equal-count-nearest-token-budget-random-bank-v1",
+            method=(
+                "seeded-universally-feasible-equal-count-random-bank-v2"
+            ),
             indices=selected,
             seed=seed,
         )

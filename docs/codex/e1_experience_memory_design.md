@@ -38,11 +38,14 @@ constrained k-medoids：
 1. medoid 必须是 bank 中真实 MemoryRecord，不生成新的总结；
 2. 目录使用完整 `When facing / Prefer / Avoid` payload；
 3. 目录总预算固定为 2048 tokenizer tokens，预算包含目录包装文本；
-4. 在预算内选择最大的可行 `k`，相同目标值按 `memory_id` 稳定打破平局；
-5. 输出每个 medoid 的 cluster size、平均/最大半径和被覆盖记录 ID。
+4. `k` 不是按最短 payload 能塞入的最大数量确定，而是按每个目录位置最昂贵真实 entry 的
+   additive token upper bound，选择“任意 `k` 条经验都不超过预算”的最大共同可行数量；
+5. 代表目录和全部随机目录共享这个 `k`，相同聚类目标值按 `memory_id` 稳定打破平局；
+6. 输出容量 upper bound、每个 medoid 的 cluster size、平均/最大半径和被覆盖记录 ID。
 
 随机对照使用种子 `17/42/73`，每个对照与代表目录条数相同、总 token 数不超过 2048，并最小化与
-代表目录的总 token 数差；随机集合不得与代表目录完全相同。随机目录同样只含真实 payload。
+代表目录的总 token 数差；随机集合不得与代表目录完全相同。共同可行容量保证随机目录天然满足
+预算，不允许通过减少条数或更换 seed 补救。随机目录同样只含真实 payload。
 
 ### 3.3 条件与判据
 

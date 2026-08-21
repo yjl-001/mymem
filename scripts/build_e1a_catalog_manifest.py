@@ -76,10 +76,16 @@ def main() -> None:
         token_budget=E1A_CATALOG_TOKEN_BUDGET,
     )
     representative = builder.build_representative()
-    random_catalogs = tuple(
-        builder.build_random_control(representative=representative, seed=seed)
-        for seed in E1A_RANDOM_SEEDS
-    )
+    random_catalogs_list = []
+    for seed in E1A_RANDOM_SEEDS:
+        random_catalogs_list.append(builder.build_random_control(
+            representative=representative,
+            seed=seed,
+            excluded_catalog_memory_ids=[
+                catalog.memory_ids for catalog in random_catalogs_list
+            ],
+        ))
+    random_catalogs = tuple(random_catalogs_list)
     catalogs = (representative,) + random_catalogs
     if any(len(item.memory_ids) != len(representative.memory_ids) for item in catalogs):
         raise RuntimeError("E1-A catalogs do not have equal record counts")
@@ -96,6 +102,7 @@ def main() -> None:
             "random_seeds": list(E1A_RANDOM_SEEDS),
             "representative_method": representative.method,
             "memory_record_count": len(records),
+            "capacity": builder.capacity_report,
         },
         "reasoner": {
             "model_name": reasoner["model_name"],

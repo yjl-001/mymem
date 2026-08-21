@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 from types import SimpleNamespace
 import unittest
 
@@ -10,6 +11,7 @@ from memgen.experience.e1_staged import (
     ConstrainedKMedoidsCatalogBuilder,
     E1BRetrievalAssignment,
     E1BRetrievalDeranger,
+    render_experience_catalog,
 )
 from memgen.experience.phase1 import canonical_json_sha256
 from scripts.evaluate_e1c_side_kv_channel import compact_trace_artifact
@@ -89,6 +91,48 @@ class RepresentativeCatalogTests(unittest.TestCase):
         self.assertEqual(
             sum(int(cluster["size"]) for cluster in representative.clusters),
             len(records),
+        )
+
+    def test_shared_capacity_makes_every_equal_count_catalog_feasible(self) -> None:
+        records = tuple(
+            FakeMemoryRecord(
+                memory_id=f"mem-{index:02d}",
+                payload_hash=f"hash-{index:02d}",
+                sanitized_retrieval_key=f"strategy cluster {index}",
+                sanitized_contrast_payload=(
+                    "When facing: relation\nPrefer: verify\nAvoid: assume "
+                    + " ".join(["detail"] * (index * 4))
+                ),
+            )
+            for index in range(8)
+        )
+        token_counter = lambda text: len(text.split())
+        builder = ConstrainedKMedoidsCatalogBuilder(
+            records=records,  # type: ignore[arg-type]
+            token_counter=token_counter,
+            token_budget=80,
+        )
+        count = builder.capacity_report["universally_feasible_memory_count"]
+        self.assertGreater(count, 0)
+        for selected in combinations(records, count):
+            self.assertLessEqual(
+                token_counter(render_experience_catalog(selected)), 80
+            )
+        representative = builder.build_representative()
+        controls_list = []
+        for seed in (17, 42, 73):
+            controls_list.append(builder.build_random_control(
+                representative=representative,
+                seed=seed,
+                excluded_catalog_memory_ids=[
+                    catalog.memory_ids for catalog in controls_list
+                ],
+            ))
+        controls = tuple(controls_list)
+        self.assertTrue(all(len(item.memory_ids) == count for item in controls))
+        self.assertEqual(
+            len({representative.memory_ids, *(item.memory_ids for item in controls)}),
+            4,
         )
 
 
