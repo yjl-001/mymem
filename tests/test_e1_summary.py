@@ -36,6 +36,8 @@ class E1SummaryTests(unittest.TestCase):
                 "status": "frozen",
                 "answer_or_reward_used": False,
                 "logical_split": "dev-test",
+                "dataset_split": "train",
+                "evaluation_role": "development_diagnostic",
                 "reasoner": {"layer": 24},
                 "configuration": {"system_profile": profile.to_dict()},
                 "summary": {"sample_count": len(assignments)},
@@ -117,6 +119,8 @@ class E1SummaryTests(unittest.TestCase):
                         "schema_version": E1_RESULTS_SCHEMA,
                         "sample_id": item.sample_id,
                         "logical_split": item.logical_split,
+                        "dataset_split": item.dataset_split,
+                        "evaluation_role": "development_diagnostic",
                         "question_sha256": item.question_sha256,
                         "assignment_manifest_sha256": manifest["manifest_sha256"],
                         "assigned": True,
@@ -131,8 +135,11 @@ class E1SummaryTests(unittest.TestCase):
                     handle.write(json.dumps(record) + "\n")
 
             run_report = {
-                "schema_version": "experience-memory-e1-run-report-v3",
+                "schema_version": "experience-memory-e1-run-report-v4",
                 "status": "completed",
+                "logical_split": "dev-test",
+                "dataset_split": "train",
+                "evaluation_role": "development_diagnostic",
                 "system_profile": profile.to_dict(),
                 "results": {"sha256": file_sha256(results_path)},
                 "inputs": {

@@ -22,6 +22,7 @@ from memgen.experience.e1 import (
     E1_RESULTS_SCHEMA,
     E1_SUMMARY_SCHEMA,
     E1Assignment,
+    E1EvaluationScope,
     paired_binary_effect,
 )
 from memgen.experience.phase1 import (
@@ -164,6 +165,14 @@ def main() -> None:
     profile = ExperienceMemorySystemProfile.from_dict(
         manifest.get("configuration", {}).get("system_profile", {})
     )
+    scope = E1EvaluationScope.from_logical_split(
+        str(manifest.get("logical_split"))
+    )
+    if (
+        manifest.get("dataset_split") != scope.dataset_split
+        or manifest.get("evaluation_role") != scope.evaluation_role
+    ):
+        raise ValueError("E1 manifest evaluation scope is inconsistent")
     assignments = {
         item.sample_id: item
         for item in (
@@ -180,8 +189,11 @@ def main() -> None:
 
     run_report = json.loads(args.run_report.read_text(encoding="utf-8"))
     if (
-        run_report.get("schema_version") != "experience-memory-e1-run-report-v3"
+        run_report.get("schema_version") != "experience-memory-e1-run-report-v4"
         or run_report.get("status") != "completed"
+        or run_report.get("logical_split") != manifest.get("logical_split")
+        or run_report.get("dataset_split") != manifest.get("dataset_split")
+        or run_report.get("evaluation_role") != manifest.get("evaluation_role")
         or run_report.get("system_profile") != profile.to_dict()
         or run_report.get("results", {}).get("sha256") != file_sha256(args.results)
         or run_report.get("inputs", {}).get("assignment_manifest_sha256")
@@ -197,6 +209,8 @@ def main() -> None:
             record.get("assignment_manifest_sha256") != logical_manifest_hash
             or record.get("question_sha256") != assignment.question_sha256
             or record.get("logical_split") != assignment.logical_split
+            or record.get("dataset_split") != assignment.dataset_split
+            or record.get("evaluation_role") != manifest.get("evaluation_role")
             or record.get("system_profile") != profile.to_dict()
             or record.get("assigned") is not assignment.assigned
             or record.get("triggered") is not assignment.triggered
@@ -422,6 +436,8 @@ def main() -> None:
         },
         "system_profile": profile.to_dict(),
         "logical_split": manifest["logical_split"],
+        "dataset_split": manifest["dataset_split"],
+        "evaluation_role": manifest["evaluation_role"],
         "sample_count": len(ordered),
         "triggered_count": sum(bool(record.get("triggered")) for record in ordered),
         "assigned_count": sum(bool(record.get("assigned")) for record in ordered),

@@ -49,5 +49,16 @@ bash scripts/experiments/gsm8k/run_e1d_full_system.sh \
   "$PHASE1_DIR" "$E0_DIR" "$RISK_ARTIFACT"
 ```
 
+明确决定执行官方 GSM8K test 的全量冻结评测时：
+
+```bash
+bash scripts/experiments/gsm8k/run_e1d_full_system.sh \
+  --logical-split final-test \
+  --limit 0 \
+  "$PHASE1_DIR" "$E0_DIR" "$RISK_ARTIFACT"
+```
+
+`--limit 0` 表示运行整个 logical split；final-test artifact 会显式标记为 `final_evaluation`。
+
 E1 只包含 `vanilla`、`gate_observation_only` 和 `matched_persistent_memory`。完整结论、系统契约与解释
 限制见 [`experience_calibrated_steering_plan.md`](../../docs/codex/experience_calibrated_steering_plan.md)。

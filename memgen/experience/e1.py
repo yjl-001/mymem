@@ -15,15 +15,41 @@ from typing import Any, Mapping, Sequence
 from memgen.experience.phase1 import canonical_json_sha256
 
 
-E1_ASSIGNMENT_SCHEMA = "experience-memory-e1-assignment-v3"
-E1_MANIFEST_SCHEMA = "experience-memory-e1-assignment-manifest-v3"
-E1_RESULTS_SCHEMA = "experience-memory-e1-results-v3"
-E1_SUMMARY_SCHEMA = "experience-memory-e1-summary-v3"
+E1_ASSIGNMENT_SCHEMA = "experience-memory-e1-assignment-v4"
+E1_MANIFEST_SCHEMA = "experience-memory-e1-assignment-manifest-v4"
+E1_RESULTS_SCHEMA = "experience-memory-e1-results-v4"
+E1_SUMMARY_SCHEMA = "experience-memory-e1-summary-v4"
 E1_CONDITIONS = (
     "vanilla",
     "gate_observation_only",
     "matched_persistent_memory",
 )
+
+
+@dataclass(frozen=True)
+class E1EvaluationScope:
+    """Canonical dataset source and role for one logical evaluation split."""
+
+    logical_split: str
+    dataset_split: str
+    evaluation_role: str
+
+    @classmethod
+    def from_logical_split(cls, logical_split: str) -> "E1EvaluationScope":
+        values = {
+            "calibration-val": ("train", "development_diagnostic"),
+            "dev-test": ("train", "development_diagnostic"),
+            "final-test": ("test", "final_evaluation"),
+        }
+        try:
+            dataset_split, evaluation_role = values[logical_split]
+        except KeyError as error:
+            raise ValueError("Unsupported E1 logical split") from error
+        return cls(
+            logical_split=logical_split,
+            dataset_split=dataset_split,
+            evaluation_role=evaluation_role,
+        )
 
 
 @dataclass(frozen=True)
@@ -121,10 +147,11 @@ class E1Assignment:
             raise ValueError("Unexpected E1 assignment schema")
         if not self.sample_id or not self.question_sha256:
             raise ValueError("E1 assignment requires sample and question IDs")
-        if self.logical_split not in {"calibration-val", "dev-test"}:
-            raise ValueError("E1 development assignments cannot use final-test")
-        if self.dataset_split != "train" or self.source_index < 0:
-            raise ValueError("E1 development assignments require a train source index")
+        scope = E1EvaluationScope.from_logical_split(self.logical_split)
+        if self.dataset_split != scope.dataset_split or self.source_index < 0:
+            raise ValueError(
+                "E1 logical split and dataset split are inconsistent"
+            )
         if self.prompt_token_count <= 0:
             raise ValueError("prompt_token_count must be positive")
         if self.answer_or_reward_used:

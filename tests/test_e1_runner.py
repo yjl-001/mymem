@@ -13,7 +13,9 @@ RUNNER = PROJECT_ROOT / "scripts/experiments/gsm8k/run_e1d_full_system.sh"
 
 
 class E1RunnerConfigurationTests(unittest.TestCase):
-    def test_print_config_derives_frozen_artifact_metadata(self) -> None:
+    def run_print_config(
+        self, *, logical_split: str, limit: str
+    ) -> dict[str, str]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             phase1 = root / "phase1"
@@ -59,8 +61,10 @@ class E1RunnerConfigurationTests(unittest.TestCase):
                     "bash",
                     str(RUNNER),
                     "--print-config",
+                    "--logical-split",
+                    logical_split,
                     "--limit",
-                    "8",
+                    limit,
                     str(phase1),
                     str(e0),
                     str(risk),
@@ -72,21 +76,33 @@ class E1RunnerConfigurationTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            parsed = dict(
+            return dict(
                 line.split("=", 1)
                 for line in result.stdout.splitlines()
                 if "=" in line
             )
-            self.assertEqual(parsed["model_revision"], "model-revision")
-            self.assertEqual(parsed["tokenizer_revision"], "tokenizer-revision")
-            self.assertEqual(parsed["dataset_revision"], "dataset-revision")
-            self.assertEqual(parsed["logical_split"], "calibration-val")
-            self.assertEqual(parsed["limit"], "8")
-            self.assertEqual(parsed["cuda_visible_devices"], "2")
-            self.assertEqual(
-                parsed["system_profile"],
-                "layer24-bm25-top1-gate-persistent-logslots-log10-v1",
-            )
+
+    def test_print_config_derives_frozen_artifact_metadata(self) -> None:
+        parsed = self.run_print_config(
+            logical_split="calibration-val", limit="8"
+        )
+        self.assertEqual(parsed["model_revision"], "model-revision")
+        self.assertEqual(parsed["tokenizer_revision"], "tokenizer-revision")
+        self.assertEqual(parsed["dataset_revision"], "dataset-revision")
+        self.assertEqual(parsed["logical_split"], "calibration-val")
+        self.assertEqual(parsed["limit"], "8")
+        self.assertEqual(parsed["cuda_visible_devices"], "2")
+        self.assertEqual(
+            parsed["system_profile"],
+            "layer24-bm25-top1-gate-persistent-logslots-log10-v1",
+        )
+
+    def test_print_config_allows_full_final_test(self) -> None:
+        parsed = self.run_print_config(logical_split="final-test", limit="0")
+        self.assertEqual(parsed["logical_split"], "final-test")
+        self.assertEqual(parsed["dataset_split"], "test")
+        self.assertEqual(parsed["evaluation_role"], "final_evaluation")
+        self.assertEqual(parsed["limit"], "0")
 
 
 if __name__ == "__main__":

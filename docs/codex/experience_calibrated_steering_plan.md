@@ -112,7 +112,7 @@ cp scripts/experiments/gsm8k/e1.server.env.example \
   scripts/experiments/gsm8k/.e1.server.env
 ```
 
-完整评测：
+开发诊断：
 
 ```bash
 source scripts/experiments/gsm8k/.e1.server.env
@@ -124,6 +124,22 @@ bash scripts/experiments/gsm8k/run_e1d_full_system.sh \
   --limit 100 \
   "$PHASE1_DIR" "$E0_DIR" "$RISK_ARTIFACT"
 ```
+
+经明确决策，当前冻结系统允许在官方 GSM8K `final-test` 上进行一次全量评测：
+
+```bash
+MEMGEN_RUN_TAG=e1d-final-test-full-v1 \
+bash scripts/experiments/gsm8k/run_e1d_full_system.sh \
+  --logical-split final-test \
+  --offset 0 \
+  --limit 0 \
+  "$PHASE1_DIR" "$E0_DIR" "$RISK_ARTIFACT"
+```
+
+`--limit 0` 表示选择该 split 的全部样本。assignment 阶段只读取 test question；test answer 只在冻结
+assignment 后的 evaluation 阶段用于评分。artifact 会记录 `dataset_split=test` 和
+`evaluation_role=final_evaluation`。从本次运行开始，官方 test 不再是未查看的 pristine final set；其结果
+不得用于反向调整同一版本后再宣称独立 final-test confirmation。
 
 如需重建风险 artifact，只运行风险分类编译，不执行 residual 干预：
 
@@ -158,5 +174,6 @@ python scripts/run_online_experience_memory.py \
 3. 重新设计 side-KV 内容表示，使其能够传递文本 payload 已证明存在的行为效应；
 4. 前三项得到正证据后，再优化 gate 触发位置。
 
-在此之前：不进入 final-test，不新增 Teacher/Pro 调用，不恢复 residual-vector 路线，不把完整系统的工程
-可运行性表述为任务收益。
+后续仍不新增 Teacher/Pro 调用，不恢复 residual-vector 路线，也不把完整系统的工程可运行性表述为任务
+收益。final-test 结果可以报告冻结系统的实际表现，但在没有内容错配对照的当前三条件设计中，不能单独
+归因于 BM25 匹配质量。

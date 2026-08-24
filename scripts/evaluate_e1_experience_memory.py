@@ -24,6 +24,7 @@ from memgen.experience.e1 import (
     E1_MANIFEST_SCHEMA,
     E1_RESULTS_SCHEMA,
     E1Assignment,
+    E1EvaluationScope,
 )
 from memgen.experience.phase1 import (
     canonical_json_sha256,
@@ -225,6 +226,8 @@ def main() -> None:
     assignments = tuple(
         E1Assignment.from_dict(value) for value in manifest["assignments"]
     )
+    if not assignments:
+        raise ValueError("E1 assignment manifest is empty")
     if len(assignments) != int(manifest.get("summary", {}).get("sample_count", -1)):
         raise ValueError("E1 assignment count differs from manifest summary")
     split_manifest = json.loads(args.split_manifest.read_text(encoding="utf-8"))
@@ -234,8 +237,28 @@ def main() -> None:
     split_entries = {
         str(item["sample_id"]): item for item in split_manifest["samples"]
     }
-    if any(item.sample_id not in split_entries for item in assignments):
-        raise ValueError("E1 assignments include unknown split sample IDs")
+    logical_splits = {item.logical_split for item in assignments}
+    dataset_splits = {item.dataset_split for item in assignments}
+    scope = E1EvaluationScope.from_logical_split(str(manifest.get("logical_split")))
+    if (
+        manifest.get("dataset_split") != scope.dataset_split
+        or manifest.get("evaluation_role") != scope.evaluation_role
+        or logical_splits != {scope.logical_split}
+        or dataset_splits != {scope.dataset_split}
+    ):
+        raise ValueError("E1 assignment split metadata is inconsistent")
+    dataset_split = next(iter(dataset_splits))
+    for assignment in assignments:
+        entry = split_entries.get(assignment.sample_id)
+        if entry is None:
+            raise ValueError("E1 assignments include unknown split sample IDs")
+        if (
+            entry.get("logical_split") != assignment.logical_split
+            or entry.get("dataset_split") != assignment.dataset_split
+            or int(entry.get("source_index", -1)) != assignment.source_index
+            or entry.get("question_sha256") != assignment.question_sha256
+        ):
+            raise ValueError("E1 assignment differs from split manifest")
 
     reasoner = manifest.get("reasoner", {})
     model_name = str(reasoner.get("model_name", ""))
@@ -308,7 +331,7 @@ def main() -> None:
     dataset = load_dataset(
         "openai/gsm8k",
         "main",
-        split="train",
+        split=dataset_split,
         revision=dataset_revision,
     )
 
@@ -324,6 +347,11 @@ def main() -> None:
                 if text_sha256(question) != assignment.question_sha256:
                     raise ValueError(
                         f"Question hash mismatch for {assignment.sample_id}"
+                    )
+                split_entry = split_entries[assignment.sample_id]
+                if text_sha256(answer) != split_entry.get("answer_sha256"):
+                    raise ValueError(
+                        f"Answer hash mismatch for {assignment.sample_id}"
                     )
                 prompt_ids = prompt_token_ids(tokenizer, question)
                 if (
@@ -427,6 +455,8 @@ def main() -> None:
                     "schema_version": E1_RESULTS_SCHEMA,
                     "sample_id": assignment.sample_id,
                     "logical_split": assignment.logical_split,
+                    "dataset_split": assignment.dataset_split,
+                    "evaluation_role": manifest["evaluation_role"],
                     "question_sha256": assignment.question_sha256,
                     "assignment_manifest_sha256": expected_manifest_hash,
                     "triggered": assignment.triggered,
@@ -485,12 +515,15 @@ def main() -> None:
             ),
         }
     run_report = {
-        "schema_version": "experience-memory-e1-run-report-v3",
+        "schema_version": "experience-memory-e1-run-report-v4",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "completed",
         "sample_count": len(records),
         "triggered_count": sum(bool(item["triggered"]) for item in records),
         "assigned_count": sum(bool(item["assigned"]) for item in records),
+        "logical_split": manifest["logical_split"],
+        "dataset_split": dataset_split,
+        "evaluation_role": manifest.get("evaluation_role"),
         "vanilla_gate_token_parity": all(
             item["vanilla_matches_gate_observation_only"] for item in records
         ),

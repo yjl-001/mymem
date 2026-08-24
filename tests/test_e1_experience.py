@@ -5,6 +5,7 @@ import unittest
 from memgen.experience.e1 import (
     E1_CONDITIONS,
     E1Assignment,
+    E1EvaluationScope,
     GateObservation,
     MemoryChoice,
     paired_binary_effect,
@@ -55,7 +56,19 @@ def assignment(sample_id: str, choice: MemoryChoice | None) -> E1Assignment:
     )
 
 
+def final_test_assignment(sample_id: str) -> E1Assignment:
+    value = assignment(sample_id, memory_choice("final", 100)).to_dict()
+    value["logical_split"] = "final-test"
+    value["dataset_split"] = "test"
+    return E1Assignment.from_dict(value)
+
+
 class E1AssignmentTests(unittest.TestCase):
+    def test_final_test_scope_maps_to_official_test(self) -> None:
+        scope = E1EvaluationScope.from_logical_split("final-test")
+        self.assertEqual(scope.dataset_split, "test")
+        self.assertEqual(scope.evaluation_role, "final_evaluation")
+
     def test_round_trip_preserves_frozen_assignment(self) -> None:
         original = assignment("sample-0", memory_choice("a", 100))
         restored = E1Assignment.from_dict(original.to_dict())
@@ -76,6 +89,13 @@ class E1AssignmentTests(unittest.TestCase):
             value["prefix_token_ids"]
         )
         with self.assertRaisesRegex(ValueError, "boundary token"):
+            E1Assignment.from_dict(value)
+
+    def test_final_test_requires_the_official_test_dataset_split(self) -> None:
+        self.assertEqual(final_test_assignment("sample-0").dataset_split, "test")
+        value = final_test_assignment("sample-0").to_dict()
+        value["dataset_split"] = "train"
+        with self.assertRaisesRegex(ValueError, "inconsistent"):
             E1Assignment.from_dict(value)
 
 

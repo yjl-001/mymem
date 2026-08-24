@@ -48,15 +48,15 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 if [[ "${#POSITIONAL[@]}" -ne 3 ]]; then
-  echo "Usage: $0 [--limit N] [--offset N] [--logical-split calibration-val|dev-test] PHASE1_DIR E0_DIR RISK_ARTIFACT" >&2
+  echo "Usage: $0 [--limit N (0=all)] [--offset N] [--logical-split calibration-val|dev-test|final-test] PHASE1_DIR E0_DIR RISK_ARTIFACT" >&2
   exit 2
 fi
-if [[ "$LOGICAL_SPLIT" != "calibration-val" && "$LOGICAL_SPLIT" != "dev-test" ]]; then
-  echo "E1 only supports calibration-val or dev-test" >&2
+if [[ "$LOGICAL_SPLIT" != "calibration-val" && "$LOGICAL_SPLIT" != "dev-test" && "$LOGICAL_SPLIT" != "final-test" ]]; then
+  echo "E1 supports calibration-val, dev-test, or final-test" >&2
   exit 2
 fi
-if ! [[ "$LIMIT" =~ ^[0-9]+$ ]] || [[ "$LIMIT" -le 0 ]]; then
-  echo "--limit must be a positive integer" >&2
+if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
+  echo "--limit must be a non-negative integer; zero selects the full split" >&2
   exit 2
 fi
 if ! [[ "$OFFSET" =~ ^[0-9]+$ ]]; then
@@ -91,6 +91,13 @@ MODEL="$(jq -r '.reasoner.model_name' "$SIDE_KV_MANIFEST")"
 MODEL_REVISION="$(jq -r '.reasoner.model_revision' "$SIDE_KV_MANIFEST")"
 TOKENIZER_REVISION="$(jq -r '.reasoner.tokenizer_revision' "$SIDE_KV_MANIFEST")"
 DATASET_REVISION="$(jq -r '.dataset.revision' "$SPLIT_MANIFEST")"
+if [[ "$LOGICAL_SPLIT" == "final-test" ]]; then
+  DATASET_SPLIT="test"
+  EVALUATION_ROLE="final_evaluation"
+else
+  DATASET_SPLIT="train"
+  EVALUATION_ROLE="development_diagnostic"
+fi
 export CUDA_VISIBLE_DEVICES="${MEMGEN_E1_CUDA_VISIBLE_DEVICES:-0}"
 
 if [[ "$PRINT_CONFIG" == "1" ]]; then
@@ -103,6 +110,8 @@ if [[ "$PRINT_CONFIG" == "1" ]]; then
   printf 'tokenizer_revision=%s\n' "$TOKENIZER_REVISION"
   printf 'dataset_revision=%s\n' "$DATASET_REVISION"
   printf 'logical_split=%s\n' "$LOGICAL_SPLIT"
+  printf 'dataset_split=%s\n' "$DATASET_SPLIT"
+  printf 'evaluation_role=%s\n' "$EVALUATION_ROLE"
   printf 'offset=%s\n' "$OFFSET"
   printf 'limit=%s\n' "$LIMIT"
   printf 'cuda_visible_devices=%s\n' "$CUDA_VISIBLE_DEVICES"

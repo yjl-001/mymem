@@ -20,6 +20,7 @@ from memgen.chat_templates import CONVERSATION_TEMPLATE
 from memgen.experience.e1 import (
     E1_MANIFEST_SCHEMA,
     E1Assignment,
+    E1EvaluationScope,
     MemoryChoice,
 )
 from memgen.experience.memory import MemoryRecord
@@ -57,11 +58,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report-output", type=Path)
     parser.add_argument(
         "--logical-split",
-        choices=("calibration-val", "dev-test"),
+        choices=("calibration-val", "dev-test", "final-test"),
         default="calibration-val",
     )
     parser.add_argument("--offset", type=int, default=0)
-    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum samples after offset; zero selects the full split.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=768)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -109,8 +115,8 @@ def prompt_token_ids(tokenizer: Any, question: str) -> list[int]:
 
 def main() -> None:
     args = parse_args()
-    if args.offset < 0 or args.limit <= 0 or args.max_new_tokens <= 0:
-        raise ValueError("E1 requires non-negative offset and positive budgets")
+    if args.offset < 0 or args.limit < 0 or args.max_new_tokens <= 0:
+        raise ValueError("E1 requires non-negative slices and a positive token budget")
 
     import torch
     from datasets import load_dataset
@@ -147,9 +153,15 @@ def main() -> None:
         for item in split_manifest["samples"]
         if item.get("logical_split") == args.logical_split
     ][args.offset :]
-    selected = selected[: args.limit]
+    if args.limit:
+        selected = selected[: args.limit]
     if not selected:
         raise ValueError("Selected E1 split is empty")
+    scope = E1EvaluationScope.from_logical_split(args.logical_split)
+    expected_dataset_split = scope.dataset_split
+    dataset_splits = {str(item.get("dataset_split")) for item in selected}
+    if dataset_splits != {expected_dataset_split}:
+        raise ValueError("Logical split contains an unexpected dataset split")
 
     records = tuple(
         MemoryRecord.from_dict(value) for value in iter_jsonl(args.memory_records)
@@ -243,7 +255,7 @@ def main() -> None:
     dataset = load_dataset(
         "openai/gsm8k",
         "main",
-        split="train",
+        split=expected_dataset_split,
         revision=dataset_revision,
     )
     query_builder = RetrievalQueryBuilder(
@@ -340,6 +352,8 @@ def main() -> None:
         "status": "frozen",
         "answer_or_reward_used": False,
         "logical_split": args.logical_split,
+        "dataset_split": expected_dataset_split,
+        "evaluation_role": scope.evaluation_role,
         "reasoner": {
             "model_name": model_name,
             "model_revision": model_revision,
@@ -406,10 +420,13 @@ def main() -> None:
         "assignment_build_report.json"
     )
     report = {
-        "schema_version": "experience-memory-e1-assignment-build-report-v3",
+        "schema_version": "experience-memory-e1-assignment-build-report-v4",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed",
         "answer_or_reward_used": False,
+        "logical_split": args.logical_split,
+        "dataset_split": expected_dataset_split,
+        "evaluation_role": manifest["evaluation_role"],
         "summary": manifest["summary"],
         "observation_trace": {
             "path": trace_path.name,
