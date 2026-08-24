@@ -30,6 +30,8 @@ E1B_RESULTS_SCHEMA = "experience-memory-e1b-results-v1"
 E1B_SUMMARY_SCHEMA = "experience-memory-e1b-summary-v2"
 E1C_RESULTS_SCHEMA = "experience-memory-e1c-results-v2"
 E1C_SUMMARY_SCHEMA = "experience-memory-e1c-summary-v3"
+E1CT_RESULTS_SCHEMA = "experience-memory-e1ct-results-v1"
+E1CT_SUMMARY_SCHEMA = "experience-memory-e1ct-summary-v1"
 
 E1A_RANDOM_SEEDS = (17, 42, 73)
 E1A_CATALOG_TOKEN_BUDGET = 2048
@@ -49,6 +51,11 @@ _CATALOG_HEADER = (
     "General experience guidance:\n"
     "Use the following general problem-solving experiences when relevant. "
     "Ignore any experience that does not apply.\n\n"
+)
+_SINGLE_EXPERIENCE_GUIDANCE = (
+    "General experience guidance:\n"
+    "Use the following general problem-solving experience when relevant. "
+    "Ignore it if it does not apply."
 )
 
 
@@ -75,11 +82,105 @@ def render_single_experience(record: MemoryRecord) -> str:
     """Render one retrieved record using the same neutral instruction style."""
 
     return (
-        "General experience guidance:\n"
-        "Use the following general problem-solving experience when relevant. "
-        "Ignore it if it does not apply.\n\n"
-        f"{record.sanitized_contrast_payload.strip()}"
+        f"{render_single_experience_guidance()}\n\n"
+        f"{render_single_experience_payload(record)}"
     )
+
+
+def render_single_experience_guidance() -> str:
+    """Render exactly the constant wrapper used by single-memory text arms."""
+
+    return _SINGLE_EXPERIENCE_GUIDANCE
+
+
+def render_single_experience_payload(record: MemoryRecord) -> str:
+    """Render the payload without the constant single-memory wrapper."""
+
+    return record.sanitized_contrast_payload.strip()
+
+
+@dataclass(frozen=True)
+class E1CTTextSourceDecision:
+    """Pre-registered routing decision for the E1C-T text decomposition."""
+
+    wrapped_matched_positive_control_present: bool
+    wrapper_only_positive_control_present: bool
+    matched_payload_positive_control_present: bool
+    shuffled_payload_positive_control_present: bool
+    matched_payload_significant_answer_harm: bool
+
+    @staticmethod
+    def _strictly_positive(effect: Mapping[str, Any]) -> bool:
+        interval = effect.get("bootstrap_95_ci")
+        return bool(interval is not None and float(interval[0]) > 0.0)
+
+    @staticmethod
+    def _strictly_negative(effect: Mapping[str, Any]) -> bool:
+        interval = effect.get("bootstrap_95_ci")
+        return bool(interval is not None and float(interval[1]) < 0.0)
+
+    @classmethod
+    def from_effects(
+        cls,
+        *,
+        format_effects: Mapping[str, Mapping[str, Any]],
+        diagnostic_answer_effects: Mapping[str, Mapping[str, Any]],
+    ) -> "E1CTTextSourceDecision":
+        return cls(
+            wrapped_matched_positive_control_present=cls._strictly_positive(
+                format_effects["wrapped_matched_vs_no_memory"]
+            ),
+            wrapper_only_positive_control_present=cls._strictly_positive(
+                format_effects["wrapper_only_vs_no_memory"]
+            ),
+            matched_payload_positive_control_present=cls._strictly_positive(
+                format_effects["payload_only_matched_vs_no_memory"]
+            ),
+            shuffled_payload_positive_control_present=cls._strictly_positive(
+                format_effects["payload_only_shuffled_vs_no_memory"]
+            ),
+            matched_payload_significant_answer_harm=cls._strictly_negative(
+                diagnostic_answer_effects[
+                    "payload_only_matched_vs_no_memory"
+                ]
+            ),
+        )
+
+    @property
+    def outcome_profile(self) -> str:
+        if self.matched_payload_positive_control_present:
+            return (
+                "payload_and_wrapper_positive"
+                if self.wrapper_only_positive_control_present
+                else "payload_positive"
+            )
+        if self.wrapper_only_positive_control_present:
+            return "wrapper_positive_payload_not_positive"
+        if self.wrapped_matched_positive_control_present:
+            return "wrapped_interaction_only"
+        return "no_positive_text_control"
+
+    @property
+    def next_step(self) -> str:
+        if self.matched_payload_positive_control_present:
+            return "e1cs_fixed_log10_memory_odds_test"
+        if (
+            self.wrapper_only_positive_control_present
+            or self.wrapped_matched_positive_control_present
+        ):
+            return "align_side_kv_compiler_text_contract"
+        return "stop_side_kv_channel_claim_no_payload_control"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "payload_positive_control_replicated_under_shuffle": (
+                self.matched_payload_positive_control_present
+                and self.shuffled_payload_positive_control_present
+            ),
+            "outcome_profile": self.outcome_profile,
+            "next_step": self.next_step,
+        }
 
 
 def build_memory_augmented_messages(

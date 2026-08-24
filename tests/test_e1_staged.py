@@ -11,7 +11,11 @@ from memgen.experience.e1_staged import (
     ConstrainedKMedoidsCatalogBuilder,
     E1BRetrievalAssignment,
     E1BRetrievalDeranger,
+    E1CTTextSourceDecision,
     render_experience_catalog,
+    render_single_experience,
+    render_single_experience_guidance,
+    render_single_experience_payload,
 )
 from memgen.experience.phase1 import canonical_json_sha256
 from scripts.e1_staged_common import (
@@ -24,6 +28,7 @@ from scripts.e1_staged_common import (
     token_sequence_diagnostic,
 )
 from scripts.evaluate_e1c_side_kv_channel import compact_trace_artifact
+from scripts.evaluate_e1ct_text_source import _source_e1c_mechanism_valid
 
 
 @dataclass(frozen=True)
@@ -144,6 +149,26 @@ class RepresentativeCatalogTests(unittest.TestCase):
             4,
         )
 
+    def test_single_experience_rendering_has_auditable_components(self) -> None:
+        record = FakeMemoryRecord(
+            memory_id="mem-a",
+            payload_hash="hash-a",
+            sanitized_retrieval_key="verify relation",
+            sanitized_contrast_payload=(
+                "When facing: a relation\n"
+                "Prefer: verify the relation\n"
+                "Avoid: assuming the result"
+            ),
+        )
+        guidance = render_single_experience_guidance()
+        payload = render_single_experience_payload(record)  # type: ignore[arg-type]
+        self.assertEqual(
+            render_single_experience(record),  # type: ignore[arg-type]
+            f"{guidance}\n\n{payload}",
+        )
+        self.assertNotIn("When facing", guidance)
+        self.assertTrue(payload.startswith("When facing:"))
+
 
 class CompletionAwareQueryTests(unittest.TestCase):
     def test_preanswer_is_truncated_and_math_literals_are_removed(self) -> None:
@@ -208,6 +233,44 @@ class PersistentTraceArtifactTests(unittest.TestCase):
         self.assertTrue(artifact["native_cache_length_matches_real_tokens"])
         self.assertTrue(artifact["memory_id_constant"])
         self.assertTrue(artifact["normalization_constant"])
+
+    def test_e1ct_validates_mechanism_from_authenticated_result_rows(self) -> None:
+        path = "split-before-final-prompt-token-v1"
+        side_kv = {
+            "one_trace_per_generated_token": True,
+            "native_cache_length_matches_real_tokens": True,
+            "all_memory_attention_mass_finite_and_positive": True,
+            "memory_id_constant": True,
+            "memory_slot_count_constant": True,
+            "normalization_constant": True,
+            "baseline_first_token_matches_split_no_memory": True,
+        }
+        record = {
+            "primary_prefill_path": path,
+            "prefill_path_diagnostics": {
+                "split_no_memory_repeat": {"exact_match": True}
+            },
+            "conditions": {
+                condition: {
+                    "prefill_path": path,
+                    "side_kv": (
+                        dict(side_kv) if "persistent" in condition else None
+                    ),
+                }
+                for condition in (
+                    "split_no_memory",
+                    "split_matched_text",
+                    "split_shuffled_text",
+                    "matched_persistent_side_kv",
+                    "shuffled_persistent_side_kv",
+                )
+            },
+        }
+        self.assertTrue(_source_e1c_mechanism_valid(record))
+        record["conditions"]["matched_persistent_side_kv"]["side_kv"][
+            "normalization_constant"
+        ] = False
+        self.assertFalse(_source_e1c_mechanism_valid(record))
 
 
 class StagedDiagnosticSummaryTests(unittest.TestCase):
@@ -328,6 +391,48 @@ class StagedDiagnosticSummaryTests(unittest.TestCase):
         parity = token_sequence_diagnostic((1, 2), (1, 2))
         self.assertTrue(parity["exact_match"])
         self.assertIsNone(parity["first_divergence_index"])
+
+    def test_text_source_decision_only_allows_strength_after_payload_control(self) -> None:
+        positive = {"bootstrap_95_ci": [0.05, 0.2]}
+        inconclusive = {"bootstrap_95_ci": [-0.05, 0.1]}
+        negative = {"bootstrap_95_ci": [-0.2, -0.01]}
+        format_effects = {
+            "wrapped_matched_vs_no_memory": positive,
+            "wrapper_only_vs_no_memory": inconclusive,
+            "payload_only_matched_vs_no_memory": positive,
+            "payload_only_shuffled_vs_no_memory": positive,
+        }
+        diagnostic_effects = {
+            "payload_only_matched_vs_no_memory": negative,
+        }
+        decision = E1CTTextSourceDecision.from_effects(
+            format_effects=format_effects,
+            diagnostic_answer_effects=diagnostic_effects,
+        )
+        self.assertEqual(
+            decision.next_step, "e1cs_fixed_log10_memory_odds_test"
+        )
+        self.assertTrue(decision.matched_payload_significant_answer_harm)
+        self.assertTrue(
+            decision.to_dict()[
+                "payload_positive_control_replicated_under_shuffle"
+            ]
+        )
+
+        wrapper_only = E1CTTextSourceDecision.from_effects(
+            format_effects={
+                **format_effects,
+                "wrapper_only_vs_no_memory": positive,
+                "payload_only_matched_vs_no_memory": inconclusive,
+                "payload_only_shuffled_vs_no_memory": inconclusive,
+            },
+            diagnostic_answer_effects={
+                "payload_only_matched_vs_no_memory": inconclusive,
+            },
+        )
+        self.assertEqual(
+            wrapper_only.next_step, "align_side_kv_compiler_text_contract"
+        )
 
 
 if __name__ == "__main__":

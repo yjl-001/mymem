@@ -228,8 +228,45 @@ KL 约为 `0.0010/0.0008`，说明 persistent side path 活跃但很弱；matche
 `0.10/0.29`，低于当时直接引用的 matched-text `0.26/0.58`。然而 E1-B full-prefill no-memory 与 E1-C
 split-prefill no-memory 只有 `28/100` 条完整 completion 一致。BF16 下微小 shape-dependent logits 差异
 可能被 greedy decoding 放大，因此旧版跨路径的 side-KV-vs-no-memory/text 数值不能作为干净的通道
-结论。matched-vs-shuffled side-KV 同为 split 路径，仍未显示内容选择收益，但在 E1-C v3 完成前不调整
-`log_valid_slots`、layer 或 gate。
+结论。E1-C v3 随后确认 split 重复 `100/100` 一致、两个 side-KV baseline 首 token 均 `100/100`
+一致，cache/trace 机制通过。split matched/shuffled text 相对 split no-memory 的格式差为 `+0.26/+0.25`，
+而 matched side-KV 为 `-0.03`；matched/shuffled memory attention mass 约为 `0.0133/0.0132`。因此当前
+`layer-24 + log_valid_slots` 通道没有传递 wrapped text 的格式正效应，也没有 matched 内容收益。该结果
+触发 E1C-T 文本来源分解，不直接调整 `log_valid_slots`、layer 或 gate。
+
+### 5.5 E1C-T：文本效应来源分解
+
+E1-C v3 已确认同路径机制完整，但 matched side-KV 没有复现 wrapped text 的格式正效应。由于文本条件
+使用固定 `General experience guidance` wrapper，而 E0 side-KV 用另一段 compiler prefix 编译并只保留
+`When facing / Prefer / Avoid` payload slots，下一步先分解文本效应，不直接调 side-KV 强度。
+
+E1C-T 原样复用 E1-C v3 的：
+
+- `split_no_memory`
+- `split_matched_text`
+- `split_shuffled_text`
+
+只新增三个相同 split-prefill 路径的条件：
+
+- `split_wrapper_only`：只追加 single-experience guidance wrapper；
+- `split_payload_only_matched`：只追加 matched MemoryRecord payload；
+- `split_payload_only_shuffled`：只追加 shuffled MemoryRecord payload。
+
+E1C-T 不重新检索、不重算 assignment、不调用 Teacher/Pro，也不改变 E0 side-KV。输入必须通过 E1-C v3
+results/run-report hash、E1-C summary v3、E0 MemoryRecord hash 和 split manifest hash 校验。主要诊断
+使用 paired 格式差；严格 accuracy 与 diagnostic answer 作为风险指标，不作为文本来源定义。
+
+预注册路由为：
+
+1. matched payload-only 相对 no-memory 的格式 bootstrap 95% CI 下界大于零：允许进入一次固定的
+   `+log(10)` memory-odds 强度测试；
+2. payload-only 不为正，但 wrapper-only 或 wrapped matched 为正：先对齐 side-KV compiler 与在线文本
+   契约，不做强度测试；
+3. wrapped/payload/wrapper 均无正对照：停止当前 side-KV 内容传递声明。
+
+shuffled payload-only 是否也为正用于判断 payload 行为效应能否跨 memory ID 复现；matched payload-only
+若显著损害 diagnostic answer，报告会单独登记，但不会把格式正对照误写成数学推理收益。E1C-T 本身不
+实现或运行强度实验。
 
 ## 6. E1-D：gate 时机（暂不实现）
 
@@ -331,3 +368,32 @@ E1-C 脚本和 Python runner 都会校验 E1-B component handoff、summary/resul
 E0 side-KV manifest；不满足时直接停止，不创建替代 assignment。冻结配置确认时使用
 `--logical-split dev-test --offset 100`，不要覆盖已有 calibration 目录。E1-A 确认运行还必须通过
 `--catalog-manifest <calibration-run/catalog_manifest.json>` 复用原目录，不重新聚类。
+
+完成 E1-C v3 后运行 E1C-T。这里的 `E1C_V3_RUN_DIR` 必须指向刚才机制通过的 v3 目录，不使用旧 v2：
+
+```bash
+E1C_V3_RUN_DIR="$MEMGEN_OUTPUT_ROOT/e1/gsm8k/gsm8k_e1c_side-kv_calibration-val_e1c-calibration-v3"
+MEMGEN_RUN_TAG=e1ct-calibration-v1 \
+bash scripts/experiments/gsm8k/run_e1ct_text_source.sh \
+  "$PHASE1_DIR" "$E0_DIR" "$E1B_RUN_DIR" "$E1C_V3_RUN_DIR"
+```
+
+检查文本来源与自动路由：
+
+```bash
+E1CT_RUN_DIR="$MEMGEN_OUTPUT_ROOT/e1/gsm8k/gsm8k_e1ct_text-source_calibration-val_e1ct-calibration-v1"
+jq '{
+  status,
+  formal_task_claim,
+  component_diagnostic,
+  condition_roles,
+  conditions,
+  format_effects,
+  diagnostic_answer_effects,
+  strict_accuracy_transition_diagnostics,
+  decision
+}' "$E1CT_RUN_DIR/evaluation/e1ct_summary.json"
+```
+
+只有 `decision.next_step == "e1cs_fixed_log10_memory_odds_test"` 才实现下一阶段固定强度诊断；其他结果
+按 `decision.next_step` 停止或对齐 compiler，不使用 accuracy 反调强度。
