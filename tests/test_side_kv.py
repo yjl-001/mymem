@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 
 try:
@@ -207,8 +208,35 @@ class SideKVControllerTests(unittest.TestCase):
             trace = normalized.traces[0]
             self.assertEqual(trace.memory_score_normalization, "log_valid_slots")
             self.assertLess(trace.memory_attention_mass, plain_mass)
+            normalized_mass = trace.memory_attention_mass
         finally:
             normalized.close()
+
+        boosted = SideKVAttentionController(
+            model=model,
+            layer_number=1,
+            memory_score_normalization="log_valid_slots",
+            memory_score_bias=math.log(10.0),
+        )
+        try:
+            with boosted.use_memory(memory):
+                attention(
+                    hidden_states=hidden,
+                    position_embeddings=position_embeddings,
+                    attention_mask=torch.zeros(1, 1, 1, 1),
+                )
+            trace = boosted.traces[0]
+            self.assertAlmostEqual(trace.memory_score_bias, math.log(10.0))
+            self.assertGreater(trace.memory_attention_mass, normalized_mass)
+        finally:
+            boosted.close()
+
+        with self.assertRaisesRegex(ValueError, "memory_score_bias"):
+            SideKVAttentionController(
+                model=model,
+                layer_number=1,
+                memory_score_bias=float("nan"),
+            )
 
     def test_memory_uses_a_side_path_without_extending_the_native_cache(self) -> None:
         from memgen.model.side_kv import SideKVAttentionController, SideKVMemory

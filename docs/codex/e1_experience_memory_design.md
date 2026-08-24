@@ -268,6 +268,50 @@ shuffled payload-only 是否也为正用于判断 payload 行为效应能否跨 
 若显著损害 diagnostic answer，报告会单独登记，但不会把格式正对照误写成数学推理收益。E1C-T 本身不
 实现或运行强度实验。
 
+E1C-T 的 100 条 `calibration-val` 结果已经完成：wrapper-only 相对 no-memory 没有格式收益；
+payload-only matched/shuffled 的格式准确率分别为 `0.63/0.61`，相对 no-memory 的 `0.32` 均给出严格
+正的 paired bootstrap 区间。因此可观测文本效应来自 MemoryRecord payload，而不是固定 wrapper。
+matched payload-only 相对 shuffled 的格式差只有 `+0.02` 且不显著，仍不能证明 BM25 语义选择能力。
+该结果按预注册路由只授权 E1C-S 一次固定强度诊断。
+
+### 5.6 E1C-S：一次固定 side-KV 强度诊断
+
+E1C-S 不搜索强度。它保持 E1-C v3 的 layer 24、canonical pre-RoPE bank、persistent side path、
+`log_valid_slots` normalization 和 E1-B matched/shuffled assignment，只在每个有效 memory score 上增加
+唯一预注册常数：
+
+```text
+memory_scores = raw_memory_scores - log(valid_slot_count) + log(10)
+```
+
+这等价于把 memory 相对 native token 的总 attention odds 乘以 `10`，不是把归一化后的 attention mass
+直接乘以 `10`。以 E1-C v3 约 `0.013` 的平均 mass 估算，预期新 mass 约为 `0.12`；E1C-S 预注册的
+matched/shuffled 聚合均值区间均为 `[0.05, 0.25]`。超出区间不再改常数补跑。
+
+E1C-S 只新增两个生成条件：
+
+- `fixed_log10_matched_persistent_side_kv`；
+- `fixed_log10_shuffled_persistent_side_kv`。
+
+以下五个条件直接从已认证结果复制，不重新生成：`split_no_memory`、payload-only matched/shuffled，
+以及 normalized side-KV matched/shuffled。所有条件保持同一个 split-prefill 路径。报告必须逐 token
+验证 cache 长度、memory ID、slot count、normalization、精确 score bias、attention mass 与 baseline
+首 token；并再次从 E1-C result rows 验证旧机制证据，而不是只信 summary。
+
+E1C-S 的主要问题是“当前 canonical layer-24 side-KV 通道在合理的更强 attention 下，能否传递已经由
+payload-only text 证明存在的格式行为效应”。`fixed matched - no-memory` 的格式 bootstrap 95% CI 下界
+严格大于零，且 matched/shuffled mean attention mass 均在预注册区间，才记为 channel-capacity evidence。
+shuffled 是否同样传递用于判断该效应是通用 payload 行为还是 matched 内容特异效应；matched-vs-shuffled
+仍是次要语义诊断。strict accuracy 与 diagnostic answer 只报告风险：它们不把本组件诊断升级为任务收益。
+
+停止规则如下：
+
+1. 机制不完整、attention mass 越界或 matched 格式效应不传递：停止当前
+   `layer-24 + canonical payload KV` 通道，不搜索 layer/强度；
+2. 格式效应传递但 diagnostic answer 显著受损：只记录 channel capacity，拒绝该强度作为候选配置；
+3. 格式效应传递且无显著 answer harm：记录 channel capacity，下一步回到经验抽象与检索设计；在数学
+   内容和 matched 选择收益成立前仍不恢复 gate。
+
 ## 6. E1-D：gate 时机（暂不实现）
 
 只有 E1-A、E1-B、E1-C 均给出正证据后，才恢复 entropy+risk gate，比较 prompt-end persistent 与
@@ -395,5 +439,34 @@ jq '{
 }' "$E1CT_RUN_DIR/evaluation/e1ct_summary.json"
 ```
 
-只有 `decision.next_step == "e1cs_fixed_log10_memory_odds_test"` 才实现下一阶段固定强度诊断；其他结果
-按 `decision.next_step` 停止或对齐 compiler，不使用 accuracy 反调强度。
+只有 `decision.next_step == "e1cs_fixed_log10_memory_odds_test"` 时 E1C-S runner 才接受该 E1C-T
+目录；其他结果按 `decision.next_step` 停止或对齐 compiler，不使用 accuracy 反调强度。
+
+当前 E1C-T 已授权 E1C-S。运行时必须同时提供原 E1-C v3 和 E1C-T 目录，以复用并认证全部冻结对照：
+
+```bash
+E1CT_RUN_DIR="$MEMGEN_OUTPUT_ROOT/e1/gsm8k/gsm8k_e1ct_text-source_calibration-val_e1ct-calibration-v1"
+MEMGEN_RUN_TAG=e1cs-calibration-v1 \
+bash scripts/experiments/gsm8k/run_e1cs_fixed_strength.sh \
+  "$PHASE1_DIR" "$E0_DIR" "$E1B_RUN_DIR" "$E1C_V3_RUN_DIR" "$E1CT_RUN_DIR"
+```
+
+只需要检查一个汇总文件：
+
+```bash
+E1CS_RUN_DIR="$MEMGEN_OUTPUT_ROOT/e1/gsm8k/gsm8k_e1cs_fixed-strength_calibration-val_e1cs-calibration-v1"
+jq '{
+  status,
+  formal_task_claim,
+  component_diagnostic,
+  fixed_strength,
+  condition_roles,
+  conditions,
+  format_effects,
+  diagnostic_answer_effects,
+  mechanism_diagnostics,
+  decision
+}' "$E1CS_RUN_DIR/evaluation/e1cs_summary.json"
+```
+
+必须按 `decision.next_step` 解释结果；本轮不允许换 bias、layer、memory 数量或样本 split 补跑。

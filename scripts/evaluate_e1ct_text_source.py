@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from memgen.chat_templates import CONVERSATION_TEMPLATE
 from memgen.experience.e1_staged import (
     E1B_MANIFEST_SCHEMA,
+    E1C_MEMORY_SCORE_NORMALIZATION,
     E1C_RESULTS_SCHEMA,
     E1C_SUMMARY_SCHEMA,
     E1CT_RESULTS_SCHEMA,
@@ -38,6 +39,7 @@ from memgen.experience.phase1 import (
 from scripts.e1_staged_common import (
     PairedConditionComparison,
     PairedConditionDiagnostics,
+    e1c_source_mechanism_valid,
     load_hashed_manifest,
     processed_solution,
     prompt_token_ids,
@@ -81,46 +83,6 @@ def _copy_source_condition(
         raise ValueError(f"Source E1-C condition is not split-prefill: {condition}")
     row["source_artifact_role"] = "frozen_e1c_v3_reference"
     return row
-
-
-def _source_e1c_mechanism_valid(record: Mapping[str, Any]) -> bool:
-    primary_conditions = (
-        "split_no_memory",
-        "split_matched_text",
-        "split_shuffled_text",
-        "matched_persistent_side_kv",
-        "shuffled_persistent_side_kv",
-    )
-    if record.get("primary_prefill_path") != SPLIT_PREFILL_PATH or not all(
-        record.get("conditions", {}).get(condition, {}).get("prefill_path")
-        == SPLIT_PREFILL_PATH
-        for condition in primary_conditions
-    ):
-        return False
-    if record.get("prefill_path_diagnostics", {}).get(
-        "split_no_memory_repeat", {}
-    ).get("exact_match") is not True:
-        return False
-    requirements = (
-        "one_trace_per_generated_token",
-        "native_cache_length_matches_real_tokens",
-        "all_memory_attention_mass_finite_and_positive",
-        "memory_id_constant",
-        "memory_slot_count_constant",
-        "normalization_constant",
-        "baseline_first_token_matches_split_no_memory",
-    )
-    return all(
-        record.get("conditions", {}).get(condition, {}).get("side_kv", {}).get(
-            requirement
-        )
-        is True
-        for condition in (
-            "matched_persistent_side_kv",
-            "shuffled_persistent_side_kv",
-        )
-        for requirement in requirements
-    )
 
 
 def main() -> None:
@@ -179,7 +141,14 @@ def main() -> None:
     e1c_by_sample = {str(record["sample_id"]): record for record in e1c_records}
     if set(e1c_by_sample) != {assignment.sample_id for assignment in assignments}:
         raise ValueError("E1-C source results and assignments have different samples")
-    if not all(_source_e1c_mechanism_valid(record) for record in e1c_records):
+    if not all(
+        e1c_source_mechanism_valid(
+            record,
+            split_prefill_path=SPLIT_PREFILL_PATH,
+            expected_normalization=E1C_MEMORY_SCORE_NORMALIZATION,
+        )
+        for record in e1c_records
+    ):
         raise ValueError(
             "E1C-T requires mechanism-valid evidence in every E1-C result"
         )

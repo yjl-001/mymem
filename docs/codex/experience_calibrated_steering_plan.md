@@ -179,9 +179,11 @@ full-vs-split 首步误差与首次分叉位置作为诊断而非机制硬门槛
 E1-C v3 的同路径机制已经通过：split no-memory 重复一致、side-KV baseline 首 token 与 split baseline
 一致、native cache/trace 不变量全部成立。wrapped matched/shuffled text 相对 split no-memory 的格式差为
 `+0.26/+0.25`，但 matched side-KV 格式差为 `-0.03`；当前 `log_valid_slots` memory attention mass 约
-`0.013`。在调强度前先运行 E1C-T，拆分 wrapper-only 与 payload-only 的格式效应。只有 matched
-payload-only 给出严格正格式 CI，才允许一次固定 `+log(10)` memory-odds 诊断；否则先对齐 compiler 文本
-契约或停止通道声明。
+`0.013`。E1C-T 随后确认 wrapper-only 无格式收益，而 payload-only matched/shuffled 相对 no-memory
+分别约为 `+0.31/+0.29`，且 bootstrap 区间严格为正。因此文本正对照来自 payload，当前只授权 E1C-S
+一次固定 `+log(10)` memory-odds 诊断。E1C-S 不搜索参数：预注册 matched/shuffled mean attention mass
+区间为 `[0.05, 0.25]`，只新增强 side-KV 两个条件并复用 E1-C/E1C-T 的冻结对照。若机制、mass 区间或
+matched 格式效应传递任一失败，则停止当前 layer-24 canonical side-KV 通道，不继续调 layer/强度。
 
 每个阶段都包含 no-memory 与错配/随机对照并使用 sample-level paired 统计。具体 manifest、条件、
 机制不变量和停止规则见 [E1 设计](e1_experience_memory_design.md)。
@@ -228,11 +230,11 @@ side_kv_applied, generation_length, final_reward, format_reward, output_path
 ## 8. 当前交接点
 
 E0 已完成并冻结；E1-v1 已完成且当前组合未通过。E1-A 和 E1-B 首轮 `calibration-val` 已完成：格式行为
-给出经验可消费性的正证据，但经验数学内容与 BM25 选择能力均未正式通过。当前只重跑修正对照路径后的
-E1-C v3 已确认机制正确但当前 normalized side-KV 未传递 wrapped text 格式效应。当前只运行 E1C-T
-文本来源分解，原样复用 E1-B assignment、E1-C v3 reference 和 E0 MemoryRecord；E1C-T 结果出来前不
-实现强度改动，不改 layer 或 gate。在经验库生成策略调整前，不把组件结果外推为完整方法的任务收益。
-配置冻结后只在 `dev-test` offset 100 之后做一次独立确认。
+给出经验可消费性的正证据，但经验数学内容与 BM25 选择能力均未正式通过。E1-C v3 已确认机制正确但
+normalized side-KV 未传递文本格式效应；E1C-T 已把该正效应定位到 payload，而非 wrapper。当前只运行
+一次预注册的 E1C-S `+log(10)` memory-odds 组件诊断，原样复用 E1-B assignment、E1-C v3、E1C-T 和
+E0 side-KV bank。不得用结果调整 bias、layer、memory 数量或 gate。在经验库生成策略与语义检索收益得到
+新的证据前，不把组件结果外推为完整方法的任务收益，也不进入独立确认。
 
 在 E1-A/B/C 得到逐组件证据前，不实现 gate timing、不扩展 memory 数量、不搜索 layer/注入强度，
 不进入 E2/E3 或 `final-test`。

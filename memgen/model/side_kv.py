@@ -32,7 +32,7 @@ from memgen.experience.phase1 import canonical_json_sha256, file_sha256
 
 
 SIDE_KV_BANK_SCHEMA = "canonical-side-kv-bank-v1"
-SIDE_KV_TRACE_SCHEMA = "side-kv-attention-trace-v1"
+SIDE_KV_TRACE_SCHEMA = "side-kv-attention-trace-v2"
 DEFAULT_COMPILER_PREFIX = (
     "<|im_start|>system\n"
     "Read the following reusable reasoning guideline as internal guidance."
@@ -109,6 +109,7 @@ class SideKVAttentionTrace:
     memory_mass_by_query_head: tuple[float, ...]
     memory_mass_by_kv_group: tuple[float, ...]
     memory_score_normalization: str = "none"
+    memory_score_bias: float = 0.0
     schema_version: str = SIDE_KV_TRACE_SCHEMA
 
     def to_dict(self) -> dict[str, Any]:
@@ -591,6 +592,7 @@ class SideKVAttentionController:
         require_batch_size_one: bool = True,
         audit_canonical_rope: bool = False,
         memory_score_normalization: str = "none",
+        memory_score_bias: float = 0.0,
     ):
         self.model = model
         self.layer_number = layer_number
@@ -601,6 +603,9 @@ class SideKVAttentionController:
                 "memory_score_normalization must be none or log_valid_slots"
             )
         self.memory_score_normalization = memory_score_normalization
+        if not math.isfinite(memory_score_bias):
+            raise ValueError("memory_score_bias must be finite")
+        self.memory_score_bias = float(memory_score_bias)
         layers = DecoderLayerResolver.resolve(model)
         if layer_number <= 0 or layer_number > len(layers):
             raise ValueError("Side-KV layer_number is outside the decoder")
@@ -765,6 +770,8 @@ class SideKVAttentionController:
         )
         if self.memory_score_normalization == "log_valid_slots":
             memory_scores = memory_scores - math.log(memory.valid_slot_count)
+        if self.memory_score_bias:
+            memory_scores = memory_scores + self.memory_score_bias
         rope_score_relative_error = (
             shared_rope_score_relative_error(
                 query_pre_rope=query_pre,
@@ -823,6 +830,7 @@ class SideKVAttentionController:
                 memory_mass_by_query_head=tuple(float(value) for value in per_query_head.tolist()),
                 memory_mass_by_kv_group=tuple(float(value) for value in per_kv_group.tolist()),
                 memory_score_normalization=self.memory_score_normalization,
+                memory_score_bias=self.memory_score_bias,
             )
         )
         return attention_output, joint_weights

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
+import math
 from types import SimpleNamespace
 import unittest
 
@@ -11,6 +12,7 @@ from memgen.experience.e1_staged import (
     ConstrainedKMedoidsCatalogBuilder,
     E1BRetrievalAssignment,
     E1BRetrievalDeranger,
+    E1CSFixedStrengthDecision,
     E1CTTextSourceDecision,
     render_experience_catalog,
     render_single_experience,
@@ -22,13 +24,14 @@ from scripts.e1_staged_common import (
     PairedConditionComparison,
     PairedConditionDiagnostics,
     completion_difference_summary,
+    e1c_source_mechanism_valid,
     format_transfer_diagnostic,
     strict_accuracy_transition_diagnostics,
     summarize_conditions,
     token_sequence_diagnostic,
 )
 from scripts.evaluate_e1c_side_kv_channel import compact_trace_artifact
-from scripts.evaluate_e1ct_text_source import _source_e1c_mechanism_valid
+from scripts.evaluate_e1cs_fixed_strength import FixedStrengthTraceAuditor
 
 
 @dataclass(frozen=True)
@@ -234,6 +237,28 @@ class PersistentTraceArtifactTests(unittest.TestCase):
         self.assertTrue(artifact["memory_id_constant"])
         self.assertTrue(artifact["normalization_constant"])
 
+    def test_fixed_strength_trace_records_the_preregistered_bias(self) -> None:
+        traces = tuple(
+            SimpleNamespace(
+                native_key_length=20 + index,
+                memory_attention_mass=0.12,
+                memory_id="memory-a",
+                memory_slot_count=12,
+                memory_score_normalization="log_valid_slots",
+                memory_score_bias=math.log(10.0),
+            )
+            for index in range(3)
+        )
+        artifact = FixedStrengthTraceAuditor(
+            normalization="log_valid_slots",
+            memory_score_bias=math.log(10.0),
+        ).compact(traces, completion_length=3, prompt_length=20)
+        self.assertTrue(artifact["memory_score_bias_constant"])
+        self.assertTrue(
+            artifact["memory_score_bias_matches_preregistered_value"]
+        )
+        self.assertAlmostEqual(artifact["memory_odds_multiplier"], 10.0)
+
     def test_e1ct_validates_mechanism_from_authenticated_result_rows(self) -> None:
         path = "split-before-final-prompt-token-v1"
         side_kv = {
@@ -244,6 +269,7 @@ class PersistentTraceArtifactTests(unittest.TestCase):
             "memory_slot_count_constant": True,
             "normalization_constant": True,
             "baseline_first_token_matches_split_no_memory": True,
+            "memory_score_normalizations": ["log_valid_slots"],
         }
         record = {
             "primary_prefill_path": path,
@@ -266,11 +292,19 @@ class PersistentTraceArtifactTests(unittest.TestCase):
                 )
             },
         }
-        self.assertTrue(_source_e1c_mechanism_valid(record))
+        self.assertTrue(e1c_source_mechanism_valid(
+            record,
+            split_prefill_path=path,
+            expected_normalization="log_valid_slots",
+        ))
         record["conditions"]["matched_persistent_side_kv"]["side_kv"][
             "normalization_constant"
         ] = False
-        self.assertFalse(_source_e1c_mechanism_valid(record))
+        self.assertFalse(e1c_source_mechanism_valid(
+            record,
+            split_prefill_path=path,
+            expected_normalization="log_valid_slots",
+        ))
 
 
 class StagedDiagnosticSummaryTests(unittest.TestCase):
@@ -379,6 +413,33 @@ class StagedDiagnosticSummaryTests(unittest.TestCase):
         )
         self.assertEqual(unavailable["status"], "no_positive_text_control")
         self.assertIsNone(unavailable["positive_direction_transferred"])
+
+    def test_e1cs_decision_separates_channel_capacity_from_task_claim(self) -> None:
+        supported = E1CSFixedStrengthDecision(
+            mechanism_integrity_passed=True,
+            matched_attention_mass_in_target_band=True,
+            shuffled_attention_mass_in_target_band=True,
+            matched_format_positive_control_transferred=True,
+            shuffled_format_positive_control_transferred=True,
+            matched_significant_answer_harm=False,
+        )
+        self.assertTrue(supported.channel_capacity_supported)
+        self.assertEqual(
+            supported.next_step,
+            "record_channel_capacity_then_redesign_experience_and_retrieval",
+        )
+        no_transfer = E1CSFixedStrengthDecision(
+            mechanism_integrity_passed=True,
+            matched_attention_mass_in_target_band=True,
+            shuffled_attention_mass_in_target_band=True,
+            matched_format_positive_control_transferred=False,
+            shuffled_format_positive_control_transferred=False,
+            matched_significant_answer_harm=False,
+        )
+        self.assertFalse(no_transfer.channel_capacity_supported)
+        self.assertEqual(
+            no_transfer.next_step, "stop_current_layer24_side_kv_channel"
+        )
 
     def test_token_sequence_diagnostic_locates_first_divergence(self) -> None:
         diagnostic = token_sequence_diagnostic(

@@ -398,6 +398,62 @@ def effect_is_positive(effect: Mapping[str, Any]) -> bool:
     return bool(interval is not None and float(interval[0]) > 0.0)
 
 
+def effect_is_negative(effect: Mapping[str, Any]) -> bool:
+    interval = effect.get("bootstrap_95_ci")
+    return bool(interval is not None and float(interval[1]) < 0.0)
+
+
+def e1c_source_mechanism_valid(
+    record: Mapping[str, Any],
+    *,
+    split_prefill_path: str,
+    expected_normalization: str,
+) -> bool:
+    """Revalidate E1-C v3 mechanism evidence from one result row.
+
+    Downstream component diagnostics must not trust the E1-C summary alone.
+    This check uses the authenticated per-sample result and deliberately
+    excludes task reward from the handoff contract.
+    """
+
+    primary_conditions = (
+        "split_no_memory",
+        "split_matched_text",
+        "split_shuffled_text",
+        "matched_persistent_side_kv",
+        "shuffled_persistent_side_kv",
+    )
+    if record.get("primary_prefill_path") != split_prefill_path or not all(
+        record.get("conditions", {}).get(condition, {}).get("prefill_path")
+        == split_prefill_path
+        for condition in primary_conditions
+    ):
+        return False
+    if record.get("prefill_path_diagnostics", {}).get(
+        "split_no_memory_repeat", {}
+    ).get("exact_match") is not True:
+        return False
+    requirements = (
+        "one_trace_per_generated_token",
+        "native_cache_length_matches_real_tokens",
+        "all_memory_attention_mass_finite_and_positive",
+        "memory_id_constant",
+        "memory_slot_count_constant",
+        "normalization_constant",
+        "baseline_first_token_matches_split_no_memory",
+    )
+    for condition in (
+        "matched_persistent_side_kv",
+        "shuffled_persistent_side_kv",
+    ):
+        trace = record.get("conditions", {}).get(condition, {}).get("side_kv", {})
+        if not all(trace.get(requirement) is True for requirement in requirements):
+            return False
+        if trace.get("memory_score_normalizations") != [expected_normalization]:
+            return False
+    return True
+
+
 def validate_resolved_revisions(
     *,
     model: Any,

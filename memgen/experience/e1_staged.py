@@ -32,11 +32,16 @@ E1C_RESULTS_SCHEMA = "experience-memory-e1c-results-v2"
 E1C_SUMMARY_SCHEMA = "experience-memory-e1c-summary-v3"
 E1CT_RESULTS_SCHEMA = "experience-memory-e1ct-results-v1"
 E1CT_SUMMARY_SCHEMA = "experience-memory-e1ct-summary-v1"
+E1CS_RESULTS_SCHEMA = "experience-memory-e1cs-results-v1"
+E1CS_SUMMARY_SCHEMA = "experience-memory-e1cs-summary-v1"
 
 E1A_RANDOM_SEEDS = (17, 42, 73)
 E1A_CATALOG_TOKEN_BUDGET = 2048
 E1B_SHUFFLE_SEED = 42
 E1C_MEMORY_SCORE_NORMALIZATION = "log_valid_slots"
+E1CS_MEMORY_SCORE_BIAS = math.log(10.0)
+E1CS_MIN_MEAN_MEMORY_ATTENTION_MASS = 0.05
+E1CS_MAX_MEAN_MEMORY_ATTENTION_MASS = 0.25
 
 _PREANSWER_MARKER_RE = re.compile(
     r"(?:\\boxed\s*\{|\\fbox\s*\{|final\s+answer|answer\s+is)",
@@ -178,6 +183,62 @@ class E1CTTextSourceDecision:
                 self.matched_payload_positive_control_present
                 and self.shuffled_payload_positive_control_present
             ),
+            "outcome_profile": self.outcome_profile,
+            "next_step": self.next_step,
+        }
+
+
+@dataclass(frozen=True)
+class E1CSFixedStrengthDecision:
+    """Pre-registered interpretation of the one-shot side-KV strength test."""
+
+    mechanism_integrity_passed: bool
+    matched_attention_mass_in_target_band: bool
+    shuffled_attention_mass_in_target_band: bool
+    matched_format_positive_control_transferred: bool
+    shuffled_format_positive_control_transferred: bool
+    matched_significant_answer_harm: bool
+
+    @property
+    def attention_target_passed(self) -> bool:
+        return (
+            self.matched_attention_mass_in_target_band
+            and self.shuffled_attention_mass_in_target_band
+        )
+
+    @property
+    def channel_capacity_supported(self) -> bool:
+        return (
+            self.mechanism_integrity_passed
+            and self.attention_target_passed
+            and self.matched_format_positive_control_transferred
+        )
+
+    @property
+    def outcome_profile(self) -> str:
+        if not self.mechanism_integrity_passed:
+            return "strengthened_mechanism_invalid"
+        if not self.attention_target_passed:
+            return "strengthened_attention_outside_target_band"
+        if not self.matched_format_positive_control_transferred:
+            return "no_payload_effect_transfer_at_fixed_strength"
+        if self.matched_significant_answer_harm:
+            return "payload_effect_transferred_with_answer_harm"
+        return "payload_effect_transferred_without_significant_answer_harm"
+
+    @property
+    def next_step(self) -> str:
+        if not self.channel_capacity_supported:
+            return "stop_current_layer24_side_kv_channel"
+        if self.matched_significant_answer_harm:
+            return "record_channel_capacity_but_reject_fixed_strength_config"
+        return "record_channel_capacity_then_redesign_experience_and_retrieval"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "attention_target_passed": self.attention_target_passed,
+            "channel_capacity_supported": self.channel_capacity_supported,
             "outcome_profile": self.outcome_profile,
             "next_step": self.next_step,
         }
