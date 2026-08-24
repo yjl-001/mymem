@@ -197,6 +197,36 @@ def completion_difference_summary(
     }
 
 
+def token_sequence_diagnostic(
+    reference: Sequence[int], treatment: Sequence[int]
+) -> dict[str, Any]:
+    """Describe where two greedy token trajectories first diverge."""
+
+    reference_ids = tuple(int(item) for item in reference)
+    treatment_ids = tuple(int(item) for item in treatment)
+    common_prefix_count = 0
+    for reference_id, treatment_id in zip(reference_ids, treatment_ids):
+        if reference_id != treatment_id:
+            break
+        common_prefix_count += 1
+    exact_match = reference_ids == treatment_ids
+    first_divergence_index = (
+        None if exact_match else common_prefix_count
+    )
+    return {
+        "reference_token_count": len(reference_ids),
+        "treatment_token_count": len(treatment_ids),
+        "exact_match": exact_match,
+        "first_token_match": bool(
+            reference_ids
+            and treatment_ids
+            and reference_ids[0] == treatment_ids[0]
+        ),
+        "common_prefix_token_count": common_prefix_count,
+        "first_divergence_index": first_divergence_index,
+    }
+
+
 def strict_accuracy_transition_diagnostics(
     records: Sequence[Mapping[str, Any]], *, treatment: str, control: str
 ) -> dict[str, int]:

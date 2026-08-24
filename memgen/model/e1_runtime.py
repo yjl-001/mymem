@@ -225,6 +225,25 @@ class PersistentMemoryGenerationResult:
     attention_traces: tuple[SideKVAttentionTrace, ...]
     first_step_logits_kl: float
     first_step_top1_changed: bool
+    baseline_first_token_id: int
+
+
+@dataclass(frozen=True)
+class FirstStepLogitsDiagnostic:
+    """Numerical comparison of full and split prompt prefill."""
+
+    kl_full_to_split: float
+    max_absolute_error: float
+    mean_absolute_error: float
+    top1_changed: bool
+
+
+@dataclass(frozen=True)
+class PromptSplitGenerationResult:
+    """Greedy completion produced through the prompt-split cache path."""
+
+    completion_token_ids: tuple[int, ...]
+    full_prefill_diagnostic: FirstStepLogitsDiagnostic | None
 
 
 class GreedyE1Runtime:
@@ -277,13 +296,18 @@ class GreedyE1Runtime:
         return tuple(ids[prompt_length:])
 
     @torch.inference_mode()
-    def generate_prompt_split_vanilla(
-        self, prompt_token_ids: Sequence[int]
-    ) -> tuple[int, ...]:
-        """Generate natively while splitting prefill before the last prompt token.
+    def generate_prompt_split(
+        self,
+        prompt_token_ids: Sequence[int],
+        *,
+        audit_full_prefill: bool = False,
+    ) -> PromptSplitGenerationResult:
+        """Generate through the exact cache path used by prompt-end side-KV.
 
-        E1-C uses this as a cache-segmentation parity control for prompt-end
-        side-KV.  It must match :meth:`generate_vanilla` token for token.
+        A full-prefill first-step comparison can be recorded as a numerical
+        diagnostic.  Complete full/split trajectory equality is deliberately
+        not assumed: small shape-dependent floating-point differences can be
+        amplified by greedy decoding.
         """
 
         prompt = list(prompt_token_ids)
@@ -300,6 +324,7 @@ class GreedyE1Runtime:
         current = self._tensor([prompt[-1]])
         completion: list[int] = []
         eos = self.tokenizer.eos_token_id
+        split_logits: torch.Tensor | None = None
         while len(completion) < self.max_new_tokens:
             live_length = len(prompt) + len(completion)
             output = self.model(
@@ -311,13 +336,48 @@ class GreedyE1Runtime:
                 use_cache=True,
                 return_dict=True,
             )
+            if split_logits is None:
+                split_logits = output.logits[:, -1, :]
             next_token = int(output.logits[:, -1, :].argmax(dim=-1).item())
             completion.append(next_token)
             past = output.past_key_values
             if eos is not None and next_token == eos:
                 break
             current = self._tensor([next_token])
-        return tuple(completion)
+        diagnostic: FirstStepLogitsDiagnostic | None = None
+        if audit_full_prefill:
+            assert split_logits is not None
+            full_prompt = self._tensor(prompt)
+            full_output = self.model(
+                input_ids=full_prompt,
+                attention_mask=torch.ones_like(full_prompt),
+                use_cache=True,
+                return_dict=True,
+            )
+            full_logits = full_output.logits[:, -1, :]
+            absolute_error = (full_logits.float() - split_logits.float()).abs()
+            diagnostic = FirstStepLogitsDiagnostic(
+                kl_full_to_split=logits_kl(full_logits, split_logits),
+                max_absolute_error=float(absolute_error.max().item()),
+                mean_absolute_error=float(absolute_error.mean().item()),
+                top1_changed=bool(
+                    full_logits.argmax(dim=-1).item()
+                    != split_logits.argmax(dim=-1).item()
+                ),
+            )
+        return PromptSplitGenerationResult(
+            completion_token_ids=tuple(completion),
+            full_prefill_diagnostic=diagnostic,
+        )
+
+    def generate_prompt_split_vanilla(
+        self, prompt_token_ids: Sequence[int]
+    ) -> tuple[int, ...]:
+        """Compatibility wrapper for an unaudited split-prefill generation."""
+
+        return self.generate_prompt_split(
+            prompt_token_ids, audit_full_prefill=False
+        ).completion_token_ids
 
     @torch.inference_mode()
     def generate_observation_only(
@@ -559,4 +619,5 @@ class GreedyE1Runtime:
                 baseline_logits.argmax(dim=-1).item()
                 != treatment_logits.argmax(dim=-1).item()
             ),
+            baseline_first_token_id=int(baseline_logits.argmax(dim=-1).item()),
         )

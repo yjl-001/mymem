@@ -25,8 +25,9 @@ E1B_RESULTS="$E1B_DIR/evaluation/results.jsonl"
 E1B_RUN_REPORT="$E1B_DIR/evaluation/run_report.json"
 E1B_SUMMARY="$E1B_DIR/evaluation/e1b_summary.json"
 SIDE_KV_MANIFEST="$E0_DIR/side_kv_manifest.json"
+MEMORY_RECORDS="$E0_DIR/memory_records.v2.jsonl"
 SPLIT_MANIFEST="$PHASE1_DIR/split_manifest.json"
-for FILE in "$ASSIGNMENT_MANIFEST" "$E1B_RESULTS" "$E1B_RUN_REPORT" "$E1B_SUMMARY" "$SIDE_KV_MANIFEST" "$SPLIT_MANIFEST"; do
+for FILE in "$ASSIGNMENT_MANIFEST" "$E1B_RESULTS" "$E1B_RUN_REPORT" "$E1B_SUMMARY" "$MEMORY_RECORDS" "$SIDE_KV_MANIFEST" "$SPLIT_MANIFEST"; do
   [[ -s "$FILE" ]] || { echo "Missing frozen input: $FILE" >&2; exit 1; }
 done
 if [[ "$(jq -r '.component_diagnostic.e1c_component_diagnostic_allowed' "$E1B_SUMMARY")" != "true" ]]; then
@@ -47,6 +48,7 @@ python scripts/evaluate_e1c_side_kv_channel.py \
   --e1b-results "$E1B_RESULTS" \
   --e1b-run-report "$E1B_RUN_REPORT" \
   --e1b-summary "$E1B_SUMMARY" \
+  --memory-records "$MEMORY_RECORDS" \
   --side-kv-manifest "$SIDE_KV_MANIFEST" \
   --split-manifest "$SPLIT_MANIFEST" \
   --output-dir "$RUN_DIR/evaluation" \

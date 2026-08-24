@@ -21,6 +21,7 @@ from scripts.e1_staged_common import (
     format_transfer_diagnostic,
     strict_accuracy_transition_diagnostics,
     summarize_conditions,
+    token_sequence_diagnostic,
 )
 from scripts.evaluate_e1c_side_kv_channel import compact_trace_artifact
 
@@ -315,6 +316,18 @@ class StagedDiagnosticSummaryTests(unittest.TestCase):
         )
         self.assertEqual(unavailable["status"], "no_positive_text_control")
         self.assertIsNone(unavailable["positive_direction_transferred"])
+
+    def test_token_sequence_diagnostic_locates_first_divergence(self) -> None:
+        diagnostic = token_sequence_diagnostic(
+            (10, 20, 30, 40), (10, 20, 99)
+        )
+        self.assertFalse(diagnostic["exact_match"])
+        self.assertTrue(diagnostic["first_token_match"])
+        self.assertEqual(diagnostic["common_prefix_token_count"], 2)
+        self.assertEqual(diagnostic["first_divergence_index"], 2)
+        parity = token_sequence_diagnostic((1, 2), (1, 2))
+        self.assertTrue(parity["exact_match"])
+        self.assertIsNone(parity["first_divergence_index"])
 
 
 if __name__ == "__main__":

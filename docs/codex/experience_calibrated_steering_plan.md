@@ -157,7 +157,9 @@ retriever 或 side-KV。
 E1-A 的 medoid 必须是真实 MemoryRecord，不使用生成式聚类总结；随机 bank 使用三个预注册种子且与
 代表 bank 等条数、近似等 token budget。E1-B 的第一次回答不进入第二次 prompt，assignment 阶段不
 读取 gold answer。E1-C 的 memory K/V 不写入 native cache，从最后一个 prompt token 开始在每个
-decode step 持续可见，并固定对 memory logits 使用 `-log(valid_slot_count)` 归一化。
+decode step 持续可见，并固定对 memory logits 使用 `-log(valid_slot_count)` 归一化。E1-C 的正式主
+对照统一采用 split-prefill：no-memory、matched/shuffled text 与 matched/shuffled side-KV 均从最后一个
+prompt token 的相同 cache segmentation 开始；E1-B full-prefill 结果只作为跨阶段数值 reference。
 
 E1-A 在首轮 100 条 `calibration-val` 上未满足预注册 accuracy 判据：no-memory、representative 和三份
 random bank 的 accuracy 分别为 `0.15/0.14/0.17/0.20/0.15`。但经验条件的严格格式准确率分别达到
@@ -166,6 +168,13 @@ random bank 的 accuracy 分别为 `0.15/0.14/0.17/0.20/0.15`。但经验条件�
 逐样本审计显示 random-seed42 的 accuracy 点收益主要来自正确数值的格式修复，经验抽象粒度、审核/格式
 语言占比、`k=5` 聚类覆盖和全局目录负迁移均登记为风险。E1-B/E1-C 因此可以继续作为组件诊断，但在
 经验内容风险解除且任务收益确认前，不恢复 E1-D gate、不进入 final-test，也不声称 E1-A 正式通过。
+
+E1-B 首轮 100 条 `calibration-val` 中，no-memory/matched/shuffled 的严格 accuracy 为
+`0.15/0.26/0.19`，格式准确率为 `0.36/0.58/0.50`。matched 的严格收益主要来自格式修复，matched
+相对 shuffled 的 diagnostic answer 只差 `+0.01`，因此 BM25 的数学策略选择能力未确认。旧 E1-C
+实现又发现 E1-B full-prefill 与 E1-C split-prefill no-memory 只有 `28/100` 条完整轨迹一致，使跨路径
+side-KV 对照带有数值混杂。当前 E1-C v3 原样复用 assignment 和 normalization，只修正对照路径，并把
+full-vs-split 首步误差与首次分叉位置作为诊断而非机制硬门槛。
 
 每个阶段都包含 no-memory 与错配/随机对照并使用 sample-level paired 统计。具体 manifest、条件、
 机制不变量和停止规则见 [E1 设计](e1_experience_memory_design.md)。
@@ -211,11 +220,11 @@ side_kv_applied, generation_length, final_reward, format_reward, output_path
 
 ## 8. 当前交接点
 
-E0 已完成并冻结；E1-v1 已完成且当前组合未通过。E1-A 首轮 `calibration-val` 已完成：格式行为给出
-经验可消费性的正证据，但预注册 accuracy 判据未通过，经验内容风险已经登记。当前继续运行 E1-B（完整
-preanswer query 的 BM25 文本检索）和 E1-C（复用相同 assignment 的 persistent side-KV）作为组件诊断；
-在经验库生成策略调整前，不把它们外推为完整方法的任务收益。配置冻结后只在 `dev-test` offset 100 之后
-做一次独立确认。
+E0 已完成并冻结；E1-v1 已完成且当前组合未通过。E1-A 和 E1-B 首轮 `calibration-val` 已完成：格式行为
+给出经验可消费性的正证据，但经验数学内容与 BM25 选择能力均未正式通过。当前只重跑修正对照路径后的
+E1-C v3，原样复用 E1-B assignment、E0 MemoryRecord/side-KV 和 `log_valid_slots`；在同路径结果出来前
+不改 normalization、layer 或 gate。在经验库生成策略调整前，不把组件结果外推为完整方法的任务收益。
+配置冻结后只在 `dev-test` offset 100 之后做一次独立确认。
 
 在 E1-A/B/C 得到逐组件证据前，不实现 gate timing、不扩展 memory 数量、不搜索 layer/注入强度，
 不进入 E2/E3 或 `final-test`。

@@ -135,18 +135,40 @@ payload hash 与精确 prompt token 数。
 token-level completion divergence。只要 assignment、无自配对 shuffle、answer-blind query 和 artifact
 provenance 完整，即允许 E1-C 原样消费该 manifest；这不要求 E1-B 已在 accuracy 上正式通过。
 
+### 4.3 calibration-val 结果与当前解释
+
+100 条样本中，no-memory、matched-text、shuffled-text 的严格 accuracy 分别为 `0.15/0.26/0.19`，
+格式准确率为 `0.36/0.58/0.50`，diagnostic answer accuracy 为 `0.37/0.30/0.29`。matched 相对
+no-memory 的严格收益为 `+0.11`，但 15 个严格收益中有 12 个是数值判断未改善、只修复格式；matched
+相对 shuffled 的严格差为 `+0.07`，置信区间跨零，diagnostic answer 只差 `+0.01`。因此 E1-B 的
+assignment/provenance 组件通过，但 BM25 的数学策略选择能力尚未得到证明。matched 和 shuffled 都能提高
+格式，说明单条 Phase 1 payload 的通用指令效应仍然存在，后续 E1-C 可把它作为通道正对照。
+
+matched/shuffled 在全局保持同一 memory-ID 多重集合，但逐题 prompt token 数没有精确相等；这仍是
+matched-vs-shuffled 的长度—内容混杂风险。当前不修改冻结 assignment，也不据此调整 BM25。
+
 ## 5. E1-C：side-KV 通道是否保留经验内容的作用
 
 ### 5.1 固定 assignment
 
-E1-C 必须原样复用 E1-B manifest 中的 matched/shuffled ID，不重新检索。条件为：
+E1-C 必须原样复用 E1-B manifest 中的 matched/shuffled ID，不重新检索。E1-C v3 将条件分成两类。
+跨阶段 reference 只用于观察 full/split 数值路径差异：
 
-- `no_memory`
-- `matched_text`、`shuffled_text`（复用 E1-B 结果）
+- `e1b_full_no_memory`
+- `e1b_full_matched_text`
+- `e1b_full_shuffled_text`
+
+正式 E1-C 对照全部重新走相同的 split-prefill 路径：
+
+- `split_no_memory`
+- `split_matched_text`
+- `split_shuffled_text`
 - `matched_persistent_side_kv`
 - `shuffled_persistent_side_kv`
 
-这使“文本通道与 side-KV 通道”使用完全相同的题目、经验 ID 和配对关系。
+文本 prompt 从冻结 E0 MemoryRecord 重建，并必须与 E1-B 保存的 prompt-token hash 一致。这使主对照不仅
+使用完全相同的题目、经验 ID 和配对关系，也使用相同的 cache segmentation；E1-B full-prefill 结果不再
+直接充当 side-KV 的 no-memory/text control。
 
 ### 5.2 prompt-end persistent side path
 
@@ -178,21 +200,36 @@ slot 是 payload 中一个 tokenizer token 在 layer 24 得到的一组 canonica
 
 每个 side-KV 样本必须满足：
 
-- `prompt[:-1] + prompt[-1]` 的分段 native prefill 与 E1-B no-memory completion token-level parity；
+- `split_no_memory` 重复运行 token-level parity；
+- 两个 side-KV 分支在启用 memory 前的 baseline 首 token 都与 `split_no_memory` 一致；
 - 每个生成 token 恰有一条 layer-24 memory trace；
 - 每一步 memory attention mass 有限且为正；
 - native cache 长度只按真实 prompt/completion token 增长；
 - memory ID、slot count、normalization mode 在整个 completion 中不变；
-- disabled path 与 no-memory logits 保持 parity。
+- 所有主条件明确记录同一 `split-before-final-prompt-token` 路径。
 
-任务层主要检验 matched persistent side-KV 是否优于 shuffled persistent side-KV 和 no-memory；同时以
-E1-B matched-text 效果作为可达到的文本上界。若文本有效而 side-KV 无效，结论应归因于表示/传输通道，
-不能归因于经验内容或检索器。
+另行记录 full-prefill 与 split-prefill 的首步 logits KL、最大绝对误差、top-1 是否变化、完整 completion
+是否一致及首次分叉位置。这组数值只作诊断，不再作为 side-KV 机制硬门槛：只要同一路径重复确定、native
+cache/trace 不变量成立，就可以把主对照解释为 side-KV 的因果差异。
+
+任务层主要检验 matched persistent side-KV 是否优于 shuffled persistent side-KV 和
+`split_no_memory`；同时以 `split_matched_text` 效果作为同路径文本上界。若同路径文本有效而 side-KV
+无效，结论应归因于表示/传输通道，不能归因于经验内容或检索器。
 
 由于 E1-A 已观察到稳定格式效应，E1-C 额外把格式作为内容传递正对照：分别计算 matched-text 和
 matched-side-KV 相对 no-memory 的格式差。只有文本差为正时，才判断 side-KV 是否复现同方向格式效应；
 若文本条件在该批 top-1 assignment 上没有正格式效应，则报告 `no_positive_text_control`，不把它误判为
 side-KV 传输失败。机制完整性、格式正对照传递和正式任务收益分别报告，互不替代。
+
+### 5.4 E1-C v2 结果为何需要同路径重跑
+
+旧版 100 条结果中，matched/shuffled side-KV 的 memory attention mass 约为 `0.0134/0.0132`，首步
+KL 约为 `0.0010/0.0008`，说明 persistent side path 活跃但很弱；matched side-KV 的严格/格式准确率为
+`0.10/0.29`，低于当时直接引用的 matched-text `0.26/0.58`。然而 E1-B full-prefill no-memory 与 E1-C
+split-prefill no-memory 只有 `28/100` 条完整 completion 一致。BF16 下微小 shape-dependent logits 差异
+可能被 greedy decoding 放大，因此旧版跨路径的 side-KV-vs-no-memory/text 数值不能作为干净的通道
+结论。matched-vs-shuffled side-KV 同为 split 路径，仍未显示内容选择收益，但在 E1-C v3 完成前不调整
+`log_valid_slots`、layer 或 gate。
 
 ## 6. E1-D：gate 时机（暂不实现）
 
@@ -262,7 +299,7 @@ E1-B 会先写入 answer-blind `assignment_manifest.json`，再读取 gold answe
 
 ```bash
 E1B_RUN_DIR="$MEMGEN_OUTPUT_ROOT/e1/gsm8k/<实际的-e1b-运行目录>"
-MEMGEN_RUN_TAG=e1c-calibration-v1 \
+MEMGEN_RUN_TAG=e1c-calibration-v3 \
 bash scripts/experiments/gsm8k/run_e1c_side_kv_channel.sh \
   "$PHASE1_DIR" "$E0_DIR" "$E1B_RUN_DIR"
 ```
@@ -276,6 +313,7 @@ jq '{
   formal_e1c_passed,
   source_e1b_formal_passed,
   component_diagnostic,
+  condition_roles,
   conditions,
   accuracy_effects,
   diagnostic_answer_effects,
@@ -283,6 +321,7 @@ jq '{
   format_positive_control_transfer,
   completion_difference_diagnostics,
   exact_slot_count_sensitivity,
+  prefill_path_diagnostics,
   mechanism_diagnostics,
   acceptance
 }' "$E1C_RUN_DIR/evaluation/e1c_summary.json"

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Evaluate prompt-end persistent side-KV using the frozen E1-B assignments."""
+"""Evaluate prompt-end side-KV against same-path split-prefill controls."""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import math
 from pathlib import Path
 import sys
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -25,7 +26,9 @@ from memgen.experience.e1_staged import (
     E1C_RESULTS_SCHEMA,
     E1C_SUMMARY_SCHEMA,
     E1BRetrievalAssignment,
+    render_single_experience,
 )
+from memgen.experience.memory import MemoryRecord
 from memgen.experience.phase1 import (
     canonical_json_sha256,
     file_sha256,
@@ -43,10 +46,15 @@ from scripts.e1_staged_common import (
     prompt_token_ids,
     score_completion,
     summarize_conditions,
+    token_sequence_diagnostic,
     utc_now,
     validate_resolved_revisions,
     write_json,
 )
+
+
+SPLIT_PREFILL_PATH = "split-before-final-prompt-token-v1"
+E1B_FULL_PREFILL_PATH = "e1b-full-prompt-prefill-reference-v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--e1b-results", type=Path, required=True)
     parser.add_argument("--e1b-run-report", type=Path, required=True)
     parser.add_argument("--e1b-summary", type=Path, required=True)
+    parser.add_argument("--memory-records", type=Path, required=True)
     parser.add_argument("--side-kv-manifest", type=Path, required=True)
     parser.add_argument("--split-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -100,6 +109,83 @@ def compact_trace_artifact(
         "memory_id_constant": len(memory_ids) == 1,
         "memory_slot_count_constant": len(slot_counts) == 1,
         "normalization_constant": normalizations == {E1C_MEMORY_SCORE_NORMALIZATION},
+    }
+
+
+def _first_step_diagnostic(value: Any) -> dict[str, Any]:
+    if value is None:
+        raise RuntimeError("Audited split prefill did not return first-step metrics")
+    return asdict(value)
+
+
+def _reference_condition(
+    previous: Mapping[str, Any], condition: str
+) -> dict[str, Any]:
+    row = dict(previous["conditions"][condition])
+    row["prefill_path"] = E1B_FULL_PREFILL_PATH
+    return row
+
+
+def _summarize_prefill_path_diagnostics(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    by_condition: dict[str, Any] = {}
+    for name in ("no_memory", "matched_text", "shuffled_text"):
+        rows = [record["prefill_path_diagnostics"][name] for record in records]
+        token_rows = [row["full_e1b_vs_split_tokens"] for row in rows]
+        logits_rows = [row["full_vs_split_first_step_logits"] for row in rows]
+        by_condition[name] = {
+            "sample_count": len(rows),
+            "complete_trajectory_match_count": sum(
+                row["exact_match"] for row in token_rows
+            ),
+            "first_token_match_count": sum(
+                row["first_token_match"] for row in token_rows
+            ),
+            "mean_common_prefix_token_count": sum(
+                int(row["common_prefix_token_count"]) for row in token_rows
+            ) / len(rows),
+            "mean_first_step_kl_full_to_split": sum(
+                float(row["kl_full_to_split"]) for row in logits_rows
+            ) / len(rows),
+            "max_first_step_kl_full_to_split": max(
+                float(row["kl_full_to_split"]) for row in logits_rows
+            ),
+            "mean_first_step_max_absolute_error": sum(
+                float(row["max_absolute_error"]) for row in logits_rows
+            ) / len(rows),
+            "max_first_step_absolute_error": max(
+                float(row["max_absolute_error"]) for row in logits_rows
+            ),
+            "first_step_top1_changed_count": sum(
+                row["top1_changed"] for row in logits_rows
+            ),
+        }
+    repeat_rows = [
+        record["prefill_path_diagnostics"]["split_no_memory_repeat"]
+        for record in records
+    ]
+    return {
+        "interpretation": (
+            "full-vs-split is a numerical diagnostic, not a mechanism gate; "
+            "all primary E1-C contrasts use the split-prefill path"
+        ),
+        "full_e1b_vs_split": by_condition,
+        "split_no_memory_repeat_exact_match_count": sum(
+            row["exact_match"] for row in repeat_rows
+        ),
+        "matched_side_kv_baseline_first_token_match_count": sum(
+            record["prefill_path_diagnostics"][
+                "matched_side_kv_baseline_first_token_matches_split_no_memory"
+            ]
+            for record in records
+        ),
+        "shuffled_side_kv_baseline_first_token_match_count": sum(
+            record["prefill_path_diagnostics"][
+                "shuffled_side_kv_baseline_first_token_matches_split_no_memory"
+            ]
+            for record in records
+        ),
     }
 
 
@@ -161,14 +247,33 @@ def main() -> None:
             != assignment.matched_memory.memory_id
             or previous.get("shuffled_memory", {}).get("memory_id")
             != assignment.shuffled_memory.memory_id
+            or previous.get("conditions", {}).get("no_memory", {}).get(
+                "completion_token_ids_sha256"
+            )
+            != assignment.preanswer_completion_token_ids_sha256
         ):
             raise ValueError("E1-B result pairing/provenance is inconsistent")
 
     inputs = manifest["inputs"]
+    if file_sha256(args.memory_records) != inputs["memory_records_sha256"]:
+        raise ValueError("MemoryRecords differ from frozen E1-B assignment")
     if file_sha256(args.side_kv_manifest) != inputs["side_kv_manifest_sha256"]:
         raise ValueError("Side-KV bank differs from frozen E1-B assignment")
     if file_sha256(args.split_manifest) != inputs["split_manifest_sha256"]:
         raise ValueError("Split manifest differs from frozen E1-B assignment")
+    memory_records = tuple(
+        MemoryRecord.from_dict(value) for value in iter_jsonl(args.memory_records)
+    )
+    memory_by_id = {record.memory_id: record for record in memory_records}
+    used_memory_ids = {
+        choice.memory_id
+        for assignment in assignments
+        for choice in (assignment.matched_memory, assignment.shuffled_memory)
+        if choice is not None
+    }
+    if not used_memory_ids <= set(memory_by_id):
+        raise ValueError("E1-C assignments reference unknown MemoryRecords")
+
     side_manifest = json.loads(args.side_kv_manifest.read_text(encoding="utf-8"))
     reasoner = manifest["reasoner"]
     layer = int(reasoner["side_kv_layer"])
@@ -223,13 +328,19 @@ def main() -> None:
         revision=inputs["dataset_revision"],
     )
 
-    conditions = (
-        "no_memory",
-        "matched_text",
-        "shuffled_text",
+    reference_conditions = (
+        "e1b_full_no_memory",
+        "e1b_full_matched_text",
+        "e1b_full_shuffled_text",
+    )
+    primary_conditions = (
+        "split_no_memory",
+        "split_matched_text",
+        "split_shuffled_text",
         "matched_persistent_side_kv",
         "shuffled_persistent_side_kv",
     )
+    conditions = reference_conditions + primary_conditions
     args.output_dir.mkdir(parents=True, exist_ok=True)
     results_path = args.output_dir / "results.jsonl"
     output_records: list[dict[str, Any]] = []
@@ -246,21 +357,114 @@ def main() -> None:
                 base_prompt_ids = prompt_token_ids(
                     tokenizer, question=question, memory_text=None
                 )
-                if canonical_json_sha256(base_prompt_ids) != (
-                    assignment.base_prompt_token_ids_sha256
+                if (
+                    len(base_prompt_ids) != assignment.base_prompt_token_count
+                    or canonical_json_sha256(base_prompt_ids)
+                    != assignment.base_prompt_token_ids_sha256
                 ):
                     raise ValueError(f"Base prompt drift for {assignment.sample_id}")
                 previous = e1b_by_sample[assignment.sample_id]
-                split_vanilla_ids = runtime.generate_prompt_split_vanilla(
-                    base_prompt_ids
-                )
-                prompt_split_no_memory_parity = split_vanilla_ids == (
-                    assignment.preanswer_completion_token_ids
-                )
                 condition_rows = {
-                    name: previous["conditions"][name]
-                    for name in ("no_memory", "matched_text", "shuffled_text")
+                    "e1b_full_no_memory": _reference_condition(
+                        previous, "no_memory"
+                    ),
+                    "e1b_full_matched_text": _reference_condition(
+                        previous, "matched_text"
+                    ),
+                    "e1b_full_shuffled_text": _reference_condition(
+                        previous, "shuffled_text"
+                    ),
                 }
+
+                started = time.perf_counter()
+                split_no_memory = runtime.generate_prompt_split(
+                    base_prompt_ids, audit_full_prefill=True
+                )
+                split_no_memory_seconds = time.perf_counter() - started
+                split_no_memory_repeat = runtime.generate_prompt_split(
+                    base_prompt_ids, audit_full_prefill=False
+                )
+                condition_rows["split_no_memory"] = score_completion(
+                    tokenizer=tokenizer,
+                    completion_token_ids=split_no_memory.completion_token_ids,
+                    ground_truth=ground_truth,
+                    runtime_seconds=split_no_memory_seconds,
+                    prompt_token_count=len(base_prompt_ids),
+                )
+                condition_rows["split_no_memory"]["prefill_path"] = (
+                    SPLIT_PREFILL_PATH
+                )
+                prefill_diagnostics: dict[str, Any] = {
+                    "no_memory": {
+                        "full_e1b_vs_split_tokens": token_sequence_diagnostic(
+                            assignment.preanswer_completion_token_ids,
+                            split_no_memory.completion_token_ids,
+                        ),
+                        "full_vs_split_first_step_logits": _first_step_diagnostic(
+                            split_no_memory.full_prefill_diagnostic
+                        ),
+                    },
+                    "split_no_memory_repeat": token_sequence_diagnostic(
+                        split_no_memory.completion_token_ids,
+                        split_no_memory_repeat.completion_token_ids,
+                    ),
+                }
+
+                for label, choice in (
+                    ("matched", assignment.matched_memory),
+                    ("shuffled", assignment.shuffled_memory),
+                ):
+                    assert choice is not None
+                    memory_record = memory_by_id[choice.memory_id]
+                    if (
+                        memory_record.payload_hash != choice.payload_hash
+                        or memory_record.token_count != choice.token_count
+                    ):
+                        raise ValueError(
+                            f"Text memory metadata drift for {choice.memory_id}"
+                        )
+                    memory_text = render_single_experience(memory_record)
+                    treatment_prompt_ids = prompt_token_ids(
+                        tokenizer, question=question, memory_text=memory_text
+                    )
+                    previous_text = previous["conditions"][f"{label}_text"]
+                    if (
+                        previous_text.get("prompt_token_ids_sha256")
+                        != canonical_json_sha256(treatment_prompt_ids)
+                    ):
+                        raise ValueError(
+                            f"E1-B {label} text prompt drift for {assignment.sample_id}"
+                        )
+                    started = time.perf_counter()
+                    split_text = runtime.generate_prompt_split(
+                        treatment_prompt_ids, audit_full_prefill=True
+                    )
+                    elapsed = time.perf_counter() - started
+                    condition_name = f"split_{label}_text"
+                    condition_rows[condition_name] = score_completion(
+                        tokenizer=tokenizer,
+                        completion_token_ids=split_text.completion_token_ids,
+                        ground_truth=ground_truth,
+                        runtime_seconds=elapsed,
+                        prompt_token_count=len(treatment_prompt_ids),
+                        memory_ids=(choice.memory_id,),
+                    )
+                    condition_rows[condition_name]["prompt_token_ids_sha256"] = (
+                        canonical_json_sha256(treatment_prompt_ids)
+                    )
+                    condition_rows[condition_name]["prefill_path"] = (
+                        SPLIT_PREFILL_PATH
+                    )
+                    prefill_diagnostics[f"{label}_text"] = {
+                        "full_e1b_vs_split_tokens": token_sequence_diagnostic(
+                            previous_text["completion_token_ids"],
+                            split_text.completion_token_ids,
+                        ),
+                        "full_vs_split_first_step_logits": _first_step_diagnostic(
+                            split_text.full_prefill_diagnostic
+                        ),
+                    }
+
                 for condition, choice in (
                     ("matched_persistent_side_kv", assignment.matched_memory),
                     ("shuffled_persistent_side_kv", assignment.shuffled_memory),
@@ -286,6 +490,11 @@ def main() -> None:
                         controller=controller,
                     )
                     elapsed = time.perf_counter() - started
+                    baseline_first_token_matches = bool(
+                        split_no_memory.completion_token_ids
+                        and generated.baseline_first_token_id
+                        == split_no_memory.completion_token_ids[0]
+                    )
                     trace = compact_trace_artifact(
                         generated.attention_traces,
                         completion_length=len(generated.completion_token_ids),
@@ -296,6 +505,10 @@ def main() -> None:
                             generated.first_step_logits_kl
                         ),
                         "first_step_top1_changed": generated.first_step_top1_changed,
+                        "baseline_first_token_id": generated.baseline_first_token_id,
+                        "baseline_first_token_matches_split_no_memory": (
+                            baseline_first_token_matches
+                        ),
                     })
                     condition_rows[condition] = score_completion(
                         tokenizer=tokenizer,
@@ -306,6 +519,12 @@ def main() -> None:
                         memory_ids=(choice.memory_id,),
                         side_kv=trace,
                     )
+                    condition_rows[condition]["prefill_path"] = SPLIT_PREFILL_PATH
+                    label = condition.split("_", 1)[0]
+                    prefill_diagnostics[
+                        f"{label}_side_kv_baseline_first_token_matches_split_no_memory"
+                    ] = baseline_first_token_matches
+
                 record = {
                     "schema_version": E1C_RESULTS_SCHEMA,
                     "sample_id": assignment.sample_id,
@@ -313,11 +532,10 @@ def main() -> None:
                     "question_sha256": assignment.question_sha256,
                     "assignment_manifest_sha256": manifest["manifest_sha256"],
                     "e1b_result_sha256": canonical_json_sha256(previous),
-                    "prompt_split_no_memory_parity": (
-                        prompt_split_no_memory_parity
-                    ),
                     "matched_memory": assignment.matched_memory.to_dict(),
                     "shuffled_memory": assignment.shuffled_memory.to_dict(),
+                    "primary_prefill_path": SPLIT_PREFILL_PATH,
+                    "prefill_path_diagnostics": prefill_diagnostics,
                     "conditions": condition_rows,
                 }
                 handle.write(
@@ -337,14 +555,14 @@ def main() -> None:
     paired_diagnostics = diagnostic_builder.summarize(
         (
             PairedConditionComparison(
-                "matched_side_kv_vs_no_memory",
+                "matched_side_kv_vs_split_no_memory",
                 "matched_persistent_side_kv",
-                "no_memory",
+                "split_no_memory",
             ),
             PairedConditionComparison(
-                "shuffled_side_kv_vs_no_memory",
+                "shuffled_side_kv_vs_split_no_memory",
                 "shuffled_persistent_side_kv",
-                "no_memory",
+                "split_no_memory",
             ),
             PairedConditionComparison(
                 "matched_side_kv_vs_shuffled_side_kv",
@@ -352,20 +570,32 @@ def main() -> None:
                 "shuffled_persistent_side_kv",
             ),
             PairedConditionComparison(
-                "matched_side_kv_vs_matched_text",
+                "matched_side_kv_vs_split_matched_text",
                 "matched_persistent_side_kv",
-                "matched_text",
+                "split_matched_text",
             ),
             PairedConditionComparison(
-                "matched_text_vs_no_memory", "matched_text", "no_memory"
+                "split_matched_text_vs_split_no_memory",
+                "split_matched_text",
+                "split_no_memory",
+            ),
+            PairedConditionComparison(
+                "split_shuffled_text_vs_split_no_memory",
+                "split_shuffled_text",
+                "split_no_memory",
+            ),
+            PairedConditionComparison(
+                "split_matched_text_vs_split_shuffled_text",
+                "split_matched_text",
+                "split_shuffled_text",
             ),
         )
     )
     accuracy_effects = paired_diagnostics["accuracy_effects"]
     format_effects = paired_diagnostics["format_effects"]
     format_transfer = format_transfer_diagnostic(
-        text_effect=format_effects["matched_text_vs_no_memory"],
-        side_kv_effect=format_effects["matched_side_kv_vs_no_memory"],
+        text_effect=format_effects["split_matched_text_vs_split_no_memory"],
+        side_kv_effect=format_effects["matched_side_kv_vs_split_no_memory"],
     )
     exact_slot_sample_ids = {
         assignment.sample_id
@@ -412,7 +642,7 @@ def main() -> None:
             "shuffled_persistent_side_kv",
         )
     ]
-    mechanism_passed = all(
+    side_trace_invariants_passed = all(
         row[requirement]
         for row in side_rows
         for requirement in (
@@ -422,27 +652,44 @@ def main() -> None:
             "memory_id_constant",
             "memory_slot_count_constant",
             "normalization_constant",
+            "baseline_first_token_matches_split_no_memory",
         )
-    ) and all(
-        record["prompt_split_no_memory_parity"] for record in output_records
+    )
+    split_repeat_deterministic = all(
+        record["prefill_path_diagnostics"]["split_no_memory_repeat"]["exact_match"]
+        for record in output_records
+    )
+    primary_path_integrity = all(
+        record["primary_prefill_path"] == SPLIT_PREFILL_PATH
+        and all(
+            record["conditions"][condition]["prefill_path"] == SPLIT_PREFILL_PATH
+            for condition in primary_conditions
+        )
+        for record in output_records
+    )
+    mechanism_passed = (
+        side_trace_invariants_passed
+        and split_repeat_deterministic
+        and primary_path_integrity
     )
     acceptance = {
         "persistent_side_kv_mechanism_integrity": mechanism_passed,
-        "matched_side_kv_accuracy_above_no_memory": effect_is_positive(
-            accuracy_effects["matched_side_kv_vs_no_memory"]
+        "matched_side_kv_accuracy_above_split_no_memory": effect_is_positive(
+            accuracy_effects["matched_side_kv_vs_split_no_memory"]
         ),
         "matched_side_kv_accuracy_above_shuffled": effect_is_positive(
             accuracy_effects["matched_side_kv_vs_shuffled_side_kv"]
         ),
-        "matched_side_kv_format_not_below_no_memory": (
+        "matched_side_kv_format_not_below_split_no_memory": (
             float(
-                format_effects["matched_side_kv_vs_no_memory"][
+                format_effects["matched_side_kv_vs_split_no_memory"][
                     "mean_treatment_minus_control"
                 ]
             )
             >= 0.0
         ),
     }
+    prefill_summary = _summarize_prefill_path_diagnostics(output_records)
     summary = {
         "schema_version": E1C_SUMMARY_SCHEMA,
         "created_at": utc_now(),
@@ -450,6 +697,10 @@ def main() -> None:
         "formal_e1c_passed": all(acceptance.values()),
         "source_e1b_formal_passed": source_e1b_formal_passed,
         "sample_count": len(output_records),
+        "condition_roles": {
+            "cross_stage_references": list(reference_conditions),
+            "same_path_primary_conditions": list(primary_conditions),
+        },
         "conditions": condition_summary,
         "accuracy_effects": accuracy_effects,
         "diagnostic_answer_effects": paired_diagnostics[
@@ -469,13 +720,14 @@ def main() -> None:
             "persistent_side_kv_mechanism_passed": mechanism_passed,
             "formal_task_pass_required_for_diagnostic": False,
         },
+        "prefill_path_diagnostics": prefill_summary,
         "mechanism_diagnostics": {
             "normalization": E1C_MEMORY_SCORE_NORMALIZATION,
+            "primary_prefill_path": SPLIT_PREFILL_PATH,
             "all_runtime_invariants_passed": mechanism_passed,
-            "prompt_split_no_memory_parity_count": sum(
-                record["prompt_split_no_memory_parity"]
-                for record in output_records
-            ),
+            "side_trace_invariants_passed": side_trace_invariants_passed,
+            "split_no_memory_repeat_deterministic": split_repeat_deterministic,
+            "primary_path_integrity": primary_path_integrity,
             "mean_matched_memory_attention_mass": sum(
                 record["conditions"]["matched_persistent_side_kv"]["side_kv"][
                     "mean_memory_attention_mass"
@@ -517,7 +769,7 @@ def main() -> None:
     }
     write_json(args.output_dir / "e1c_summary.json", summary)
     write_json(args.output_dir / "run_report.json", {
-        "schema_version": "experience-memory-e1c-run-report-v1",
+        "schema_version": "experience-memory-e1c-run-report-v2",
         "created_at": utc_now(),
         "status": "completed",
         "sample_count": len(output_records),
@@ -526,6 +778,7 @@ def main() -> None:
             "e1b_results_sha256": file_sha256(args.e1b_results),
             "e1b_run_report_sha256": file_sha256(args.e1b_run_report),
             "e1b_summary_sha256": file_sha256(args.e1b_summary),
+            "memory_records_sha256": file_sha256(args.memory_records),
             "side_kv_manifest_sha256": file_sha256(args.side_kv_manifest),
             "split_manifest_sha256": file_sha256(args.split_manifest),
         },
