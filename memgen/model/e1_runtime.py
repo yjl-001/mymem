@@ -1,4 +1,4 @@
-"""Runtime primitives for the E1 observation and one-shot side-KV branches."""
+"""Runtime primitives for E1 observation and persistent side-KV branches."""
 
 from __future__ import annotations
 
@@ -210,11 +210,14 @@ class ObservationRolloutResult:
 
 
 @dataclass(frozen=True)
-class MemoryContinuationResult:
+class TriggeredPersistentMemoryGenerationResult:
+    """Frozen-prefix continuation with memory visible from trigger to EOS."""
+
     completion_token_ids: tuple[int, ...]
-    attention_trace: SideKVAttentionTrace
+    attention_traces: tuple[SideKVAttentionTrace, ...]
     first_step_logits_kl: float
     first_step_top1_changed: bool
+    baseline_first_token_id: int
 
 
 @dataclass(frozen=True)
@@ -452,14 +455,16 @@ class GreedyE1Runtime:
         )
 
     @torch.inference_mode()
-    def generate_with_memory(
+    def generate_from_trigger_with_persistent_memory(
         self,
         *,
         prefix_token_ids: Sequence[int],
         prompt_token_count: int,
         memory: SideKVMemory,
         controller: SideKVAttentionController,
-    ) -> MemoryContinuationResult:
+    ) -> TriggeredPersistentMemoryGenerationResult:
+        """Replay a frozen trigger prefix and keep memory active through EOS."""
+
         prefix = list(prefix_token_ids)
         if prompt_token_count <= 0 or len(prefix) <= prompt_token_count:
             raise ValueError("Treatment prefix must contain partial reasoning")
@@ -494,38 +499,51 @@ class GreedyE1Runtime:
                 use_cache=True,
                 return_dict=True,
             )
-        if len(controller.traces) != 1:
-            raise RuntimeError("One-shot E1 injection expected one attention trace")
-        baseline_logits = baseline.logits[:, -1, :]
-        treatment_logits = treatment.logits[:, -1, :]
-        first_token = int(treatment_logits.argmax(dim=-1).item())
-        ids = prefix + [first_token]
-        past = treatment.past_key_values
-        eos = self.tokenizer.eos_token_id
-        remaining = self.max_new_tokens - partial_length - 1
-        if eos is None or first_token != eos:
-            for _ in range(remaining):
-                full = self._tensor(ids)
-                output = self.model(
-                    input_ids=full[:, -1:],
-                    attention_mask=torch.ones_like(full),
-                    past_key_values=past,
-                    use_cache=True,
-                    return_dict=True,
-                )
-                next_token = int(output.logits[:, -1, :].argmax(dim=-1).item())
-                ids.append(next_token)
-                past = output.past_key_values
-                if eos is not None and next_token == eos:
-                    break
-        return MemoryContinuationResult(
+            baseline_logits = baseline.logits[:, -1, :]
+            treatment_logits = treatment.logits[:, -1, :]
+            first_token = int(treatment_logits.argmax(dim=-1).item())
+            ids = prefix + [first_token]
+            past = treatment.past_key_values
+            eos = self.tokenizer.eos_token_id
+            remaining = self.max_new_tokens - partial_length - 1
+            if eos is None or first_token != eos:
+                for _ in range(remaining):
+                    full = self._tensor(ids)
+                    output = self.model(
+                        input_ids=full[:, -1:],
+                        attention_mask=torch.ones_like(full),
+                        past_key_values=past,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                    next_token = int(output.logits[:, -1, :].argmax(dim=-1).item())
+                    ids.append(next_token)
+                    past = output.past_key_values
+                    if eos is not None and next_token == eos:
+                        break
+
+        traces = controller.traces
+        generated_after_trigger = len(ids) - len(prefix)
+        expected_native_lengths = tuple(
+            len(prefix) + index for index in range(generated_after_trigger)
+        )
+        if len(traces) != generated_after_trigger:
+            raise RuntimeError(
+                "Triggered persistent side-KV requires one trace per new token"
+            )
+        if tuple(trace.native_key_length for trace in traces) != expected_native_lengths:
+            raise RuntimeError("Triggered persistent native cache length drifted")
+        if any(trace.memory_id != memory.memory_id for trace in traces):
+            raise RuntimeError("Triggered persistent memory ID changed during generation")
+        return TriggeredPersistentMemoryGenerationResult(
             completion_token_ids=tuple(ids[prompt_token_count:]),
-            attention_trace=controller.traces[0],
+            attention_traces=traces,
             first_step_logits_kl=logits_kl(baseline_logits, treatment_logits),
             first_step_top1_changed=bool(
                 baseline_logits.argmax(dim=-1).item()
                 != treatment_logits.argmax(dim=-1).item()
             ),
+            baseline_first_token_id=int(baseline_logits.argmax(dim=-1).item()),
         )
 
     @torch.inference_mode()

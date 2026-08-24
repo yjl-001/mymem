@@ -42,8 +42,8 @@ online prompt + partial CoT ──► reasoning boundary ──► entropy-risk 
 
 layer 24 已由 E0 固定。原先“首次满足 trigger 时单步附加一条 memory”的 E1-v1 已完成诊断但未产生
 任务收益；后续不再把经验内容、检索、表示通道和 gate 时机捆绑验证。E1-A/B/C 分别冻结经验目录、
-BM25 assignment 和 persistent side-KV 接口，E1-D 才恢复 gate。任何配置都不得用 `final-test`
-accuracy 调整。
+BM25 assignment 和 persistent side-KV 接口。E1-D 的 gate 完整链路已作为工程骨架实现，但只有上游
+组件取得正证据后才允许优化 gate 或解释其效果。任何配置都不得用 `final-test` accuracy 调整。
 
 ## 3. 数据、质量与反泄漏约束
 
@@ -152,7 +152,7 @@ retriever 或 side-KV。
 | `E1-A` | 无 retriever/gate；同一份 2048-token k-medoids 代表经验目录追加到所有题 | Phase 1 经验集合整体是否包含模型可利用的信息？ |
 | `E1-B` | no-memory 首次完整回答只用于 `question + sanitized preanswer` query；BM25 top-1 文本重答 | 检索到的经验是否优于 shuffled 和 no-memory？ |
 | `E1-C` | 原样复用 E1-B memory IDs；prompt-end persistent side-KV 与相同 ID 的文本条件比较 | side-KV 是否保留了经验内容的作用？ |
-| `E1-D` | 仅在 A/B/C 通过后恢复 entropy+risk gate | 风险 gate 是否提供更好的开始时机？ |
+| `E1-D` | 工程上连接 entropy+risk gate、在线 BM25 与 persistent side-KV；效果优化仍需 A/B/C 正证据 | 完整系统是否可审计运行，未来 gate 是否提供更好的开始时机？ |
 
 E1-A 的 medoid 必须是真实 MemoryRecord，不使用生成式聚类总结；随机 bank 使用三个预注册种子且与
 代表 bank 等条数、近似等 token budget。E1-B 的第一次回答不进入第二次 prompt，assignment 阶段不
@@ -185,6 +185,11 @@ E1-C v3 的同路径机制已经通过：split no-memory 重复一致、side-KV 
 区间为 `[0.05, 0.25]`，只新增强 side-KV 两个条件并复用 E1-C/E1C-T 的冻结对照。若机制、mass 区间或
 matched 格式效应传递任一失败，则停止当前 layer-24 canonical side-KV 通道，不继续调 layer/强度。
 
+E1C-S 实际满足机制与 attention 区间，但 matched/shuffled side-KV 格式准确率 `0.30/0.28` 均未复现
+payload-only text 的 `0.63/0.61`；matched 相对 no-memory 的格式差为 `-0.02`。因此当前通道的效果
+路线已经停止。为便于后续模块化重构，E1-D 完整系统骨架仍已实现，固定使用 reference profile 执行
+gate→BM25→persistent side-KV，并只报告工程/机制完整性，不据此恢复 gate 优化或任务收益声明。
+
 每个阶段都包含 no-memory 与错配/随机对照并使用 sample-level paired 统计。具体 manifest、条件、
 机制不变量和停止规则见 [E1 设计](e1_experience_memory_design.md)。
 
@@ -198,7 +203,7 @@ matched 格式效应传递任一失败，则停止当前 layer-24 canonical side
 
 该实验回答失败经验是否为成功策略提供额外 guardrail；它不重新测试 residual vector。
 
-### E3：风险触发时机的贡献（对应 E1-D，仅 E1-A/B/C 通过后）
+### E3：风险触发时机的贡献（E1-D 骨架已实现，效果检验仍仅在 E1-A/B/C 通过后）
 
 同一条 matched memory 分别在风险 gate 的首次触发 boundary 与同生成内的确定性随机 delimiter
 附加。两组的 memory、预算和生成条件相同。该实验回答高熵+risk 是否提供了有价值的访问时机。
@@ -231,10 +236,12 @@ side_kv_applied, generation_length, final_reward, format_reward, output_path
 
 E0 已完成并冻结；E1-v1 已完成且当前组合未通过。E1-A 和 E1-B 首轮 `calibration-val` 已完成：格式行为
 给出经验可消费性的正证据，但经验数学内容与 BM25 选择能力均未正式通过。E1-C v3 已确认机制正确但
-normalized side-KV 未传递文本格式效应；E1C-T 已把该正效应定位到 payload，而非 wrapper。当前只运行
-一次预注册的 E1C-S `+log(10)` memory-odds 组件诊断，原样复用 E1-B assignment、E1-C v3、E1C-T 和
-E0 side-KV bank。不得用结果调整 bias、layer、memory 数量或 gate。在经验库生成策略与语义检索收益得到
-新的证据前，不把组件结果外推为完整方法的任务收益，也不进入独立确认。
+normalized side-KV 未传递文本格式效应；E1C-T 已把该正效应定位到 payload，而 E1C-S 进一步确认提高
+attention 强度仍不能传递该行为。完整 E1-D 系统现已工程实现，包括一遍在线接口和冻结四条件评测接口；
+它使用版本化 reference profile，不接受环境变量调参。下一阶段从经验抽象开始逐模块优化。在经验库生成
+策略、语义检索和表示通道重新得到正证据前，不优化 gate，不把完整系统结果外推为方法收益，也不进入
+独立确认。
 
-在 E1-A/B/C 得到逐组件证据前，不实现 gate timing、不扩展 memory 数量、不搜索 layer/注入强度，
-不进入 E2/E3 或 `final-test`。
+在 E1-A/B/C 得到逐组件证据前，不优化 gate timing、不扩展 memory 数量、不搜索 layer/注入强度，
+不进入正式 E2/E3 效果检验或 `final-test`。完整系统骨架见
+[实现文档](experience_memory_full_system.md)。

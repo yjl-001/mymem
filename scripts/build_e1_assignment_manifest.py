@@ -23,7 +23,7 @@ from memgen.experience.e1 import (
     MatchedMemoryDeranger,
     MemoryChoice,
 )
-from memgen.experience.memory import MemoryRecord, MemoryRecordRejected
+from memgen.experience.memory import MemoryRecord
 from memgen.experience.phase1 import (
     canonical_json_sha256,
     file_sha256,
@@ -35,7 +35,15 @@ from memgen.experience.phase2 import (
     STEERING_VECTOR_ARTIFACT_SCHEMA,
     build_gsm8k_messages,
 )
-from memgen.experience.retrieval import BM25MemoryIndex, RetrievalQueryBuilder
+from memgen.experience.retrieval import (
+    BM25MemoryIndex,
+    RetrievalQueryBuilder,
+    RetrievalQueryConfig,
+)
+from memgen.experience.system import (
+    ExperienceMemorySystemProfile,
+    SemanticMemoryRetriever,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--logical-split",
         choices=("calibration-val", "dev-test"),
-        default="dev-test",
+        default="calibration-val",
     )
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=100)
@@ -113,10 +121,22 @@ def main() -> None:
     from memgen.model.e1_runtime import EntropyRiskGate, GreedyE1Runtime
 
     e0_final = json.loads(args.e0_final_report.read_text(encoding="utf-8"))
+    expected_e0_hash = e0_final.get("final_report_sha256")
+    actual_e0_hash = canonical_json_sha256({
+        key: value
+        for key, value in e0_final.items()
+        if key != "final_report_sha256"
+    })
+    if expected_e0_hash != actual_e0_hash:
+        raise ValueError("E0 final report hash mismatch")
     if e0_final.get("status") != "passed" or e0_final.get("formal_e0_passed") is not True:
         raise ValueError("E1 requires a formally passed E0 artifact set")
     if e0_final.get("task_accuracy_used") is not False:
         raise ValueError("E0 artifact does not prove answer-blind mechanism qualification")
+    if not e0_final.get("requirements") or not all(
+        value is True for value in e0_final["requirements"].values()
+    ):
+        raise ValueError("E0 final report contains an unmet mechanism requirement")
 
     split_manifest = load_hashed_manifest(args.split_manifest)
     if not split_manifest.get("overlap_check", {}).get("passed"):
@@ -149,8 +169,9 @@ def main() -> None:
     )
     if expected_side_hash != actual_side_hash:
         raise ValueError("Side-KV manifest hash mismatch")
-    if int(side_manifest.get("layer_number", -1)) != 24:
-        raise ValueError("E1-v1 is frozen to side-KV layer 24")
+    profile = ExperienceMemorySystemProfile()
+    if int(side_manifest.get("layer_number", -1)) != profile.layer_number:
+        raise ValueError("System profile and side-KV layer differ")
     side_entries = {
         str(item["memory_id"]): item for item in side_manifest.get("records", [])
     }
@@ -175,8 +196,8 @@ def main() -> None:
     ):
         raise ValueError("Entropy-risk artifact did not pass held-out qualification")
     gate = EntropyRiskGate.from_artifact(risk_artifact)
-    if gate.config.layer_number != 24:
-        raise ValueError("E1 gate and side-KV must both use layer 24")
+    if gate.config.layer_number != profile.layer_number:
+        raise ValueError("System gate and side-KV must use the same layer")
 
     reasoner = side_manifest.get("reasoner", {})
     model_name = str(reasoner.get("model_name", ""))
@@ -204,7 +225,7 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         revision=model_revision,
-        torch_dtype=dtype,
+        dtype=dtype,
         attn_implementation="eager",
     ).to(args.device)
     model.eval()
@@ -230,6 +251,18 @@ def main() -> None:
     query_builder = RetrievalQueryBuilder(
         tokenizer=tokenizer,
         analyzer=bm25.analyzer,
+        config=RetrievalQueryConfig(
+            partial_cot_window_tokens=profile.partial_cot_window_tokens
+        ),
+    )
+    retriever = SemanticMemoryRetriever(
+        index=bm25,
+        query_builder=query_builder,
+        kv_valid_slot_counts={
+            memory_id: int(entry["kv_valid_slot_count"])
+            for memory_id, entry in side_entries.items()
+        },
+        profile=profile,
     )
     runtime = GreedyE1Runtime(
         model=model,
@@ -255,49 +288,13 @@ def main() -> None:
             abstain_reason = "no_joint_entropy_risk_trigger"
         else:
             completion_prefix = observation.prefix_token_ids[len(prompt_ids) :]
-            try:
-                query = query_builder.build(
-                    question=question,
-                    partial_cot_token_ids=completion_prefix,
-                )
-                hits = bm25.search(query.query_text, top_k=2)
-                retrieval_query = query.to_dict(include_text=False)
-                retrieval_query.update(
-                    {
-                        "method": "bm25",
-                        "top_k_requested": 2,
-                        "top1_score": hits[0].score if hits else None,
-                        "top2_score": hits[1].score if len(hits) > 1 else None,
-                        "top1_top2_margin": (
-                            hits[0].score - hits[1].score
-                            if len(hits) > 1
-                            else None
-                        ),
-                    }
-                )
-            except MemoryRecordRejected as exc:
-                hits = []
-                retrieval_query = {
-                    "method": "bm25",
-                    "status": "rejected",
-                    "reasons": list(exc.reasons),
-                }
-            if hits:
-                top = hits[0]
-                side_entry = side_entries[top.memory_id]
-                matched = MemoryChoice(
-                    memory_id=top.memory_id,
-                    payload_hash=top.payload_hash,
-                    token_count=top.token_count,
-                    kv_valid_slot_count=int(
-                        side_entry["kv_valid_slot_count"]
-                    ),
-                    retrieval_score=float(top.score),
-                    retrieval_rank=top.rank,
-                )
-                abstain_reason = None
-            else:
-                abstain_reason = "retrieval_has_no_positive_bm25_hit"
+            decision = retriever.retrieve(
+                question=question,
+                partial_cot_token_ids=completion_prefix,
+            )
+            retrieval_query = decision.to_dict()
+            matched = decision.matched_memory
+            abstain_reason = decision.abstain_reason
         assignment = E1Assignment(
             sample_id=str(sample["sample_id"]),
             logical_split=args.logical_split,
@@ -351,7 +348,7 @@ def main() -> None:
             "model_name": model_name,
             "model_revision": model_revision,
             "tokenizer_revision": tokenizer_revision,
-            "layer": 24,
+            "layer": profile.layer_number,
             "dtype": args.dtype,
             "attention_implementation": "eager",
         },
@@ -364,16 +361,20 @@ def main() -> None:
                 side_manifest["tensor_shape"]["keys"][2]
             ),
             "gate": gate.config_dict,
+            "system_profile": profile.to_dict(),
             "retrieval": {
                 "method": "bm25",
-                "top_k_assignment": 1,
-                "top_k_diagnostic": 2,
+                "top_k_assignment": profile.selected_memory_count,
+                "top_k_diagnostic": profile.retrieval_top_k,
                 "query": asdict(query_builder.config),
                 "analyzer": asdict(bm25.analyzer.config),
                 "bm25": asdict(bm25.config),
             },
             "shuffle": shuffle_report,
-            "injection_policy": "first_joint_trigger_one_memory_once",
+            "injection_policy": profile.injection_policy,
+            "assignment_policy": (
+                "observation_only_gate_and_retrieval_then_frozen_replay"
+            ),
         },
         "inputs": {
             "split_manifest_path": str(args.split_manifest.resolve()),
@@ -410,7 +411,7 @@ def main() -> None:
         "assignment_build_report.json"
     )
     report = {
-        "schema_version": "experience-memory-e1-assignment-build-report-v1",
+        "schema_version": "experience-memory-e1-assignment-build-report-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed",
         "answer_or_reward_used": False,

@@ -85,6 +85,13 @@ from memgen.experience.e1_staged import (
     render_single_experience_guidance,
     render_single_experience_payload,
 )
+from memgen.experience.system import (
+    EXPERIENCE_MEMORY_SYSTEM_PROFILE_SCHEMA,
+    SEMANTIC_RETRIEVAL_DECISION_SCHEMA,
+    ExperienceMemorySystemProfile,
+    SemanticMemoryRetriever,
+    SemanticRetrievalDecision,
+)
 
 __all__ = [
     "TEACHER_BANK_REQUIRED_FIELDS",
@@ -160,4 +167,9 @@ __all__ = [
     "render_single_experience",
     "render_single_experience_guidance",
     "render_single_experience_payload",
+    "EXPERIENCE_MEMORY_SYSTEM_PROFILE_SCHEMA",
+    "SEMANTIC_RETRIEVAL_DECISION_SCHEMA",
+    "ExperienceMemorySystemProfile",
+    "SemanticMemoryRetriever",
+    "SemanticRetrievalDecision",
 ]

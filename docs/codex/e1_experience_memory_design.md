@@ -312,19 +312,32 @@ shuffled 是否同样传递用于判断该效应是通用 payload 行为还是 m
 3. 格式效应传递且无显著 answer harm：记录 channel capacity，下一步回到经验抽象与检索设计；在数学
    内容和 matched 选择收益成立前仍不恢复 gate。
 
-## 6. E1-D：gate 时机（暂不实现）
+E1C-S 的 100 条 `calibration-val` 结果已经完成。matched/shuffled mean attention mass 为
+`0.0841/0.0832`，均在目标区间，cache/prefill/trace 不变量全部通过；但格式准确率只有 `0.30/0.28`，
+低于 no-memory 的 `0.32`，更显著低于 payload-only text 的 `0.63/0.61`。matched 相对 no-memory 的
+格式差为 `-0.02`，CI `[-0.12, 0.08]`；matched 相对 shuffled 的格式差 `+0.02`，CI 跨零。系统因此
+输出 `no_payload_effect_transfer_at_fixed_strength` 和 `stop_current_layer24_side_kv_channel`。这关闭当前
+表示通道的效果调参路线，但不妨碍把它保留为完整系统骨架中的已知弱基线。
 
-只有 E1-A、E1-B、E1-C 均给出正证据后，才恢复 entropy+risk gate，比较 prompt-end persistent 与
-completion 中触发后的 persistent side path。E1-D 只优化“何时开始可见”，不得重新选择 memory ID、
-改变 payload 或 side-KV normalization。
+## 6. E1-D：完整系统骨架与 gate 时机
+
+为支持后续逐模块优化，E1-D 的工程链路已经完整实现：在线 entropy+risk gate、`question + partial CoT`
+BM25、top-1 MemoryRecord、触发后 persistent side-KV，以及冻结 prefix 的 matched/shuffled/no-memory
+因果评测。当前 reference profile 使用 E1C-S 的 `log_valid_slots + log(10)`，确保 channel 具有非平凡
+attention；这不推翻 E1C-S 的负结论，也不表示该强度被接受为有效方法配置。
+
+科学上仍不允许用 E1-D 调 gate 阈值或声明 gate 收益：E1-A/B 的数学内容与检索区分度未通过，E1C-S 又
+没有证明当前 side-KV 能传递 payload 行为。当前 E1-D 只证明整个系统可以执行并产生完整审计 artifact。
+后续必须先逐模块获得正证据，最后才能比较 prompt-end 与风险触发时机。实现接口、在线/冻结执行语义和
+服务器命令见 [完整系统文档](experience_memory_full_system.md)。
 
 ## 7. 数据使用与停止规则
 
 1. 已运行的 `dev-test` 前 100 条 E1-v1 仅作为诊断，不再用于配置选择或独立确认；
 2. E1-A/B/C 首先在 `calibration-val` 完成机制与方向验证；
 3. 配置冻结后，只在未触碰的 `dev-test` offset 100 之后做一次确认；
-4. 任一阶段未通过预注册任务判据，记录正式状态；已有有效机制正对照时可以继续下游组件诊断，但不得据此
-   进入 E1-D、final-test 或声称完整方法获得任务收益；
+4. 任一阶段未通过预注册任务判据，记录正式状态；可以执行 E1-D 工程完整性诊断，但不得据此优化 gate、
+   进入 final-test 或声称完整方法获得任务收益；
 5. 全过程不运行 `final-test`，不新增 Teacher/Pro 调用，不恢复 residual-vector 路线。
 
 ## 8. 服务器执行顺序

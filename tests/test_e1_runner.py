@@ -80,9 +80,13 @@ class E1RunnerConfigurationTests(unittest.TestCase):
             self.assertEqual(parsed["model_revision"], "model-revision")
             self.assertEqual(parsed["tokenizer_revision"], "tokenizer-revision")
             self.assertEqual(parsed["dataset_revision"], "dataset-revision")
-            self.assertEqual(parsed["logical_split"], "dev-test")
+            self.assertEqual(parsed["logical_split"], "calibration-val")
             self.assertEqual(parsed["limit"], "8")
             self.assertEqual(parsed["cuda_visible_devices"], "2")
+            self.assertEqual(
+                parsed["system_profile"],
+                "layer24-bm25-top1-gate-persistent-logslots-log10-v1",
+            )
 
 
 if __name__ == "__main__":

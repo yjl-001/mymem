@@ -20,6 +20,7 @@ from memgen.experience.e1_staged import (
     render_single_experience_payload,
 )
 from memgen.experience.phase1 import canonical_json_sha256
+from memgen.experience.system import ExperienceMemorySystemProfile
 from scripts.e1_staged_common import (
     PairedConditionComparison,
     PairedConditionDiagnostics,
@@ -32,6 +33,7 @@ from scripts.e1_staged_common import (
 )
 from scripts.evaluate_e1c_side_kv_channel import compact_trace_artifact
 from scripts.evaluate_e1cs_fixed_strength import FixedStrengthTraceAuditor
+from scripts.evaluate_e1_experience_memory import compact_persistent_trace
 
 
 @dataclass(frozen=True)
@@ -218,6 +220,37 @@ class E1BRetrievalAssignmentTests(unittest.TestCase):
 
 
 class PersistentTraceArtifactTests(unittest.TestCase):
+    def test_triggered_persistent_trace_covers_every_post_gate_token(self) -> None:
+        profile = ExperienceMemorySystemProfile()
+        traces = tuple(
+            SimpleNamespace(
+                native_key_length=30 + index,
+                memory_attention_mass=0.08,
+                memory_id="memory-a",
+                memory_slot_count=12,
+                memory_score_normalization="log_valid_slots",
+                memory_score_bias=profile.memory_score_bias,
+            )
+            for index in range(4)
+        )
+        artifact = compact_persistent_trace(
+            traces,
+            completion_length=9,
+            prefix_length=30,
+            prompt_token_count=25,
+            expected_memory_id="memory-a",
+            expected_slot_count=12,
+            expected_baseline_first_token_id=7,
+            actual_baseline_first_token_id=7,
+            profile=profile,
+        )
+        self.assertEqual(artifact["expected_trace_count"], 4)
+        self.assertTrue(artifact["one_trace_per_post_trigger_token"])
+        self.assertTrue(artifact["native_cache_length_matches_real_tokens"])
+        self.assertTrue(
+            artifact["baseline_first_token_matches_gate_observation"]
+        )
+
     def test_compact_trace_proves_cache_and_persistence_invariants(self) -> None:
         traces = tuple(
             SimpleNamespace(

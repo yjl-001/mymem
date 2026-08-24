@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import sys
 from typing import Any, Callable
@@ -28,6 +29,7 @@ from memgen.experience.phase1 import (
     file_sha256,
     iter_jsonl,
 )
+from memgen.experience.system import ExperienceMemorySystemProfile
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,9 +51,20 @@ def condition_metric(
     *,
     predicate: Callable[[dict[str, Any]], bool] | None = None,
 ) -> dict[str, bool | float]:
-    selected = [record for record in records if predicate is None or predicate(record)]
+    selected = [
+        record for record in records if predicate is None or predicate(record)
+    ]
+
+    def value(record: dict[str, Any]) -> bool | float:
+        row = record["conditions"][condition]
+        if field == "diagnostic_answer_correct":
+            return row.get("verifier", {}).get(
+                "diagnostic_answer_correct"
+            ) is True
+        return row[field]
+
     return {
-        str(record["sample_id"]): record["conditions"][condition][field]
+        str(record["sample_id"]): value(record)
         for record in selected
     }
 
@@ -102,6 +115,9 @@ def main() -> None:
             E1Assignment.from_dict(value) for value in manifest["assignments"]
         )
     }
+    profile = ExperienceMemorySystemProfile.from_dict(
+        manifest.get("configuration", {}).get("system_profile", {})
+    )
     records = list(iter_jsonl(args.results))
     if any(record.get("schema_version") != E1_RESULTS_SCHEMA for record in records):
         raise ValueError("Unexpected E1 result schema")
@@ -110,7 +126,9 @@ def main() -> None:
         raise ValueError("E1 results and assignments do not cover identical sample IDs")
     run_report = json.loads(args.run_report.read_text(encoding="utf-8"))
     if (
-        run_report.get("status") != "completed"
+        run_report.get("schema_version") != "experience-memory-e1-run-report-v2"
+        or run_report.get("system_profile") != profile.to_dict()
+        or run_report.get("status") != "completed"
         or run_report.get("results", {}).get("sha256") != file_sha256(args.results)
         or run_report.get("inputs", {}).get("assignment_manifest_sha256")
         != file_sha256(args.assignment_manifest)
@@ -125,6 +143,7 @@ def main() -> None:
             record.get("assignment_manifest_sha256") != logical_manifest_hash
             or record.get("question_sha256") != assignment.question_sha256
             or record.get("logical_split") != assignment.logical_split
+            or record.get("system_profile") != profile.to_dict()
         ):
             pairing_violations.append(
                 {"sample_id": sample_id, "reason": "assignment_identity_mismatch"}
@@ -139,8 +158,8 @@ def main() -> None:
                 {"sample_id": sample_id, "reason": "prefix_hash_mismatch"}
             )
         if assignment.assigned:
-            matched = conditions["matched_memory"]
-            shuffled = conditions["shuffled_memory"]
+            matched = conditions["matched_persistent_memory"]
+            shuffled = conditions["shuffled_persistent_memory"]
             assert assignment.matched_memory is not None
             assert assignment.shuffled_memory is not None
             frozen_completion_prefix = list(
@@ -162,9 +181,16 @@ def main() -> None:
                         }
                     )
                 completion_ids = output.get("completion_token_ids")
+                if not isinstance(completion_ids, list):
+                    pairing_violations.append(
+                        {
+                            "sample_id": sample_id,
+                            "reason": f"{condition}_completion_prefix_mismatch",
+                        }
+                    )
+                    continue
                 if (
-                    not isinstance(completion_ids, list)
-                    or completion_ids[: len(frozen_completion_prefix)]
+                    completion_ids[: len(frozen_completion_prefix)]
                     != frozen_completion_prefix
                 ):
                     pairing_violations.append(
@@ -174,7 +200,7 @@ def main() -> None:
                         }
                     )
                 trace = output.get("memory_attention") or {}
-                mass = trace.get("memory_attention_mass")
+                mass = trace.get("mean_memory_attention_mass")
                 if not isinstance(mass, (int, float)) or float(mass) <= 0:
                     pairing_violations.append(
                         {
@@ -182,15 +208,56 @@ def main() -> None:
                             "reason": f"{condition}_memory_attention_not_positive",
                         }
                     )
+                expected_trace_count = (
+                    len(completion_ids) - len(frozen_completion_prefix)
+                )
+                if expected_trace_count <= 0:
+                    pairing_violations.append({
+                        "sample_id": sample_id,
+                        "reason": f"{condition}_no_post_trigger_completion",
+                    })
+                    continue
+                expected_native_lengths = list(range(
+                    len(assignment.prefix_token_ids),
+                    len(assignment.prefix_token_ids) + expected_trace_count,
+                ))
+                masses = trace.get("memory_attention_masses")
+                trace_count = int(trace.get("trace_count", -1))
                 if (
-                    trace.get("memory_id") != choice.memory_id
-                    or int(trace.get("layer_number", -1))
-                    != int(manifest["reasoner"]["layer"])
-                    or int(trace.get("query_length", -1)) != 1
-                    or int(trace.get("native_key_length", -1))
-                    != len(assignment.prefix_token_ids)
-                    or int(trace.get("memory_slot_count", -1))
-                    != choice.kv_valid_slot_count
+                    trace.get("memory_ids") != [choice.memory_id]
+                    or trace.get("memory_slot_counts")
+                    != [choice.kv_valid_slot_count]
+                    or trace_count != expected_trace_count
+                    or trace.get("native_key_lengths") != expected_native_lengths
+                    or trace.get("native_key_lengths_sha256")
+                    != canonical_json_sha256(expected_native_lengths)
+                    or not isinstance(masses, list)
+                    or len(masses) != trace_count
+                    or not all(
+                        isinstance(value, (int, float))
+                        and math.isfinite(float(value))
+                        and float(value) > 0.0
+                        for value in (masses or [])
+                    )
+                    or trace.get("memory_attention_masses_sha256")
+                    != canonical_json_sha256(masses)
+                    or trace.get("memory_score_normalizations")
+                    != [profile.memory_score_normalization]
+                    or trace.get("memory_score_biases")
+                    != [profile.memory_score_bias]
+                    or any(
+                        trace.get(requirement) is not True
+                        for requirement in (
+                            "one_trace_per_post_trigger_token",
+                            "native_cache_length_matches_real_tokens",
+                            "all_memory_attention_mass_finite_and_positive",
+                            "memory_id_constant_and_matched",
+                            "memory_slot_count_constant_and_matched",
+                            "normalization_constant_and_matched",
+                            "memory_score_bias_constant_and_matched",
+                            "baseline_first_token_matches_gate_observation",
+                        )
+                    )
                 ):
                     pairing_violations.append(
                         {
@@ -200,7 +267,10 @@ def main() -> None:
                     )
         elif any(
             conditions[name].get("side_kv_applied")
-            for name in ("matched_memory", "shuffled_memory")
+            for name in (
+                "matched_persistent_memory",
+                "shuffled_persistent_memory",
+            )
         ):
             pairing_violations.append(
                 {"sample_id": sample_id, "reason": "memory_applied_to_unassigned_sample"}
@@ -210,7 +280,10 @@ def main() -> None:
             != conditions["gate_observation_only"].get(
                 "completion_token_ids_sha256"
             )
-            for name in ("matched_memory", "shuffled_memory")
+            for name in (
+                "matched_persistent_memory",
+                "shuffled_persistent_memory",
+            )
         ):
             pairing_violations.append(
                 {
@@ -228,8 +301,8 @@ def main() -> None:
     primary = {
         "matched_vs_shuffled_accuracy": paired(
             ordered_records,
-            "matched_memory",
-            "shuffled_memory",
+            "matched_persistent_memory",
+            "shuffled_persistent_memory",
             "final_reward",
             predicate=assigned_predicate,
             seed=args.seed,
@@ -237,7 +310,7 @@ def main() -> None:
         ),
         "matched_vs_gate_accuracy": paired(
             ordered_records,
-            "matched_memory",
+            "matched_persistent_memory",
             "gate_observation_only",
             "final_reward",
             predicate=assigned_predicate,
@@ -246,19 +319,55 @@ def main() -> None:
         ),
         "matched_vs_vanilla_format": paired(
             ordered_records,
-            "matched_memory",
+            "matched_persistent_memory",
             "vanilla",
             "format_valid",
             predicate=None,
             seed=args.seed + 2,
             resamples=args.bootstrap_resamples,
         ),
+        "matched_vs_shuffled_diagnostic_answer": paired(
+            ordered_records,
+            "matched_persistent_memory",
+            "shuffled_persistent_memory",
+            "diagnostic_answer_correct",
+            predicate=assigned_predicate,
+            seed=args.seed + 6,
+            resamples=args.bootstrap_resamples,
+        ),
+        "matched_vs_gate_diagnostic_answer": paired(
+            ordered_records,
+            "matched_persistent_memory",
+            "gate_observation_only",
+            "diagnostic_answer_correct",
+            predicate=assigned_predicate,
+            seed=args.seed + 7,
+            resamples=args.bootstrap_resamples,
+        ),
+        "matched_vs_shuffled_format": paired(
+            ordered_records,
+            "matched_persistent_memory",
+            "shuffled_persistent_memory",
+            "format_valid",
+            predicate=assigned_predicate,
+            seed=args.seed + 8,
+            resamples=args.bootstrap_resamples,
+        ),
+        "matched_vs_gate_format": paired(
+            ordered_records,
+            "matched_persistent_memory",
+            "gate_observation_only",
+            "format_valid",
+            predicate=assigned_predicate,
+            seed=args.seed + 9,
+            resamples=args.bootstrap_resamples,
+        ),
     }
     intention_to_treat = {
         "matched_vs_shuffled_accuracy": paired(
             ordered_records,
-            "matched_memory",
-            "shuffled_memory",
+            "matched_persistent_memory",
+            "shuffled_persistent_memory",
             "final_reward",
             predicate=None,
             seed=args.seed + 3,
@@ -266,7 +375,7 @@ def main() -> None:
         ),
         "matched_vs_gate_accuracy": paired(
             ordered_records,
-            "matched_memory",
+            "matched_persistent_memory",
             "gate_observation_only",
             "final_reward",
             predicate=None,
@@ -276,8 +385,8 @@ def main() -> None:
     }
     exact_slot_sensitivity = paired(
         ordered_records,
-        "matched_memory",
-        "shuffled_memory",
+        "matched_persistent_memory",
+        "shuffled_persistent_memory",
         "final_reward",
         predicate=exact_slot_predicate,
         seed=args.seed + 5,
@@ -291,18 +400,32 @@ def main() -> None:
             "sample_count": len(rows),
             "accuracy": mean([float(row["final_reward"]) for row in rows]),
             "format_accuracy": mean([float(bool(row["format_valid"])) for row in rows]),
+            "diagnostic_answer_accuracy": mean([
+                float(
+                    row.get("verifier", {}).get("diagnostic_answer_correct")
+                    is True
+                )
+                for row in rows
+            ]),
+            "diagnostic_answer_coverage": mean([
+                float(
+                    row.get("verifier", {}).get("diagnostic_answer_correct")
+                    is not None
+                )
+                for row in rows
+            ]),
             "mean_generation_length": mean(
                 [float(row["generation_length"]) for row in rows]
             ),
             "side_kv_applied_count": sum(bool(row["side_kv_applied"]) for row in rows),
         }
     matched_outputs = [
-        record["conditions"]["matched_memory"]
+        record["conditions"]["matched_persistent_memory"]
         for record in ordered_records
         if record.get("assigned")
     ]
     shuffled_outputs = [
-        record["conditions"]["shuffled_memory"]
+        record["conditions"]["shuffled_persistent_memory"]
         for record in ordered_records
         if record.get("assigned")
     ]
@@ -312,15 +435,17 @@ def main() -> None:
         if record.get("assigned")
     ]
     mechanism_diagnostics = {
+        "persistent_from_trigger_through_eos": True,
+        "runtime_profile": profile.to_dict(),
         "matched_mean_memory_attention_mass": mean(
             [
-                float(row["memory_attention"]["memory_attention_mass"])
+                float(row["memory_attention"]["mean_memory_attention_mass"])
                 for row in matched_outputs
             ]
         ),
         "shuffled_mean_memory_attention_mass": mean(
             [
-                float(row["memory_attention"]["memory_attention_mass"])
+                float(row["memory_attention"]["mean_memory_attention_mass"])
                 for row in shuffled_outputs
             ]
         ),
@@ -337,6 +462,26 @@ def main() -> None:
             ]
         ),
         "mean_bm25_top1_score": mean(retrieval_scores),
+        "matched_mean_trace_count": mean([
+            float(row["memory_attention"]["trace_count"])
+            for row in matched_outputs
+        ]),
+        "shuffled_mean_trace_count": mean([
+            float(row["memory_attention"]["trace_count"])
+            for row in shuffled_outputs
+        ]),
+        "matched_baseline_first_token_match_count": sum(
+            row["memory_attention"][
+                "baseline_first_token_matches_gate_observation"
+            ]
+            for row in matched_outputs
+        ),
+        "shuffled_baseline_first_token_match_count": sum(
+            row["memory_attention"][
+                "baseline_first_token_matches_gate_observation"
+            ]
+            for row in shuffled_outputs
+        ),
     }
 
     matched_shuffled = primary["matched_vs_shuffled_accuracy"]
@@ -369,11 +514,29 @@ def main() -> None:
             and format_effect["mean_treatment_minus_control"] >= 0
         ),
     }
+    frozen_effect_criteria_passed = all(acceptance.values())
+    runtime_integrity_passed = (
+        not pairing_violations
+        and acceptance["vanilla_matches_gate_observation_only"]
+    )
     output = {
         "schema_version": E1_SUMMARY_SCHEMA,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "status": "passed" if all(acceptance.values()) else "did_not_pass",
-        "formal_e1_passed": all(acceptance.values()),
+        "status": "completed" if runtime_integrity_passed else "invalid",
+        # The current layer-24 channel failed E1C-S. E1-D can measure the
+        # frozen effect criteria, but cannot override that upstream stop rule.
+        "formal_e1_passed": False,
+        "frozen_effect_criteria_passed": frozen_effect_criteria_passed,
+        # E1-D is a calibration-side engineering evaluation. Passing its
+        # frozen checks is not, by itself, a held-out task-effect claim.
+        "formal_task_claim": False,
+        "component_diagnostic": {
+            "full_system_implemented": True,
+            "gate_retrieval_persistent_side_kv_pipeline_executed": True,
+            "runtime_and_pairing_integrity_passed": runtime_integrity_passed,
+            "implementation_completeness_is_not_task_effectiveness": True,
+        },
+        "system_profile": profile.to_dict(),
         "logical_split": manifest["logical_split"],
         "sample_count": len(ordered_records),
         "triggered_count": sum(bool(record.get("triggered")) for record in ordered_records),
@@ -408,7 +571,8 @@ def main() -> None:
         encoding="utf-8",
     )
     print(
-        f"[e1-summary] passed={output['formal_e1_passed']} "
+        f"[e1-summary] status={output['status']} "
+        f"effect_criteria={output['frozen_effect_criteria_passed']} "
         f"assigned={output['assigned_count']} output={args.output}",
         flush=True,
     )

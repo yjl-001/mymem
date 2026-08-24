@@ -1,4 +1,4 @@
-"""Pure, auditable contracts for the E1 matched-memory experiment.
+"""Pure, auditable contracts for the frozen full-system causal experiment.
 
 This module deliberately has no Torch dependency.  It owns the immutable
 assignment records, deterministic shuffled-memory control, and paired binary
@@ -16,15 +16,15 @@ from typing import Any, Mapping, Sequence
 from memgen.experience.phase1 import canonical_json_sha256
 
 
-E1_ASSIGNMENT_SCHEMA = "experience-memory-e1-assignment-v1"
-E1_MANIFEST_SCHEMA = "experience-memory-e1-assignment-manifest-v1"
-E1_RESULTS_SCHEMA = "experience-memory-e1-results-v1"
-E1_SUMMARY_SCHEMA = "experience-memory-e1-summary-v1"
+E1_ASSIGNMENT_SCHEMA = "experience-memory-e1-assignment-v2"
+E1_MANIFEST_SCHEMA = "experience-memory-e1-assignment-manifest-v2"
+E1_RESULTS_SCHEMA = "experience-memory-e1-results-v2"
+E1_SUMMARY_SCHEMA = "experience-memory-e1-summary-v2"
 E1_CONDITIONS = (
     "vanilla",
     "gate_observation_only",
-    "matched_memory",
-    "shuffled_memory",
+    "matched_persistent_memory",
+    "shuffled_persistent_memory",
 )
 
 

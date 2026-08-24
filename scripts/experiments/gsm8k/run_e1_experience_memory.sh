@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# E1: frozen observation-only assignment and matched-vs-shuffled side-KV test.
+# Complete system: gate + semantic retrieval + persistent side-KV with controls.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -15,7 +15,7 @@ source "$E1_SERVER_ENV"
 
 LIMIT=100
 OFFSET=0
-LOGICAL_SPLIT="dev-test"
+LOGICAL_SPLIT="calibration-val"
 PRINT_CONFIG=0
 POSITIONAL=()
 while [[ "$#" -gt 0 ]]; do
@@ -48,7 +48,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 if [[ "${#POSITIONAL[@]}" -ne 3 ]]; then
-  echo "Usage: $0 [--limit N] [--offset N] [--logical-split dev-test|calibration-val] PHASE1_DIR E0_DIR RISK_ARTIFACT" >&2
+  echo "Usage: $0 [--limit N] [--offset N] [--logical-split calibration-val|dev-test] PHASE1_DIR E0_DIR RISK_ARTIFACT" >&2
   exit 2
 fi
 if [[ "$LOGICAL_SPLIT" != "dev-test" && "$LOGICAL_SPLIT" != "calibration-val" ]]; then
@@ -106,11 +106,12 @@ if [[ "$PRINT_CONFIG" == "1" ]]; then
   printf 'offset=%s\n' "$OFFSET"
   printf 'limit=%s\n' "$LIMIT"
   printf 'cuda_visible_devices=%s\n' "$CUDA_VISIBLE_DEVICES"
+  printf 'system_profile=%s\n' 'layer24-bm25-top1-gate-persistent-logslots-log10-v1'
   exit 0
 fi
 
 RUN_TAG="${MEMGEN_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
-RUN_ID="gsm8k_e1_experience-memory_layer24_${LOGICAL_SPLIT}_${RUN_TAG}"
+RUN_ID="gsm8k_e1d_full-system_layer24_${LOGICAL_SPLIT}_${RUN_TAG}"
 RUN_DIR="$MEMGEN_OUTPUT_ROOT/e1/gsm8k/$RUN_ID"
 ASSIGNMENT_MANIFEST="$RUN_DIR/assignment_manifest.json"
 EVALUATION_DIR="$RUN_DIR/evaluation"
@@ -144,10 +145,10 @@ python scripts/summarize_e1_experience_memory.py \
   --assignment-manifest "$ASSIGNMENT_MANIFEST" \
   --results "$EVALUATION_DIR/results.jsonl" \
   --run-report "$EVALUATION_DIR/run_report.json" \
-  --output "$RUN_DIR/e1_summary.json" \
+  --output "$RUN_DIR/e1d_summary.json" \
   --bootstrap-resamples 10000 \
   --min-primary-pairs 20 \
   --seed 42
 
-echo "E1 artifacts: $RUN_DIR"
-echo "E1 summary: $RUN_DIR/e1_summary.json"
+echo "Full-system artifacts: $RUN_DIR"
+echo "Full-system summary: $RUN_DIR/e1d_summary.json"

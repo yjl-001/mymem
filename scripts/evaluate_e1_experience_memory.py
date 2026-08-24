@@ -6,10 +6,11 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import sys
 import time
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +31,7 @@ from memgen.experience.phase1 import (
     text_sha256,
 )
 from memgen.experience.phase2 import build_gsm8k_messages
+from memgen.experience.system import ExperienceMemorySystemProfile
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,7 +82,7 @@ def condition_result(
     runtime_seconds: float | None,
     memory_id: str | None = None,
     payload_hash: str | None = None,
-    attention_trace: Any | None = None,
+    memory_attention: Mapping[str, Any] | None = None,
     first_step_logits_kl: float | None = None,
     first_step_top1_changed: bool | None = None,
 ) -> dict[str, Any]:
@@ -103,10 +105,76 @@ def condition_result(
         "payload_hash": payload_hash,
         "side_kv_applied": memory_id is not None,
         "memory_attention": (
-            attention_trace.to_dict() if attention_trace is not None else None
+            dict(memory_attention) if memory_attention is not None else None
         ),
         "first_step_logits_kl_baseline_to_memory": first_step_logits_kl,
         "first_step_top1_changed": first_step_top1_changed,
+    }
+
+
+def compact_persistent_trace(
+    traces: Sequence[Any],
+    *,
+    completion_length: int,
+    prefix_length: int,
+    prompt_token_count: int,
+    expected_memory_id: str,
+    expected_slot_count: int,
+    expected_baseline_first_token_id: int,
+    actual_baseline_first_token_id: int,
+    profile: ExperienceMemorySystemProfile,
+) -> dict[str, Any]:
+    partial_length = prefix_length - prompt_token_count
+    expected_trace_count = completion_length - partial_length
+    if expected_trace_count <= 0 or not traces:
+        raise RuntimeError("Persistent trigger produced no post-activation trace")
+    native_lengths = [int(trace.native_key_length) for trace in traces]
+    masses = [float(trace.memory_attention_mass) for trace in traces]
+    memory_ids = {str(trace.memory_id) for trace in traces}
+    slot_counts = {int(trace.memory_slot_count) for trace in traces}
+    normalizations = {str(trace.memory_score_normalization) for trace in traces}
+    biases = {float(trace.memory_score_bias) for trace in traces}
+    expected_native_lengths = list(
+        range(prefix_length, prefix_length + expected_trace_count)
+    )
+    return {
+        "trace_count": len(traces),
+        "expected_trace_count": expected_trace_count,
+        "activation_prefix_token_count": prefix_length,
+        "activation_generated_boundary_index": partial_length - 1,
+        "memory_ids": sorted(memory_ids),
+        "memory_slot_counts": sorted(slot_counts),
+        "memory_score_normalizations": sorted(normalizations),
+        "memory_score_biases": sorted(biases),
+        "memory_attention_masses": masses,
+        "memory_attention_masses_sha256": canonical_json_sha256(masses),
+        "mean_memory_attention_mass": sum(masses) / len(masses),
+        "min_memory_attention_mass": min(masses),
+        "max_memory_attention_mass": max(masses),
+        "native_key_lengths": native_lengths,
+        "native_key_lengths_sha256": canonical_json_sha256(native_lengths),
+        "one_trace_per_post_trigger_token": len(traces) == expected_trace_count,
+        "native_cache_length_matches_real_tokens": (
+            native_lengths == expected_native_lengths
+        ),
+        "all_memory_attention_mass_finite_and_positive": all(
+            math.isfinite(value) and value > 0.0 for value in masses
+        ),
+        "memory_id_constant_and_matched": memory_ids == {expected_memory_id},
+        "memory_slot_count_constant_and_matched": (
+            slot_counts == {expected_slot_count}
+        ),
+        "normalization_constant_and_matched": (
+            normalizations == {profile.memory_score_normalization}
+        ),
+        "memory_score_bias_constant_and_matched": biases == {
+            profile.memory_score_bias
+        },
+        "baseline_first_token_id": actual_baseline_first_token_id,
+        "expected_gate_only_first_token_id": expected_baseline_first_token_id,
+        "baseline_first_token_matches_gate_observation": (
+            actual_baseline_first_token_id == expected_baseline_first_token_id
+        ),
     }
 
 
@@ -177,8 +245,16 @@ def main() -> None:
     model_revision = str(reasoner.get("model_revision", ""))
     tokenizer_revision = str(reasoner.get("tokenizer_revision", ""))
     layer = int(reasoner.get("layer", -1))
-    if layer != 24 or reasoner.get("attention_implementation") != "eager":
-        raise ValueError("E1-v1 requires eager side-KV at layer 24")
+    profile = ExperienceMemorySystemProfile.from_dict(
+        manifest.get("configuration", {}).get("system_profile", {})
+    )
+    if (
+        layer != profile.layer_number
+        or reasoner.get("attention_implementation") != "eager"
+        or manifest.get("configuration", {}).get("injection_policy")
+        != profile.injection_policy
+    ):
+        raise ValueError("Runtime profile differs from the frozen assignment")
     if args.dtype != reasoner.get("dtype"):
         raise ValueError("Runtime dtype differs from the assignment manifest")
 
@@ -196,7 +272,7 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         revision=model_revision,
-        torch_dtype=dtype,
+        dtype=dtype,
         attn_implementation="eager",
     ).to(args.device)
     model.eval()
@@ -223,6 +299,8 @@ def main() -> None:
         model=model,
         layer_number=layer,
         audit_canonical_rope=False,
+        memory_score_normalization=profile.memory_score_normalization,
+        memory_score_bias=profile.memory_score_bias,
     )
     runtime = GreedyE1Runtime(
         model=model,
@@ -284,53 +362,113 @@ def main() -> None:
                     assert assignment.matched_memory is not None
                     assert assignment.shuffled_memory is not None
                     started = time.perf_counter()
-                    matched_runtime = runtime.generate_with_memory(
+                    matched_memory = loader.get(
+                        assignment.matched_memory.memory_id,
+                        device=args.device,
+                        dtype=next(model.parameters()).dtype,
+                    )
+                    if (
+                        matched_memory.payload_hash
+                        != assignment.matched_memory.payload_hash
+                        or matched_memory.valid_slot_count
+                        != assignment.matched_memory.kv_valid_slot_count
+                    ):
+                        raise ValueError("Matched side-KV metadata drifted")
+                    matched_runtime = runtime.generate_from_trigger_with_persistent_memory(
                         prefix_token_ids=assignment.prefix_token_ids,
                         prompt_token_count=assignment.prompt_token_count,
-                        memory=loader.get(
-                            assignment.matched_memory.memory_id,
-                            device=args.device,
-                            dtype=next(model.parameters()).dtype,
-                        ),
+                        memory=matched_memory,
                         controller=controller,
                     )
                     matched_seconds = time.perf_counter() - started
                     started = time.perf_counter()
-                    shuffled_runtime = runtime.generate_with_memory(
+                    shuffled_memory = loader.get(
+                        assignment.shuffled_memory.memory_id,
+                        device=args.device,
+                        dtype=next(model.parameters()).dtype,
+                    )
+                    if (
+                        shuffled_memory.payload_hash
+                        != assignment.shuffled_memory.payload_hash
+                        or shuffled_memory.valid_slot_count
+                        != assignment.shuffled_memory.kv_valid_slot_count
+                    ):
+                        raise ValueError("Shuffled side-KV metadata drifted")
+                    shuffled_runtime = runtime.generate_from_trigger_with_persistent_memory(
                         prefix_token_ids=assignment.prefix_token_ids,
                         prompt_token_count=assignment.prompt_token_count,
-                        memory=loader.get(
-                            assignment.shuffled_memory.memory_id,
-                            device=args.device,
-                            dtype=next(model.parameters()).dtype,
-                        ),
+                        memory=shuffled_memory,
                         controller=controller,
                     )
                     shuffled_seconds = time.perf_counter() - started
-                    conditions["matched_memory"] = condition_result(
+                    partial_length = (
+                        len(assignment.prefix_token_ids)
+                        - assignment.prompt_token_count
+                    )
+                    if partial_length >= len(
+                        assignment.observation_completion_token_ids
+                    ):
+                        raise ValueError("Frozen trigger has no baseline next token")
+                    expected_baseline_token = (
+                        assignment.observation_completion_token_ids[partial_length]
+                    )
+                    matched_trace = compact_persistent_trace(
+                        matched_runtime.attention_traces,
+                        completion_length=len(matched_runtime.completion_token_ids),
+                        prefix_length=len(assignment.prefix_token_ids),
+                        prompt_token_count=assignment.prompt_token_count,
+                        expected_memory_id=assignment.matched_memory.memory_id,
+                        expected_slot_count=(
+                            assignment.matched_memory.kv_valid_slot_count
+                        ),
+                        expected_baseline_first_token_id=expected_baseline_token,
+                        actual_baseline_first_token_id=(
+                            matched_runtime.baseline_first_token_id
+                        ),
+                        profile=profile,
+                    )
+                    shuffled_trace = compact_persistent_trace(
+                        shuffled_runtime.attention_traces,
+                        completion_length=len(shuffled_runtime.completion_token_ids),
+                        prefix_length=len(assignment.prefix_token_ids),
+                        prompt_token_count=assignment.prompt_token_count,
+                        expected_memory_id=assignment.shuffled_memory.memory_id,
+                        expected_slot_count=(
+                            assignment.shuffled_memory.kv_valid_slot_count
+                        ),
+                        expected_baseline_first_token_id=expected_baseline_token,
+                        actual_baseline_first_token_id=(
+                            shuffled_runtime.baseline_first_token_id
+                        ),
+                        profile=profile,
+                    )
+                    conditions["matched_persistent_memory"] = condition_result(
                         tokenizer=tokenizer,
                         completion_token_ids=matched_runtime.completion_token_ids,
                         ground_truth=ground_truth,
                         runtime_seconds=matched_seconds,
                         memory_id=assignment.matched_memory.memory_id,
                         payload_hash=assignment.matched_memory.payload_hash,
-                        attention_trace=matched_runtime.attention_trace,
+                        memory_attention=matched_trace,
                         first_step_logits_kl=matched_runtime.first_step_logits_kl,
                         first_step_top1_changed=matched_runtime.first_step_top1_changed,
                     )
-                    conditions["shuffled_memory"] = condition_result(
+                    conditions["shuffled_persistent_memory"] = condition_result(
                         tokenizer=tokenizer,
                         completion_token_ids=shuffled_runtime.completion_token_ids,
                         ground_truth=ground_truth,
                         runtime_seconds=shuffled_seconds,
                         memory_id=assignment.shuffled_memory.memory_id,
                         payload_hash=assignment.shuffled_memory.payload_hash,
-                        attention_trace=shuffled_runtime.attention_trace,
+                        memory_attention=shuffled_trace,
                         first_step_logits_kl=shuffled_runtime.first_step_logits_kl,
                         first_step_top1_changed=shuffled_runtime.first_step_top1_changed,
                     )
                 else:
-                    for condition in ("matched_memory", "shuffled_memory"):
+                    for condition in (
+                        "matched_persistent_memory",
+                        "shuffled_persistent_memory",
+                    ):
                         conditions[condition] = condition_result(
                             tokenizer=tokenizer,
                             completion_token_ids=gate_ids,
@@ -355,6 +493,7 @@ def main() -> None:
                         else None
                     ),
                     "retrieval_query": assignment.retrieval_query,
+                    "system_profile": profile.to_dict(),
                     "matched_memory": (
                         assignment.matched_memory.to_dict()
                         if assignment.matched_memory is not None
@@ -392,6 +531,10 @@ def main() -> None:
             / len(condition_rows),
             "format_accuracy": sum(bool(item["format_valid"]) for item in condition_rows)
             / len(condition_rows),
+            "diagnostic_answer_accuracy": sum(
+                item.get("verifier", {}).get("diagnostic_answer_correct") is True
+                for item in condition_rows
+            ) / len(condition_rows),
             "mean_generation_length": sum(
                 int(item["generation_length"]) for item in condition_rows
             )
@@ -401,7 +544,7 @@ def main() -> None:
             ),
         }
     run_report = {
-        "schema_version": "experience-memory-e1-run-report-v1",
+        "schema_version": "experience-memory-e1-run-report-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "completed",
         "sample_count": len(records),
@@ -411,6 +554,7 @@ def main() -> None:
             item["vanilla_matches_gate_observation_only"] for item in records
         ),
         "conditions": condition_summaries,
+        "system_profile": profile.to_dict(),
         "inputs": {
             "assignment_manifest_path": str(args.assignment_manifest.resolve()),
             "assignment_manifest_sha256": file_sha256(args.assignment_manifest),

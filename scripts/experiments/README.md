@@ -102,13 +102,15 @@ memory payload**，而不是只做 Phase 2 的质量标签。payload 仅允许�
 失败机制/警告信号；必须剔除原题、原始轨迹、`\boxed{}` 答案、原始 evidence quote 与实例特有数值。
 不再产生新的 Teacher/Pro 调用。
 
-E0-v1 已进入实现与服务器机制审计阶段；E1 仍未实现。顺序与实验门槛固定为：
+E0-v1 已通过服务器机制审计。E1-A/B/C 与 E1C-S 已完成分组件诊断；当前也已实现 E1-D
+完整系统骨架。顺序与实验门槛固定为：
 
 1. E0：审计 payload 无泄漏，并验证 layer-24 canonical side-KV 能附加而不改写原 cache，且有非零
    memory attention mass；
-2. E1：先用 observation-only pass 冻结每题首次风险触发 boundary 和 matched memory id，再比较
-   `vanilla`、`gate-observation-only`、`matched-memory` 与同预算 `shuffled-memory`；所有条件使用
-   相同 sample、prefix、触发位置和单次预算；
+2. E1-D：先用 observation-only pass 冻结每题首次风险触发 boundary 和 matched memory id，再比较
+   `vanilla`、`gate-observation-only`、`matched-persistent-memory` 与
+   `shuffled-persistent-memory`；memory 从触发 boundary 持续可见到 EOS，所有条件使用相同 sample、
+   prefix、触发位置和一条 memory，shuffle 保持全局 memory-ID 多重集合；
 3. 仅当 matched memory 相比 shuffled/gate-only 有配对因果证据且格式不受损时，才做 target/reference
    字段消融和随机位置时机消融，最后才进入 final-test。
 
@@ -155,14 +157,18 @@ entropy-risk artifact。服务器本地配置仍只保留 output root 和可选 
 cp scripts/experiments/gsm8k/e1.server.env.example \
   scripts/experiments/gsm8k/.e1.server.env
 
-bash scripts/experiments/gsm8k/run_e1_experience_memory.sh \
+bash scripts/experiments/gsm8k/run_e1d_full_system.sh \
+  --logical-split calibration-val \
   --limit 100 \
   /absolute/path/to/phase1-run \
   /absolute/path/to/formal-e0-run \
   /absolute/path/to/phase2-entropy-risk-state-delta-answer_correctness.pt
 ```
 
-可先用 `--print-config` 检查从 artifacts 解析出的 revisions 和 split，而不加载模型。E1 首版固定
-BM25 top-1、96-token partial-CoT window、layer 24、首次联合 entropy-risk trigger、单条 memory 和
-单次注入；matched/shuffled 只改变 memory ID。完整接口见
-[`e1_experience_memory_design.md`](../../docs/codex/e1_experience_memory_design.md)。
+可先用 `--print-config` 检查从 artifacts 解析出的 revisions 和 split，而不加载模型。E1-D v1 固定
+BM25 top-1（保留 top-2 诊断）、96-token partial-CoT window、layer 24、首次联合 entropy-risk
+trigger、单条 memory、`-log(valid slots) + log(10)` score 校准，以及从触发到 EOS 的 persistent
+side path。完整运行与审计契约见
+[`experience_memory_full_system.md`](../../docs/codex/experience_memory_full_system.md)。当前 E1C-S
+没有证明 side-KV 传递了 payload 内容效应，因此 E1-D 只用于验证工程完整性和定位模块问题，不进入
+final-test，也不构成正式任务收益声明。
