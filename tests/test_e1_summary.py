@@ -22,19 +22,14 @@ SUMMARY_SCRIPT = PROJECT_ROOT / "scripts/summarize_e1_experience_memory.py"
 
 
 class E1SummaryTests(unittest.TestCase):
-    def test_summarizes_authenticated_paired_results(self) -> None:
+    def test_summarizes_authenticated_gate_vs_matched_results(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            assignments = []
-            for index, (matched_id, shuffled_id) in enumerate(
-                (("a", "b"), ("b", "a"))
-            ):
-                item = assignment(
-                    f"sample-{index}", memory_choice(matched_id, 100 + index)
-                ).with_shuffled_memory(
-                    memory_choice(shuffled_id, 101 - index)
-                )
-                assignments.append(item)
+            assignments = [
+                assignment(f"sample-{index}", memory_choice(f"m{index}", 100 + index))
+                for index in range(2)
+            ]
+            profile = ExperienceMemorySystemProfile()
             manifest = {
                 "schema_version": E1_MANIFEST_SCHEMA,
                 "created_at": "fixture",
@@ -42,67 +37,54 @@ class E1SummaryTests(unittest.TestCase):
                 "answer_or_reward_used": False,
                 "logical_split": "dev-test",
                 "reasoner": {"layer": 24},
-                "configuration": {
-                    "system_profile": ExperienceMemorySystemProfile().to_dict()
-                },
+                "configuration": {"system_profile": profile.to_dict()},
                 "summary": {"sample_count": len(assignments)},
                 "assignments": [item.to_dict() for item in assignments],
             }
-            manifest["manifest_sha256"] = canonical_json_sha256(
-                {
-                    key: value
-                    for key, value in manifest.items()
-                    if key not in {"created_at", "manifest_sha256"}
-                }
-            )
+            manifest["manifest_sha256"] = canonical_json_sha256({
+                key: value
+                for key, value in manifest.items()
+                if key not in {"created_at", "manifest_sha256"}
+            })
             manifest_path = root / "assignment.json"
             manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
 
             results_path = root / "results.jsonl"
             with results_path.open("w", encoding="utf-8") as handle:
                 for index, item in enumerate(assignments):
+                    assert item.matched_memory is not None
                     conditions = {}
                     for condition in E1_CONDITIONS:
-                        applied = condition in {
-                            "matched_persistent_memory",
-                            "shuffled_persistent_memory",
-                        }
-                        choice = (
-                            item.matched_memory
-                            if condition == "matched_persistent_memory"
-                            else item.shuffled_memory
-                            if condition == "shuffled_persistent_memory"
-                            else None
-                        )
-                        reward = (
-                            1.0
-                            if condition == "matched_persistent_memory" and index == 0
-                            else 0.0
-                        )
+                        applied = condition == "matched_persistent_memory"
+                        completion = [31, 50 + index] if applied else [31, 40 + index]
                         conditions[condition] = {
-                            "final_reward": reward,
+                            "final_reward": float(applied and index == 0),
                             "format_valid": True,
-                            "generation_length": 10,
-                            "completion_token_ids": [31, 40 + index],
+                            "generation_length": len(completion),
+                            "completion_token_ids": completion,
                             "completion_token_ids_sha256": canonical_json_sha256(
-                                [31, 40 + index]
+                                completion
                             ),
                             "side_kv_applied": applied,
                             "verifier": {"diagnostic_answer_correct": False},
-                            "memory_id": choice.memory_id if choice else None,
-                            "payload_hash": choice.payload_hash if choice else None,
+                            "memory_id": (
+                                item.matched_memory.memory_id if applied else None
+                            ),
+                            "payload_hash": (
+                                item.matched_memory.payload_hash if applied else None
+                            ),
                             "memory_attention": (
                                 {
                                     "trace_count": 1,
-                                    "memory_ids": [choice.memory_id],
+                                    "memory_ids": [item.matched_memory.memory_id],
                                     "memory_slot_counts": [
-                                        choice.kv_valid_slot_count
+                                        item.matched_memory.kv_valid_slot_count
                                     ],
                                     "memory_score_normalizations": [
-                                        "log_valid_slots"
+                                        profile.memory_score_normalization
                                     ],
                                     "memory_score_biases": [
-                                        ExperienceMemorySystemProfile().memory_score_bias
+                                        profile.memory_score_bias
                                     ],
                                     "native_key_lengths": [
                                         len(item.prefix_token_ids)
@@ -136,24 +118,22 @@ class E1SummaryTests(unittest.TestCase):
                         "sample_id": item.sample_id,
                         "logical_split": item.logical_split,
                         "question_sha256": item.question_sha256,
-                        "assignment_manifest_sha256": manifest[
-                            "manifest_sha256"
-                        ],
+                        "assignment_manifest_sha256": manifest["manifest_sha256"],
                         "assigned": True,
                         "triggered": True,
                         "prefix_token_ids_sha256": item.prefix_token_ids_sha256,
+                        "retrieval_query": item.retrieval_query,
                         "matched_memory": item.matched_memory.to_dict(),
-                        "shuffled_memory": item.shuffled_memory.to_dict(),
-                        "system_profile": ExperienceMemorySystemProfile().to_dict(),
+                        "system_profile": profile.to_dict(),
                         "vanilla_matches_gate_observation_only": True,
                         "conditions": conditions,
                     }
                     handle.write(json.dumps(record) + "\n")
 
             run_report = {
-                "schema_version": "experience-memory-e1-run-report-v2",
+                "schema_version": "experience-memory-e1-run-report-v3",
                 "status": "completed",
-                "system_profile": ExperienceMemorySystemProfile().to_dict(),
+                "system_profile": profile.to_dict(),
                 "results": {"sha256": file_sha256(results_path)},
                 "inputs": {
                     "assignment_manifest_sha256": file_sha256(manifest_path)
@@ -189,8 +169,10 @@ class E1SummaryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             summary = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(summary["assigned_count"], 2)
-            self.assertEqual(summary["pairing_violations"], [])
-            self.assertTrue(summary["acceptance"]["assignment_and_pairing_integrity"])
+            self.assertEqual(summary["integrity_violations"], [])
+            self.assertTrue(
+                summary["acceptance"]["assignment_and_runtime_integrity"]
+            )
             self.assertEqual(summary["status"], "completed")
             self.assertFalse(summary["formal_e1_passed"])
             self.assertFalse(summary["formal_task_claim"])

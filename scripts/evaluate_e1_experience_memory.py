@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute the four frozen E1 conditions and score GSM8K after generation."""
+"""Execute the three frozen E1 conditions and score GSM8K after generation."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from memgen.experience.phase1 import (
     file_sha256,
     text_sha256,
 )
-from memgen.experience.phase2 import build_gsm8k_messages
+from memgen.experience.risk import build_gsm8k_messages
 from memgen.experience.system import ExperienceMemorySystemProfile
 
 
@@ -227,9 +227,6 @@ def main() -> None:
     )
     if len(assignments) != int(manifest.get("summary", {}).get("sample_count", -1)):
         raise ValueError("E1 assignment count differs from manifest summary")
-    if any(not item.assigned for item in assignments if item.matched_memory is not None):
-        raise ValueError("E1 assignment has matched memory without shuffled control")
-
     split_manifest = json.loads(args.split_manifest.read_text(encoding="utf-8"))
     dataset_revision = str(inputs.get("dataset_revision", ""))
     if split_manifest.get("dataset", {}).get("revision") != dataset_revision:
@@ -360,7 +357,6 @@ def main() -> None:
 
                 if assignment.assigned:
                     assert assignment.matched_memory is not None
-                    assert assignment.shuffled_memory is not None
                     started = time.perf_counter()
                     matched_memory = loader.get(
                         assignment.matched_memory.memory_id,
@@ -381,26 +377,6 @@ def main() -> None:
                         controller=controller,
                     )
                     matched_seconds = time.perf_counter() - started
-                    started = time.perf_counter()
-                    shuffled_memory = loader.get(
-                        assignment.shuffled_memory.memory_id,
-                        device=args.device,
-                        dtype=next(model.parameters()).dtype,
-                    )
-                    if (
-                        shuffled_memory.payload_hash
-                        != assignment.shuffled_memory.payload_hash
-                        or shuffled_memory.valid_slot_count
-                        != assignment.shuffled_memory.kv_valid_slot_count
-                    ):
-                        raise ValueError("Shuffled side-KV metadata drifted")
-                    shuffled_runtime = runtime.generate_from_trigger_with_persistent_memory(
-                        prefix_token_ids=assignment.prefix_token_ids,
-                        prompt_token_count=assignment.prompt_token_count,
-                        memory=shuffled_memory,
-                        controller=controller,
-                    )
-                    shuffled_seconds = time.perf_counter() - started
                     partial_length = (
                         len(assignment.prefix_token_ids)
                         - assignment.prompt_token_count
@@ -427,21 +403,6 @@ def main() -> None:
                         ),
                         profile=profile,
                     )
-                    shuffled_trace = compact_persistent_trace(
-                        shuffled_runtime.attention_traces,
-                        completion_length=len(shuffled_runtime.completion_token_ids),
-                        prefix_length=len(assignment.prefix_token_ids),
-                        prompt_token_count=assignment.prompt_token_count,
-                        expected_memory_id=assignment.shuffled_memory.memory_id,
-                        expected_slot_count=(
-                            assignment.shuffled_memory.kv_valid_slot_count
-                        ),
-                        expected_baseline_first_token_id=expected_baseline_token,
-                        actual_baseline_first_token_id=(
-                            shuffled_runtime.baseline_first_token_id
-                        ),
-                        profile=profile,
-                    )
                     conditions["matched_persistent_memory"] = condition_result(
                         tokenizer=tokenizer,
                         completion_token_ids=matched_runtime.completion_token_ids,
@@ -453,30 +414,15 @@ def main() -> None:
                         first_step_logits_kl=matched_runtime.first_step_logits_kl,
                         first_step_top1_changed=matched_runtime.first_step_top1_changed,
                     )
-                    conditions["shuffled_persistent_memory"] = condition_result(
-                        tokenizer=tokenizer,
-                        completion_token_ids=shuffled_runtime.completion_token_ids,
-                        ground_truth=ground_truth,
-                        runtime_seconds=shuffled_seconds,
-                        memory_id=assignment.shuffled_memory.memory_id,
-                        payload_hash=assignment.shuffled_memory.payload_hash,
-                        memory_attention=shuffled_trace,
-                        first_step_logits_kl=shuffled_runtime.first_step_logits_kl,
-                        first_step_top1_changed=shuffled_runtime.first_step_top1_changed,
-                    )
                 else:
-                    for condition in (
-                        "matched_persistent_memory",
-                        "shuffled_persistent_memory",
-                    ):
-                        conditions[condition] = condition_result(
-                            tokenizer=tokenizer,
-                            completion_token_ids=gate_ids,
-                            ground_truth=ground_truth,
-                            runtime_seconds=None,
-                        )
+                    conditions["matched_persistent_memory"] = condition_result(
+                        tokenizer=tokenizer,
+                        completion_token_ids=gate_ids,
+                        ground_truth=ground_truth,
+                        runtime_seconds=None,
+                    )
                 if set(conditions) != set(E1_CONDITIONS):
-                    raise RuntimeError("E1 runner did not produce all four conditions")
+                    raise RuntimeError("E1 runner did not produce all three conditions")
                 record = {
                     "schema_version": E1_RESULTS_SCHEMA,
                     "sample_id": assignment.sample_id,
@@ -497,11 +443,6 @@ def main() -> None:
                     "matched_memory": (
                         assignment.matched_memory.to_dict()
                         if assignment.matched_memory is not None
-                        else None
-                    ),
-                    "shuffled_memory": (
-                        assignment.shuffled_memory.to_dict()
-                        if assignment.shuffled_memory is not None
                         else None
                     ),
                     "vanilla_matches_gate_observation_only": (
@@ -544,7 +485,7 @@ def main() -> None:
             ),
         }
     run_report = {
-        "schema_version": "experience-memory-e1-run-report-v2",
+        "schema_version": "experience-memory-e1-run-report-v3",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "completed",
         "sample_count": len(records),

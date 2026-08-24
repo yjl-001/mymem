@@ -20,7 +20,6 @@ from memgen.chat_templates import CONVERSATION_TEMPLATE
 from memgen.experience.e1 import (
     E1_MANIFEST_SCHEMA,
     E1Assignment,
-    MatchedMemoryDeranger,
     MemoryChoice,
 )
 from memgen.experience.memory import MemoryRecord
@@ -31,8 +30,8 @@ from memgen.experience.phase1 import (
     text_sha256,
     write_jsonl,
 )
-from memgen.experience.phase2 import (
-    STEERING_VECTOR_ARTIFACT_SCHEMA,
+from memgen.experience.risk import (
+    ENTROPY_RISK_ARTIFACT_SCHEMA,
     build_gsm8k_messages,
 )
 from memgen.experience.retrieval import (
@@ -64,7 +63,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--max-new-tokens", type=int, default=768)
-    parser.add_argument("--shuffle-seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--dtype",
@@ -111,8 +109,8 @@ def prompt_token_ids(tokenizer: Any, question: str) -> list[int]:
 
 def main() -> None:
     args = parse_args()
-    if args.offset < 0 or args.limit <= 1 or args.max_new_tokens <= 0:
-        raise ValueError("E1 requires offset >= 0, limit > 1, and generation budget > 0")
+    if args.offset < 0 or args.limit <= 0 or args.max_new_tokens <= 0:
+        raise ValueError("E1 requires non-negative offset and positive budgets")
 
     import torch
     from datasets import load_dataset
@@ -150,8 +148,8 @@ def main() -> None:
         if item.get("logical_split") == args.logical_split
     ][args.offset :]
     selected = selected[: args.limit]
-    if len(selected) <= 1:
-        raise ValueError("Selected E1 split has fewer than two samples")
+    if not selected:
+        raise ValueError("Selected E1 split is empty")
 
     records = tuple(
         MemoryRecord.from_dict(value) for value in iter_jsonl(args.memory_records)
@@ -188,7 +186,7 @@ def main() -> None:
     risk_artifact = torch.load(
         args.risk_artifact, map_location="cpu", weights_only=False
     )
-    if risk_artifact.get("schema_version") != STEERING_VECTOR_ARTIFACT_SCHEMA:
+    if risk_artifact.get("schema_version") != ENTROPY_RISK_ARTIFACT_SCHEMA:
         raise ValueError("Unexpected entropy-risk artifact schema")
     heldout = risk_artifact.get("risk_gate", {}).get("heldout_diagnostic", {})
     if float(heldout.get("heldout_roc_auc", 0.0)) < float(
@@ -316,7 +314,6 @@ def main() -> None:
             ),
             retrieval_query=retrieval_query,
             matched_memory=matched,
-            shuffled_memory=None,
             abstain_reason=abstain_reason,
         )
         assignments.append(assignment)
@@ -328,10 +325,9 @@ def main() -> None:
                 flush=True,
             )
 
-    trace_path = args.output.with_name("observation_assignments.unshuffled.jsonl")
+    trace_path = args.output.with_name("observation_assignments.jsonl")
     write_jsonl(trace_path, (item.to_dict() for item in assignments))
-    deranger = MatchedMemoryDeranger(seed=args.shuffle_seed)
-    frozen_assignments, shuffle_report = deranger.assign(assignments)
+    frozen_assignments = tuple(assignments)
     abstain_counts: dict[str, int] = {}
     for item in frozen_assignments:
         if item.abstain_reason:
@@ -370,7 +366,6 @@ def main() -> None:
                 "analyzer": asdict(bm25.analyzer.config),
                 "bm25": asdict(bm25.config),
             },
-            "shuffle": shuffle_report,
             "injection_policy": profile.injection_policy,
             "assignment_policy": (
                 "observation_only_gate_and_retrieval_then_frozen_replay"
@@ -411,12 +406,11 @@ def main() -> None:
         "assignment_build_report.json"
     )
     report = {
-        "schema_version": "experience-memory-e1-assignment-build-report-v2",
+        "schema_version": "experience-memory-e1-assignment-build-report-v3",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed",
         "answer_or_reward_used": False,
         "summary": manifest["summary"],
-        "shuffle": shuffle_report,
         "observation_trace": {
             "path": trace_path.name,
             "sha256": file_sha256(trace_path),

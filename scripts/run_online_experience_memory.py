@@ -23,8 +23,8 @@ from memgen.experience.phase1 import (
     iter_jsonl,
     text_sha256,
 )
-from memgen.experience.phase2 import (
-    STEERING_VECTOR_ARTIFACT_SCHEMA,
+from memgen.experience.risk import (
+    ENTROPY_RISK_ARTIFACT_SCHEMA,
     build_gsm8k_messages,
 )
 from memgen.experience.retrieval import (
@@ -130,7 +130,7 @@ def main() -> None:
     risk_artifact = torch.load(
         args.risk_artifact, map_location="cpu", weights_only=False
     )
-    if risk_artifact.get("schema_version") != STEERING_VECTOR_ARTIFACT_SCHEMA:
+    if risk_artifact.get("schema_version") != ENTROPY_RISK_ARTIFACT_SCHEMA:
         raise ValueError("Unexpected entropy-risk artifact schema")
     heldout = risk_artifact.get("risk_gate", {}).get("heldout_diagnostic", {})
     if float(heldout.get("heldout_roc_auc", 0.0)) < float(

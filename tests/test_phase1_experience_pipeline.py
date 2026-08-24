@@ -20,7 +20,6 @@ from memgen.experience.phase1 import (
     create_gsm8k_split_manifest,
     route_ai_review,
     split_audit_reasons,
-    summarize_human_review,
 )
 from scripts.build_teacher_bank import TeacherClient, jsonl_examples
 from scripts.build_teacher_bank import teacher_messages
@@ -405,36 +404,6 @@ class VerifierDiagnosticTests(unittest.TestCase):
         self.assertEqual(report["verified_success_rollouts"], 1)
 
 
-class HumanReviewTests(unittest.TestCase):
-    def test_requires_complete_ninety_percent_agreement(self) -> None:
-        records = []
-        for index in range(10):
-            records.append({
-                "experience_id": f"experience-{index}",
-                "human_review": {
-                    "target_supported": True,
-                    "reference_supported": True,
-                    "target_reference_distinct": True,
-                    "factually_consistent": index != 0,
-                },
-            })
-        result = summarize_human_review(
-            records,
-            required_sample_size=10,
-            required_agreement=0.9,
-        )
-        self.assertTrue(result["passed"])
-        self.assertEqual(result["agreement"], 0.9)
-
-        records[1]["human_review"]["factually_consistent"] = None
-        incomplete = summarize_human_review(
-            records,
-            required_sample_size=10,
-            required_agreement=0.9,
-        )
-        self.assertFalse(incomplete["passed"])
-
-
 class AIReviewRoutingTests(unittest.TestCase):
     def review(
         self,
@@ -581,63 +550,6 @@ class AIReviewRoutingTests(unittest.TestCase):
         self.assertIn("intentionally hidden", messages[0]["content"])
         self.assertNotIn("automatic_gate_reasons", messages[1]["content"])
         self.assertNotIn('"quality"', messages[1]["content"])
-
-    def test_dispute_finalizer_merges_only_completed_human_decisions(self) -> None:
-        script = Path(__file__).resolve().parents[1] / "scripts" / "finalize_phase1_disputes.py"
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            ai_approved = root / "ai-approved.jsonl"
-            ai_rejected = root / "ai-rejected.jsonl"
-            disputes = root / "disputes.jsonl"
-            final_approved = root / "final-approved.jsonl"
-            final_rejected = root / "final-rejected.jsonl"
-            report = root / "report.json"
-            ai_approved.write_text('{"experience_id":"auto"}\n', encoding="utf-8")
-            ai_rejected.write_text("", encoding="utf-8")
-            disputes.write_text(
-                json.dumps(
-                    {
-                        "experience_id": "disputed",
-                        "automatic_gate": {"passed": True, "reasons": []},
-                        "ai_review": {"decision": "reject"},
-                        "teacher_record": {"experience_id": "disputed"},
-                        "human_resolution": {
-                            "decision": "approve",
-                            "reviewer_notes": "resolved from source evidence",
-                        },
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "--ai-approved",
-                    str(ai_approved),
-                    "--ai-rejected",
-                    str(ai_rejected),
-                    "--human-review",
-                    str(disputes),
-                    "--final-approved",
-                    str(final_approved),
-                    "--final-rejected",
-                    str(final_rejected),
-                    "--report-output",
-                    str(report),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            approved_records = [
-                json.loads(line) for line in final_approved.read_text().splitlines()
-            ]
-            self.assertEqual(len(approved_records), 2)
-            self.assertTrue(json.loads(report.read_text())["passed"])
-
 
 class TeacherClientTests(unittest.TestCase):
     def test_teacher_script_can_start_outside_repository(self) -> None:

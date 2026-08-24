@@ -1,11 +1,12 @@
 # MemGen
 
-MemGen 让 Agent 在推理流中插入 latent memory，而不更新 reasoner 参数或依赖外部文本
-数据库。当前仓库的正式实验采用“版本化 YAML 配置 + 一键 Bash 脚本”的工作流：代码、
-配置和脚本提交到 Git；模型、数据集、日志和结果保留在服务器磁盘。
+MemGen 让 Agent 在推理流中插入 latent memory，而不更新 reasoner 参数。当前仓库同时保留
+原始 MemGen 训练框架，以及 verifier-backed experience memory 研究主线。模型、数据集、
+checkpoint、日志和实验产物只保存在服务器，不进入 Git。
 
-详细实验约定见 [docs/experiment_workflow.md](docs/experiment_workflow.md)，脚本说明见
-[scripts/experiments/README.md](scripts/experiments/README.md)。
+当前经验记忆结论与系统契约见
+[experience_calibrated_steering_plan.md](docs/codex/experience_calibrated_steering_plan.md)，
+可运行入口见 [scripts/experiments/README.md](scripts/experiments/README.md)。
 
 ## 服务器首次设置
 
@@ -35,36 +36,8 @@ bash scripts/experiments/<dataset>/run_<method>.sh
 1. `configs/experiments/<dataset>/<method>.yaml`
 2. `scripts/experiments/<dataset>/run_<method>.sh`
 
-## 当前：GSM8K entropy gate
+## 当前经验记忆评测
 
-该实验使用最后一层、去除前 4 个 attention-sink token 后的注意力熵，在 delimiter
-边界决定是否调用 Weaver。先在 validation 集校准阈值：
-
-```bash
-bash scripts/experiments/gsm8k/run_entropy_calibration_sink4_q85.sh
-```
-
-脚本结束后会打印生成的 `entropy_threshold.json` 路径。把它传给 test 脚本：
-
-```bash
-bash scripts/experiments/gsm8k/run_entropy_eval_sink4_q85.sh \
-  /absolute/path/to/entropy_threshold.json
-```
-
-每次评测的 `evaluate/` 目录包含：
-
-- `answer.json`：模型回答与结果；
-- `augmentation_positions.csv`：实际 latent 插入位置；
-- `entropy_gate_trace.csv`：每个 delimiter 候选点的 entropy 与门控决定。
-
-## Teacher-constructed bank MVP
-
-离线 bank 构造不会更新 student 模型参数。配置好未提交的
-`DEEPSEEK_API_KEY` 后，可生成五条可检查的 GSM8K train bank record：
-
-```bash
-bash scripts/experiments/gsm8k/build_teacher_bank_preview.sh
-```
-
-输出位于 `MEMGEN_OUTPUT_ROOT/banks/gsm8k/`；详情见
-[docs/teacher_bank_mvp.md](docs/teacher_bank_mvp.md)。
+完整系统只评测三种条件：`vanilla`、`gate_observation_only` 和
+`matched_persistent_memory`。服务器同步 `main` 后按顺序运行 Phase 1、risk gate、E0 与 E1D；
+命令和所需 artifact 路径见实验入口文档。旧过程性实验与负向路线可从 Git 历史恢复。

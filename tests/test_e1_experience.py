@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from collections import Counter
 import unittest
 
 from memgen.experience.e1 import (
+    E1_CONDITIONS,
     E1Assignment,
     GateObservation,
-    MatchedMemoryDeranger,
     MemoryChoice,
     paired_binary_effect,
 )
@@ -52,7 +51,6 @@ def assignment(sample_id: str, choice: MemoryChoice | None) -> E1Assignment:
         prefix_token_ids_sha256=canonical_json_sha256(list(prefix)),
         retrieval_query={"query_hash": f"query-{sample_id}"},
         matched_memory=choice,
-        shuffled_memory=None,
         abstain_reason=None if choice is not None else "no_hit",
     )
 
@@ -62,6 +60,14 @@ class E1AssignmentTests(unittest.TestCase):
         original = assignment("sample-0", memory_choice("a", 100))
         restored = E1Assignment.from_dict(original.to_dict())
         self.assertEqual(restored, original)
+        self.assertEqual(
+            E1_CONDITIONS,
+            (
+                "vanilla",
+                "gate_observation_only",
+                "matched_persistent_memory",
+            ),
+        )
 
     def test_rejects_a_treatment_prefix_with_the_wrong_boundary(self) -> None:
         value = assignment("sample-0", memory_choice("a", 100)).to_dict()
@@ -71,46 +77,6 @@ class E1AssignmentTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "boundary token"):
             E1Assignment.from_dict(value)
-
-
-class MatchedMemoryDerangerTests(unittest.TestCase):
-    def test_preserves_the_exact_memory_multiset_without_self_assignment(self) -> None:
-        inputs = (
-            assignment("sample-0", memory_choice("a", 100)),
-            assignment("sample-1", memory_choice("a", 100)),
-            assignment("sample-2", memory_choice("b", 120)),
-            assignment("sample-3", memory_choice("b", 120)),
-            assignment("sample-4", memory_choice("c", 140)),
-            assignment("sample-5", memory_choice("c", 140)),
-        )
-        output, report = MatchedMemoryDeranger(seed=42).assign(inputs)
-        matched = Counter(item.matched_memory.memory_id for item in output)
-        shuffled = Counter(item.shuffled_memory.memory_id for item in output)
-        self.assertEqual(matched, shuffled)
-        self.assertTrue(
-            all(
-                item.matched_memory.memory_id != item.shuffled_memory.memory_id
-                for item in output
-            )
-        )
-        self.assertEqual(report["assigned_count"], len(inputs))
-        self.assertEqual(
-            report["matched_memory_multiset_sha256"],
-            report["shuffled_memory_multiset_sha256"],
-        )
-        self.assertTrue(
-            all(item.shuffled_memory.retrieval_score is None for item in output)
-        )
-
-    def test_fails_when_one_retrieval_id_cannot_be_deranged(self) -> None:
-        inputs = (
-            assignment("sample-0", memory_choice("a", 100)),
-            assignment("sample-1", memory_choice("a", 100)),
-            assignment("sample-2", memory_choice("a", 100)),
-            assignment("sample-3", memory_choice("b", 120)),
-        )
-        with self.assertRaisesRegex(ValueError, "too concentrated"):
-            MatchedMemoryDeranger().assign(inputs)
 
 
 class PairedEffectTests(unittest.TestCase):

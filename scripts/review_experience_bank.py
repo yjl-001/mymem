@@ -120,7 +120,7 @@ Do not reject merely because an abstraction omits other errors in the same
 trajectory or is less specific than the instance. Any visibly present,
 causally relevant failure may be abstracted unless the bank falsely calls it
 the sole or primary cause. Treat a valid generalization as supported, not
-unsupported. Use partially_supported for real residual ambiguity.
+unsupported. Use partially_supported for real remaining ambiguity.
 
 Evaluate independently. The automatic gate result is intentionally hidden from
 you to prevent anchoring. Assess all eight bank fields and all five pair-level

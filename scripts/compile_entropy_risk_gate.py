@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Diagnose high-entropy recovery risk and compile one fixed Phase-2 vector.
+"""Compile the qualified high-entropy persistence-risk gate artifact.
 
-This is intentionally narrower than the earlier vector ablation: it uses a
-single, pre-registered layer and a single state vector.  First it asks whether
-the current hidden state of a high-entropy boundary can distinguish a next-step
-recovery from persistence on *held-out experiences*.  Only a passing diagnostic
-emits the vector artifact used by the online probe.
+The serialized schema remains stable so qualified server artifacts stay
+loadable. The compiler emits risk prototypes and diagnostics only; it does not
+authorize or evaluate a residual-vector intervention.
 """
 
 from __future__ import annotations
@@ -28,9 +26,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from memgen.chat_templates import CONVERSATION_TEMPLATE
 from memgen.experience.phase1 import file_sha256, iter_jsonl, write_jsonl
-from memgen.experience.phase2 import (
-    PHASE2_ELIGIBLE_EXPERIENCE_TYPES,
-    STEERING_VECTOR_ARTIFACT_SCHEMA,
+from memgen.experience.risk import (
+    ENTROPY_RISK_ARTIFACT_SCHEMA,
     approved_experiences,
     binary_average_precision,
     binary_roc_auc,
@@ -240,7 +237,10 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, revision=args.model_revision, torch_dtype=dtype, attn_implementation="eager"
+        args.model,
+        revision=args.model_revision,
+        dtype=dtype,
+        attn_implementation="eager",
     ).to(args.device)
     model.eval()
     context_limit = args.max_sequence_length or model_context_limit(model)
@@ -329,7 +329,7 @@ def main() -> None:
         if counts.get(label, 0) < args.min_events_per_label
     ]
     base_report = {
-        "schema_version": "phase2-entropy-risk-diagnostic-v2",
+        "schema_version": "entropy-risk-diagnostic-v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "selected_pair_count": len(selected), "context_eligible_pair_count": len(pairs),
         "candidate_boundary_count": len(all_entropies),
@@ -408,13 +408,10 @@ def main() -> None:
         write_report(report_path, base_report)
         raise RuntimeError(f"Held-out entropy-risk ROC AUC {auc:.4f} is below {args.min_heldout_roc_auc:.4f}")
 
-    vector = recovery_center - persistence_center
-    if not torch.isfinite(vector).all() or float(vector.square().mean().sqrt().item()) <= 0:
-        raise RuntimeError("Entropy-risk state vector is non-finite or zero")
-    artifact_path = output_dir / "phase2-entropy-risk-state-delta-answer_correctness.pt"
+    artifact_path = output_dir / "entropy-risk-gate-answer_correctness.pt"
     artifact = {
-        "schema_version": STEERING_VECTOR_ARTIFACT_SCHEMA,
-        "artifact_id": "phase2-entropy-risk-state-delta-answer_correctness",
+        "schema_version": ENTROPY_RISK_ARTIFACT_SCHEMA,
+        "artifact_id": "entropy-risk-gate-answer_correctness",
         "experience_type": "answer_correctness",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "reasoner": {
@@ -423,10 +420,11 @@ def main() -> None:
             "tokenizer_revision": str(getattr(tokenizer, "init_kwargs", {}).get("_commit_hash") or args.model_revision),
         },
         "construction": {
-            "source": "frozen_phase1_ai_approved_bank_no_phase2_ai",
-            "method": "entropy_risk_state_delta", "fixed_layer": args.layer,
+            "source": "frozen_phase1_ai_approved_bank_no_additional_ai",
+            "method": "entropy_risk_prototype_classifier",
+            "fixed_layer": args.layer,
             "boundary_definition": "preboxed_delimiter_with_next_reasoning_boundary",
-            "condition": "high_entropy_recovery_minus_persistence_all_outcomes_train_only",
+            "condition": "high_entropy_recovery_vs_persistence_all_outcomes_train_only",
             "sink_token_count": args.sink_token_count,
             "high_entropy_quantile": args.high_entropy_quantile, "high_entropy_threshold": high_threshold,
             "low_entropy_quantile": args.low_entropy_quantile, "low_entropy_threshold": low_threshold,
@@ -436,8 +434,6 @@ def main() -> None:
             "score_definition": diagnostic["risk_score"], "threshold": 0.0,
             "fit_partition": "bank-train", "heldout_diagnostic": diagnostic,
         },
-        "vectors": {args.layer: vector},
-        "vector_rms": {str(args.layer): float(vector.square().mean().sqrt().item())},
         "evidence_count": min(len(recovery_train), len(persistence_train)),
         "recovery_event_counts": event_counts,
         "source_episode_ids": [
@@ -449,8 +445,10 @@ def main() -> None:
     torch.save(artifact, artifact_path)
     base_report.update({
         "status": "passed", "risk_diagnostic": diagnostic,
-        "artifact": {"path": artifact_path.name, "sha256": file_sha256(artifact_path),
-                     "vector_rms": artifact["vector_rms"]},
+        "artifact": {
+            "path": artifact_path.name,
+            "sha256": file_sha256(artifact_path),
+        },
     })
     write_report(report_path, base_report)
     print(f"[entropy-risk] passed auc={auc:.4f} artifact={artifact_path} report={report_path}", flush=True)

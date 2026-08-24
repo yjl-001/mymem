@@ -24,7 +24,7 @@ from memgen.experience.phase1 import (
     text_sha256,
     write_jsonl,
 )
-from memgen.experience.phase2 import build_gsm8k_messages
+from memgen.experience.risk import build_gsm8k_messages
 
 
 _ANSWER_MARKER_RE = re.compile(

@@ -9,7 +9,7 @@ import unittest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RUNNER = PROJECT_ROOT / "scripts/experiments/gsm8k/run_e1_experience_memory.sh"
+RUNNER = PROJECT_ROOT / "scripts/experiments/gsm8k/run_e1d_full_system.sh"
 
 
 class E1RunnerConfigurationTests(unittest.TestCase):
