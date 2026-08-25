@@ -8,8 +8,9 @@ They provide a separate, training-free E0/E1 mechanism:
 * :class:`SideKVAttentionController` temporarily augments one Qwen2 attention
   layer while leaving the native Hugging Face cache and token positions intact.
 
-The first version is deliberately restricted to eager attention and batch size
-one.  Those restrictions make attention mass and cache invariants inspectable.
+The runtime is deliberately restricted to Hugging Face's SDPA attention and
+batch size one.  Model outputs use ``scaled_dot_product_attention`` while
+attention entropy and memory mass are recomputed on a detached audit path.
 """
 
 from __future__ import annotations
@@ -31,8 +32,9 @@ from memgen.experience.memory import MemoryRecord
 from memgen.experience.phase1 import canonical_json_sha256, file_sha256
 
 
-SIDE_KV_BANK_SCHEMA = "canonical-side-kv-bank-v1"
-SIDE_KV_TRACE_SCHEMA = "side-kv-attention-trace-v2"
+SIDE_KV_BANK_SCHEMA = "canonical-side-kv-bank-v2"
+SIDE_KV_TRACE_SCHEMA = "side-kv-attention-trace-v3"
+SIDE_KV_ATTENTION_BACKEND = "sdpa"
 DEFAULT_COMPILER_PREFIX = (
     "<|im_start|>system\n"
     "Read the following reusable reasoning guideline as internal guidance."
@@ -67,12 +69,15 @@ class SideKVCompilerConfig:
     layer_number: int = 24
     template_prefix: str = DEFAULT_COMPILER_PREFIX
     relative_phase_delta: int = 0
+    attention_backend: str = SIDE_KV_ATTENTION_BACKEND
 
     def __post_init__(self) -> None:
         if self.layer_number <= 0:
             raise ValueError("layer_number must be positive")
         if self.relative_phase_delta != 0:
-            raise ValueError("E0-v1 fixes relative_phase_delta to zero")
+            raise ValueError("Canonical side-KV fixes relative_phase_delta to zero")
+        if self.attention_backend != SIDE_KV_ATTENTION_BACKEND:
+            raise ValueError("Canonical side-KV compilation requires SDPA")
         if not self.template_prefix:
             raise ValueError("template_prefix must not be empty")
 
@@ -178,6 +183,131 @@ class QwenAttentionProtocol:
 
 
 @dataclass(frozen=True)
+class AttentionEntropyObservation:
+    """Sink-masked mean-head entropy for every live query position."""
+
+    entropy_by_query: torch.Tensor
+    native_key_length: int
+
+
+class SDPAAttentionEntropyObserver:
+    """Observe Qwen attention entropy without changing the SDPA output path.
+
+    The selected attention module still executes its original Hugging Face
+    forward.  The observer only reconstructs Q/K scores after that call and
+    immediately reduces them to one entropy value per query.  This replaces
+    ``output_attentions=True``, which SDPA does not support.
+    """
+
+    def __init__(self, *, model: Any, sink_token_count: int):
+        if sink_token_count < 0:
+            raise ValueError("sink_token_count must be non-negative")
+        self.sink_token_count = sink_token_count
+        layers = DecoderLayerResolver.resolve(model)
+        if not layers:
+            raise ValueError("Reasoner has no decoder layers")
+        self.module = getattr(layers[-1], "self_attn", None)
+        if self.module is None:
+            raise ValueError("Final decoder block has no self_attn")
+        _require_sdpa(self.module, owner=type(self).__name__)
+        self._protocol = QwenAttentionProtocol(self.module.forward)
+        self._original_forward = self.module.forward
+        self._capture_active = False
+        self._observation: AttentionEntropyObservation | None = None
+        self._closed = False
+        observer = self
+
+        def patched_forward(module_self: Any, *args: Any, **kwargs: Any):
+            call = observer._protocol.bind(args, kwargs)
+            output = observer._original_forward(*args, **kwargs)
+            if observer._capture_active:
+                observer._observation = observer._observe(module_self, call)
+            return output
+
+        self.module.forward = types.MethodType(patched_forward, self.module)
+
+    @contextmanager
+    def capture(self) -> Iterator["SDPAAttentionEntropyObserver"]:
+        if self._closed:
+            raise RuntimeError("Cannot use a closed SDPA entropy observer")
+        if self._capture_active:
+            raise RuntimeError("SDPA entropy capture is already active")
+        self._capture_active = True
+        self._observation = None
+        try:
+            yield self
+        finally:
+            self._capture_active = False
+
+    @property
+    def observation(self) -> AttentionEntropyObservation:
+        if self._observation is None:
+            raise RuntimeError("SDPA entropy capture produced no observation")
+        return self._observation
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._capture_active = False
+        self.module.forward = self._original_forward
+        self._closed = True
+
+    def _observe(
+        self, module: Any, call: QwenAttentionCall
+    ) -> AttentionEntropyObservation:
+        if call.position_embeddings is None:
+            raise ValueError("SDPA entropy observation requires position_embeddings")
+        hidden_states = call.hidden_states
+        batch_size, query_length, _ = hidden_states.shape
+        head_dim = int(module.head_dim)
+        num_query_heads = int(module.config.num_attention_heads)
+        num_kv_heads = int(module.config.num_key_value_heads)
+        query_pre = module.q_proj(hidden_states).view(
+            batch_size, query_length, num_query_heads, head_dim
+        ).transpose(1, 2)
+        key_pre = module.k_proj(hidden_states).view(
+            batch_size, query_length, num_kv_heads, head_dim
+        ).transpose(1, 2)
+        cos, sin = call.position_embeddings
+        query, current_keys = apply_rotary_pos_emb(query_pre, key_pre, cos, sin)
+        if call.past_key_value is None:
+            native_keys = current_keys
+        else:
+            try:
+                native_keys = call.past_key_value[int(module.layer_idx)][0]
+            except (IndexError, KeyError, TypeError, AttributeError) as error:
+                raise RuntimeError("Unable to inspect the updated native SDPA cache") from error
+        native_keys = repeat_kv(native_keys, int(module.num_key_value_groups))
+        scores = torch.matmul(query, native_keys.transpose(2, 3)) * float(
+            module.scaling
+        )
+        allowed = _native_allowed_mask(
+            attention_mask=call.attention_mask,
+            batch_size=batch_size,
+            query_length=query_length,
+            native_key_length=native_keys.shape[-2],
+            device=scores.device,
+        )
+        selected = allowed & (
+            allowed.to(dtype=torch.int64).cumsum(dim=-1) > self.sink_token_count
+        )
+        valid_query = selected.any(dim=-1)
+        masked_scores = scores.float().masked_fill(
+            ~selected.unsqueeze(1), torch.finfo(torch.float32).min
+        )
+        probabilities = F.softmax(masked_scores, dim=-1)
+        entropy = -(
+            probabilities
+            * probabilities.clamp_min(torch.finfo(torch.float32).tiny).log()
+        ).sum(dim=-1).mean(dim=1)
+        entropy = entropy.masked_fill(~valid_query, torch.nan).detach()
+        return AttentionEntropyObservation(
+            entropy_by_query=entropy,
+            native_key_length=int(native_keys.shape[-2]),
+        )
+
+
+@dataclass(frozen=True)
 class CompiledSideKVBank:
     """Padded tensor bank plus its content-addressed manifest."""
 
@@ -245,6 +375,7 @@ class CanonicalSideKVCompiler:
         self.attention = getattr(self.decoder_layer, "self_attn", None)
         if self.attention is None:
             raise ValueError("Selected decoder block has no self_attn module")
+        _require_sdpa(self.attention, owner=type(self).__name__)
         for attribute in ("input_layernorm",):
             if not hasattr(self.decoder_layer, attribute):
                 raise ValueError(f"Selected decoder block has no {attribute}")
@@ -498,6 +629,9 @@ class SideKVBankLoader:
             raise ValueError("Side-KV manifest hash mismatch")
         if self.manifest.get("canonical_pre_rope") is not True:
             raise ValueError("Side-KV bank is not canonical pre-RoPE")
+        compiler = self.manifest.get("compiler", {})
+        if compiler.get("attention_backend") != SIDE_KV_ATTENTION_BACKEND:
+            raise ValueError("Side-KV bank was not compiled for SDPA")
         if self.manifest.get("relative_phase_delta") != 0:
             raise ValueError("E0-v1 side-KV manifest must use relative phase delta zero")
         records = self.manifest.get("records")
@@ -576,7 +710,7 @@ class SideKVBankLoader:
 
 
 class SideKVAttentionController:
-    """Attach one persistent memory to one eager Qwen2 attention layer.
+    """Attach one persistent memory to one SDPA Qwen2 attention layer.
 
     When no memory is active, the original module forward is called unchanged.
     With a memory active, only native token K/V are passed to ``past_key_value``;
@@ -613,11 +747,7 @@ class SideKVAttentionController:
         if self.module is None:
             raise ValueError("Selected decoder block has no self_attn")
         self._attention_protocol = self._validate_attention_protocol()
-        implementation = getattr(
-            getattr(self.module, "config", None), "_attn_implementation", None
-        )
-        if implementation != "eager":
-            raise ValueError("SideKVAttentionController requires eager attention")
+        _require_sdpa(self.module, owner=type(self).__name__)
         self._original_forward = self.module.forward
         self._active_memory: SideKVMemory | None = None
         self._traces: list[SideKVAttentionTrace] = []
@@ -695,7 +825,7 @@ class SideKVAttentionController:
         self,
         module: Any,
         call: QwenAttentionCall,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, None]:
         memory = self._active_memory
         if memory is None:
             raise RuntimeError("Active side-KV forward has no memory")
@@ -707,6 +837,10 @@ class SideKVAttentionController:
         batch_size, query_length, _ = hidden_states.shape
         if self.require_batch_size_one and batch_size != 1:
             raise ValueError("Side-KV E0/E1 integration requires batch size one")
+        if query_length != 1:
+            raise ValueError(
+                "Persistent side-KV is defined only for single-token SDPA decode"
+            )
 
         head_dim = int(module.head_dim)
         num_query_heads = int(module.config.num_attention_heads)
@@ -743,39 +877,25 @@ class SideKVAttentionController:
 
         native_keys = repeat_kv(key_rotated, num_kv_groups)
         native_values = repeat_kv(value_states, num_kv_groups)
-        native_scores = torch.matmul(
-            query_rotated,
-            native_keys.transpose(2, 3),
-        ) * float(module.scaling)
-        if call.attention_mask is not None:
-            native_scores = (
-                native_scores
-                + call.attention_mask[:, :, :, : native_keys.shape[-2]]
-            )
-
         memory_keys = memory.keys.to(device=query_pre.device, dtype=query_pre.dtype)
         memory_values = memory.values.to(device=query_pre.device, dtype=query_pre.dtype)
         if memory_keys.shape[0] != num_kv_heads or memory_keys.shape[-1] != head_dim:
             raise ValueError("Runtime side-KV shape does not match the selected Qwen layer")
-        expanded_memory_keys = repeat_kv(memory_keys.unsqueeze(0), num_kv_groups).expand(
-            batch_size, -1, -1, -1
-        )
+        canonical_memory_keys = repeat_kv(
+            memory_keys.unsqueeze(0), num_kv_groups
+        ).expand(batch_size, -1, -1, -1)
         expanded_memory_values = repeat_kv(
             memory_values.unsqueeze(0), num_kv_groups
         ).expand(batch_size, -1, -1, -1)
-        memory_scores = canonical_memory_scores(
-            query_pre,
-            expanded_memory_keys,
-            scaling=float(module.scaling),
+        memory_keys_rotated = rotate_canonical_memory_keys(
+            canonical_memory_keys=canonical_memory_keys,
+            cos=cos,
+            sin=sin,
         )
-        if self.memory_score_normalization == "log_valid_slots":
-            memory_scores = memory_scores - math.log(memory.valid_slot_count)
-        if self.memory_score_bias:
-            memory_scores = memory_scores + self.memory_score_bias
         rope_score_relative_error = (
             shared_rope_score_relative_error(
                 query_pre_rope=query_pre,
-                canonical_memory_keys=expanded_memory_keys,
+                canonical_memory_keys=canonical_memory_keys,
                 cos=cos,
                 sin=sin,
                 scaling=float(module.scaling),
@@ -784,21 +904,51 @@ class SideKVAttentionController:
             else None
         )
         slot_mask = memory.slot_mask.to(device=query_pre.device, dtype=torch.bool)
-        memory_scores = memory_scores.masked_fill(
+        score_shift = self.memory_score_bias
+        if self.memory_score_normalization == "log_valid_slots":
+            score_shift -= math.log(memory.valid_slot_count)
+        native_mask = _native_additive_mask(
+            attention_mask=call.attention_mask,
+            batch_size=batch_size,
+            query_length=query_length,
+            native_key_length=native_keys.shape[-2],
+            device=query_pre.device,
+            dtype=query_pre.dtype,
+        )
+        memory_mask = torch.full(
+            (batch_size, 1, query_length, memory_keys_rotated.shape[-2]),
+            fill_value=score_shift,
+            device=query_pre.device,
+            dtype=query_pre.dtype,
+        )
+        memory_mask = memory_mask.masked_fill(
             ~slot_mask.view(1, 1, 1, -1),
-            torch.finfo(memory_scores.dtype).min,
+            torch.finfo(query_pre.dtype).min,
         )
-
-        joint_scores = torch.cat([native_scores, memory_scores], dim=-1)
-        joint_weights = F.softmax(joint_scores, dim=-1, dtype=torch.float32).to(
-            query_pre.dtype
-        )
+        joint_mask = torch.cat([native_mask, memory_mask], dim=-1)
+        joint_keys = torch.cat([native_keys, memory_keys_rotated], dim=-2)
         joint_values = torch.cat([native_values, expanded_memory_values], dim=-2)
-        attention_output = torch.matmul(joint_weights, joint_values)
+        attention_output = F.scaled_dot_product_attention(
+            query_rotated.contiguous(),
+            joint_keys.contiguous(),
+            joint_values.contiguous(),
+            attn_mask=joint_mask,
+            dropout_p=0.0,
+            scale=float(module.scaling),
+            is_causal=False,
+        )
         attention_output = attention_output.transpose(1, 2).contiguous().reshape(
             batch_size, query_length, -1
         )
         attention_output = module.o_proj(attention_output)
+
+        joint_scores = torch.matmul(
+            query_rotated, joint_keys.transpose(2, 3)
+        ) * float(module.scaling)
+        joint_scores = joint_scores + joint_mask
+        joint_weights = F.softmax(joint_scores, dim=-1, dtype=torch.float32).to(
+            query_pre.dtype
+        )
 
         native_length = native_keys.shape[-2]
         memory_weights = joint_weights[..., native_length:]
@@ -833,7 +983,95 @@ class SideKVAttentionController:
                 memory_score_bias=self.memory_score_bias,
             )
         )
-        return attention_output, joint_weights
+        return attention_output, None
+
+
+def _require_sdpa(module: Any, *, owner: str) -> None:
+    implementation = getattr(
+        getattr(module, "config", None), "_attn_implementation", None
+    )
+    if implementation != SIDE_KV_ATTENTION_BACKEND:
+        raise ValueError(f"{owner} requires SDPA attention")
+
+
+def _native_allowed_mask(
+    *,
+    attention_mask: torch.Tensor | None,
+    batch_size: int,
+    query_length: int,
+    native_key_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return the native causal/padding visibility mask as ``[B,Q,K]``."""
+
+    if attention_mask is not None:
+        if attention_mask.ndim != 4:
+            raise ValueError("Qwen SDPA attention mask must be four-dimensional")
+        sliced = attention_mask[:, :, :query_length, :native_key_length]
+        if sliced.shape[1] != 1:
+            raise ValueError("Qwen SDPA attention mask must have one broadcast head")
+        allowed = sliced[:, 0] if sliced.dtype == torch.bool else sliced[:, 0] >= 0
+        return allowed.expand(
+            batch_size, query_length, native_key_length
+        )
+    past_length = native_key_length - query_length
+    if past_length < 0:
+        raise ValueError("Native key length is shorter than query length")
+    query_positions = torch.arange(query_length, device=device) + past_length
+    key_positions = torch.arange(native_key_length, device=device)
+    return (key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)).unsqueeze(
+        0
+    ).expand(batch_size, -1, -1)
+
+
+def _native_additive_mask(
+    *,
+    attention_mask: torch.Tensor | None,
+    batch_size: int,
+    query_length: int,
+    native_key_length: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if attention_mask is not None:
+        sliced = attention_mask[:, :, :query_length, :native_key_length].to(
+            device=device
+        )
+        if sliced.dtype != torch.bool:
+            return sliced.to(dtype=dtype)
+        additive = torch.zeros(sliced.shape, device=device, dtype=dtype)
+        return additive.masked_fill(~sliced, torch.finfo(dtype).min)
+    allowed = _native_allowed_mask(
+        attention_mask=None,
+        batch_size=batch_size,
+        query_length=query_length,
+        native_key_length=native_key_length,
+        device=device,
+    )
+    mask = torch.zeros(
+        (batch_size, 1, query_length, native_key_length),
+        device=device,
+        dtype=dtype,
+    )
+    return mask.masked_fill(~allowed.unsqueeze(1), torch.finfo(dtype).min)
+
+
+def rotate_canonical_memory_keys(
+    *,
+    canonical_memory_keys: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the single live query phase to canonical pre-RoPE memory keys."""
+
+    if cos.shape[1] != 1 or sin.shape[1] != 1:
+        raise ValueError("Canonical memory rotation requires one live query")
+    cos_by_slot = cos.unsqueeze(1)
+    sin_by_slot = sin.unsqueeze(1)
+    return (
+        canonical_memory_keys * cos_by_slot
+        + rotate_half(canonical_memory_keys) * sin_by_slot
+    )
 
 
 def rotate_half(value: torch.Tensor) -> torch.Tensor:

@@ -126,8 +126,8 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         revision=args.model_revision,
-        torch_dtype=dtype,
-        attn_implementation="eager",
+        dtype=dtype,
+        attn_implementation="sdpa",
     ).to(args.device)
     model.eval()
     generation_config = GenerationConfig(
@@ -164,7 +164,7 @@ def main() -> None:
         prefix_ids = prompt_ids + selected_completion
         cases.append(
             {
-                "schema_version": "side-kv-mechanism-audit-case-input-v1",
+                "schema_version": "side-kv-mechanism-audit-case-input-v2",
                 "case_id": f"{sample['sample_id']}-boundary-{boundary_index}",
                 "sample_id": sample["sample_id"],
                 "logical_split": args.logical_split,
@@ -189,7 +189,7 @@ def main() -> None:
     write_jsonl(args.output, cases)
     report_path = args.report_output or args.output.with_name("audit_case_build_report.json")
     report = {
-        "schema_version": "side-kv-mechanism-audit-case-build-report-v1",
+        "schema_version": "side-kv-mechanism-audit-case-build-report-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "answer_or_reward_used": False,
         "logical_split": args.logical_split,
@@ -209,6 +209,7 @@ def main() -> None:
             ),
             "dataset_revision": args.dataset_revision,
             "max_new_tokens": args.max_new_tokens,
+            "attention_implementation": "sdpa",
         },
         "output": {
             "path": str(args.output.resolve()),

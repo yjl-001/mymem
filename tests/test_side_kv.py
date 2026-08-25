@@ -54,7 +54,7 @@ if torch is not None:
         num_attention_heads = 4
         num_key_value_heads = 2
         hidden_size = 8
-        _attn_implementation = "eager"
+        _attn_implementation = "sdpa"
 
 
     class FakeAttention(nn.Module):
@@ -158,6 +158,11 @@ if torch is not None:
             self.cache_kwargs = cache_kwargs
             self.keys = torch.cat([self.keys, keys], dim=-2)
             self.values = torch.cat([self.values, values], dim=-2)
+            return self.keys, self.values
+
+        def __getitem__(self, layer_idx):
+            if layer_idx != 0:
+                raise KeyError(layer_idx)
             return self.keys, self.values
 
 
@@ -284,7 +289,7 @@ class SideKVControllerTests(unittest.TestCase):
                             **call_kwargs,
                         )
                     self.assertEqual(tuple(output.shape), (1, 1, 8))
-                    self.assertEqual(tuple(weights.shape), (1, 4, 1, 6))
+                    self.assertIsNone(weights)
                     self.assertEqual(cache.keys.shape[-2], 4)
                     self.assertTrue(torch.equal(cache.keys[..., :3, :], prefix_keys))
                     self.assertEqual(len(controller.traces), 1)
@@ -324,6 +329,69 @@ class SideKVControllerTests(unittest.TestCase):
             )
         finally:
             controller.close()
+
+    def test_active_memory_rejects_multi_token_prefill(self) -> None:
+        from memgen.model.side_kv import SideKVAttentionController, SideKVMemory
+
+        model = FakeModel().eval()
+        attention = model.model.layers[0].self_attn
+        controller = SideKVAttentionController(model=model, layer_number=1)
+        memory = SideKVMemory(
+            memory_id="memory-fixture",
+            payload_hash="payload",
+            keys=torch.ones(2, 1, 2),
+            values=torch.ones(2, 1, 2),
+            slot_mask=torch.tensor([True]),
+            layer_number=1,
+        )
+        try:
+            with controller.use_memory(memory), self.assertRaisesRegex(
+                ValueError, "single-token SDPA decode"
+            ):
+                attention(
+                    hidden_states=torch.ones(1, 2, 8),
+                    position_embeddings=(
+                        torch.ones(1, 2, 2),
+                        torch.zeros(1, 2, 2),
+                    ),
+                    attention_mask=torch.zeros(1, 1, 2, 2),
+                )
+        finally:
+            controller.close()
+
+
+@unittest.skipIf(torch is None, "Torch is required for SDPA entropy tests")
+class SDPAEntropyObserverTests(unittest.TestCase):
+    def test_observer_preserves_native_forward_and_reduces_entropy(self) -> None:
+        from memgen.model.side_kv import SDPAAttentionEntropyObserver
+
+        torch.manual_seed(11)
+        model = FakeModel().eval()
+        attention = model.model.layers[0].self_attn
+        observer = SDPAAttentionEntropyObserver(
+            model=model,
+            sink_token_count=1,
+        )
+        hidden = torch.randn(1, 3, 8)
+        try:
+            with observer.capture():
+                output = attention(
+                    hidden_states=hidden,
+                    position_embeddings=(
+                        torch.ones(1, 3, 2),
+                        torch.zeros(1, 3, 2),
+                    ),
+                    attention_mask=None,
+                )
+            self.assertEqual(output, "native-forward")
+            entropy = observer.observation.entropy_by_query
+            self.assertEqual(tuple(entropy.shape), (1, 3))
+            self.assertTrue(torch.isnan(entropy[0, 0]))
+            self.assertTrue(torch.isfinite(entropy[0, 1:]).all())
+            self.assertEqual(observer.observation.native_key_length, 3)
+        finally:
+            observer.close()
+        self.assertEqual(attention(hidden_states=hidden), "native-forward")
 
 
 if __name__ == "__main__":

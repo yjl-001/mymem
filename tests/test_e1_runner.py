@@ -93,9 +93,10 @@ class E1RunnerConfigurationTests(unittest.TestCase):
         self.assertEqual(parsed["limit"], "8")
         self.assertEqual(parsed["max_new_tokens"], "1024")
         self.assertEqual(parsed["cuda_visible_devices"], "2")
+        self.assertEqual(parsed["attention_implementation"], "sdpa")
         self.assertEqual(
             parsed["system_profile"],
-            "layer24-bm25-top1-gate-persistent-logslots-log10-v1",
+            "layer24-bm25-top1-gate-persistent-logslots-log10-sdpa-v2",
         )
 
     def test_print_config_allows_full_final_test(self) -> None:

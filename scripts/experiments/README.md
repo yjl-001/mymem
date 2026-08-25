@@ -28,16 +28,16 @@ cp scripts/experiments/gsm8k/e1.server.env.example \
 bash scripts/experiments/gsm8k/run_phase1_verified_bank.sh
 ```
 
-2. 编译冻结 entropy-risk gate artifact：
+2. 在 SDPA 下重新编译冻结 entropy-risk gate artifact：
 
 ```bash
 bash scripts/experiments/gsm8k/run_entropy_risk_gate.sh "$PHASE1_DIR"
 ```
 
-风险 artifact 与 prompt contract 绑定。旧 artifact 使用过带额外换行的 prompt，
-不能与当前 canonical baseline 混用，必须重新编译；这一步不调用 Teacher/Pro。
+风险 artifact 与 prompt contract、attention backend 绑定。旧 eager artifact 不能与当前 SDPA runtime
+混用，必须重新编译；这一步不调用 Teacher/Pro。
 
-3. 构造并审计 MemoryRecord 与 canonical side-KV：
+3. 构造并在 SDPA 下审计 MemoryRecord 与 canonical side-KV：
 
 ```bash
 bash scripts/experiments/gsm8k/run_e0_experience_memory.sh "$PHASE1_DIR"
@@ -72,7 +72,7 @@ bash scripts/experiments/gsm8k/run_base_attention_backend_comparison.sh \
 `attention_implementation`。`comparison_summary.json` 报告两个 backend 各自的 native/cache parity、
 准确率差以及跨 backend 的逐 token 分叉；不运行 gate、检索或 memory 注入。
 
-已确认 eager 会显著破坏当前 reasoner 后，使用同一诊断检查 SDPA：
+已确认 eager 会显著破坏当前 reasoner 后，使用同一诊断完成 SDPA 检查：
 
 ```bash
 MEMGEN_RUN_TAG=base-sdpa-final32-v1 \
@@ -83,6 +83,9 @@ bash scripts/experiments/gsm8k/run_base_attention_backend_comparison.sh \
   --candidate-backend sdpa \
   "$PHASE1_DIR" "$E0_DIR"
 ```
+
+当前 32 题诊断中 SDPA strict accuracy 为 `0.53125`，且 native/cache 逐 token 一致；正式 E1
+固定使用 SDPA。FlashAttention2 仍是质量参考，不与 SDPA 系统效果混称。
 
 5. 运行 gate、BM25 和 persistent side-KV 完整评测：
 

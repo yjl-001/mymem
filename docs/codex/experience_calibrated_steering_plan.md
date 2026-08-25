@@ -15,7 +15,8 @@
 ### 何时需要经验
 
 - 高熵和 layer-24 hidden state 可以区分“高熵后自然恢复”与“持续发散”。
-- held-out ROC-AUC 为 `0.8053`，balanced accuracy 为 `0.7158`。
+- eager 历史 artifact 的 held-out ROC-AUC 为 `0.8053`，balanced accuracy 为 `0.7158`；该数值不能
+  直接用于 SDPA，正式运行前必须重新编译并通过相同 held-out 门槛。
 - gate 只负责决定何时访问经验，不负责决定经验内容。
 
 ### 已关闭路线
@@ -23,7 +24,7 @@
 - 全局 `recovery - persistence` residual vector 在独立确认中无效；不再调整 alpha、layer、符号或样本量。
 - 同题 local-action raw hidden-state 检索 margin 很低；不再用于具体经验检索。
 
-### E0 side-KV 机制
+### E0 side-KV 机制（历史 eager 证据）
 
 - 161 条 payload 已编译为 layer-24 canonical pre-RoPE side-KV。
 - 8/8 answer-blind runtime audit cases 通过。
@@ -31,7 +32,8 @@
 - maximum canonical RoPE score relative error 为 `0.00109`。
 - memory K/V 不写入 HuggingFace native cache，disabled path 与原始 logits 保持一致。
 
-这些结果只证明机制正确且能够影响 logits，不证明 memory 内容改善任务表现。
+这些结果只证明旧 eager 机制正确且能够影响 logits，不证明 memory 内容改善任务表现，也不替代新的
+SDPA E0 审计。
 
 ### Attention backend 基线
 
@@ -41,8 +43,13 @@
   因此低 baseline 不是 KV cache 或手工 decode 导致的。
 - 32/32 completion 在 backend 之间最终分叉，但首 token 全部一致，平均共享前缀为 23.125 token。
 - 正式 E1 不再允许使用 eager，也不允许 vanilla 与 matched 使用不同 backend。
+- 同一批 32 题上，SDPA 严格准确率为 `0.53125`、诊断答案准确率为 `0.6875`、格式准确率为
+  `0.65625`，且 SDPA native/cache 逐 token 完全一致。SDPA 因此被选为当前 side-KV 正式 runtime。
+- FlashAttention2 仍是质量参考（严格准确率 `0.65625`），SDPA 结果只能表述为“SDPA runtime 下”的
+  系统效果，不能表述为 FlashAttention2 等价效果。
 
-现有 eager E0 仍可作为机制正确性证据，但迁移到合格 backend 后必须重新编译 risk artifact 和 side-KV bank。
+当前代码已迁移到 SDPA；旧 risk artifact、side-KV bank、E0 final report 和 E1 assignment 均由 schema
+拒绝复用。服务器必须重新生成这些 artifact。
 
 ### 经验内容、检索与通道诊断
 
@@ -77,6 +84,7 @@ question + generated partial CoT
 | 项目 | 当前值 |
 |---|---|
 | layer | 24 |
+| attention backend | SDPA（vanilla、gate observation、matched 完全一致） |
 | gate | 首个同时通过 entropy/risk 阈值的答案前 delimiter |
 | query | 原题 + 最近 96 个 partial-CoT token |
 | retrieval | BM25 top-1，保留 top-2 score/margin 诊断 |
@@ -147,7 +155,7 @@ bash scripts/experiments/gsm8k/run_base_attention_backend_comparison.sh \
   "$PHASE1_DIR" "$E0_DIR"
 ```
 
-结果已确认 attention backend 是主要差异来源。下一步以 FlashAttention2 为参考检查 SDPA：
+结果已确认 attention backend 是主要差异来源。随后以 FlashAttention2 为参考完成了 SDPA 检查：
 
 ```bash
 MEMGEN_RUN_TAG=base-sdpa-final32-v1 \
@@ -159,7 +167,8 @@ bash scripts/experiments/gsm8k/run_base_attention_backend_comparison.sh \
   "$PHASE1_DIR" "$E0_DIR"
 ```
 
-只有 SDPA 的 baseline 质量和 native/cache parity 合格，才考虑将 gate 与 side-KV 迁移到 SDPA。
+该诊断已经满足 SDPA baseline 质量与 native/cache parity 要求；当前 gate 与 side-KV 已固定迁移到
+SDPA。
 
 服务器环境文件只保留输出目录和可选 GPU：
 
@@ -168,7 +177,18 @@ cp scripts/experiments/gsm8k/e1.server.env.example \
   scripts/experiments/gsm8k/.e1.server.env
 ```
 
-开发诊断：
+正式 E1 前必须依次重建 SDPA artifact（旧 eager 目录不可复用）：
+
+```bash
+MEMGEN_RUN_TAG=risk-sdpa-v1 \
+bash scripts/experiments/gsm8k/run_entropy_risk_gate.sh "$PHASE1_DIR"
+
+MEMGEN_RUN_TAG=e0-sdpa-v1 \
+bash scripts/experiments/gsm8k/run_e0_experience_memory.sh "$PHASE1_DIR"
+```
+
+确认新的 risk report 通过 held-out AUC 门槛，且新的 `e0_final_report.json` 中
+`attention_implementation=sdpa`、`formal_e0_passed=true` 后，再运行开发诊断：
 
 ```bash
 source scripts/experiments/gsm8k/.e1.server.env

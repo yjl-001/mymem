@@ -170,7 +170,7 @@ class E1SummaryTests(unittest.TestCase):
                     handle.write(json.dumps(record) + "\n")
 
             run_report = {
-                "schema_version": "experience-memory-e1-run-report-v7",
+                "schema_version": "experience-memory-e1-run-report-v8",
                 "status": "completed",
                 "logical_split": "dev-test",
                 "dataset_split": "train",

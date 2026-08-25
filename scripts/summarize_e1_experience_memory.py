@@ -189,7 +189,7 @@ def main() -> None:
 
     run_report = json.loads(args.run_report.read_text(encoding="utf-8"))
     if (
-        run_report.get("schema_version") != "experience-memory-e1-run-report-v7"
+        run_report.get("schema_version") != "experience-memory-e1-run-report-v8"
         or run_report.get("status") != "completed"
         or run_report.get("logical_split") != manifest.get("logical_split")
         or run_report.get("dataset_split") != manifest.get("dataset_split")

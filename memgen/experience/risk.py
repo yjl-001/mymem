@@ -10,7 +10,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from memgen.experience.phase1 import canonical_json_sha256
 
 
-ENTROPY_RISK_ARTIFACT_SCHEMA = "entropy-risk-gate-artifact-v2"
+ENTROPY_RISK_ARTIFACT_SCHEMA = "entropy-risk-gate-artifact-v3"
 RISK_ELIGIBLE_EXPERIENCE_TYPES = frozenset({
     "answer_correctness",
     "format_compliance",

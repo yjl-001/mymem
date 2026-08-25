@@ -93,8 +93,10 @@ def main() -> None:
     if expected_e0_hash != actual_e0_hash:
         raise ValueError("E0 final report hash mismatch")
     if (
-        e0_final.get("status") != "passed"
+        e0_final.get("schema_version") != "experience-memory-e0-final-report-v2"
+        or e0_final.get("status") != "passed"
         or e0_final.get("formal_e0_passed") is not True
+        or e0_final.get("attention_implementation") != "sdpa"
         or e0_final.get("task_accuracy_used") is not False
         or not e0_final.get("requirements")
         or not all(
@@ -116,7 +118,11 @@ def main() -> None:
         if key != "manifest_sha256"
     }):
         raise ValueError("Side-KV manifest hash mismatch")
-    if int(side_manifest.get("layer_number", -1)) != profile.layer_number:
+    if (
+        int(side_manifest.get("layer_number", -1)) != profile.layer_number
+        or side_manifest.get("compiler", {}).get("attention_backend")
+        != profile.attention_backend
+    ):
         raise ValueError("Side-KV layer differs from the system profile")
     side_entries = {
         str(entry["memory_id"]): entry for entry in side_manifest["records"]
@@ -136,7 +142,7 @@ def main() -> None:
     )
     if risk_artifact.get("schema_version") != ENTROPY_RISK_ARTIFACT_SCHEMA:
         raise ValueError(
-            "Entropy-risk artifact predates the canonical GSM8K prompt; "
+            "Entropy-risk artifact predates the canonical SDPA runtime; "
             "rebuild it with run_entropy_risk_gate.sh"
         )
     if risk_artifact.get("prompt_contract") != GSM8K_PROMPT_CONTRACT.metadata(
@@ -172,7 +178,7 @@ def main() -> None:
         reasoner["model_name"],
         revision=reasoner["model_revision"],
         dtype=dtype,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     ).to(args.device)
     model.eval()
     resolved_model = str(
@@ -238,7 +244,7 @@ def main() -> None:
         list(result.completion_token_ids), skip_special_tokens=True
     ).strip()
     output = {
-        "schema_version": "experience-memory-online-generation-v2",
+        "schema_version": "experience-memory-online-generation-v3",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "completed",
         "answer_or_reward_used": False,

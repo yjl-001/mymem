@@ -267,7 +267,7 @@ def main() -> None:
     )
     if (
         layer != profile.layer_number
-        or reasoner.get("attention_implementation") != "eager"
+        or reasoner.get("attention_implementation") != profile.attention_backend
         or manifest.get("configuration", {}).get("injection_policy")
         != profile.injection_policy
     ):
@@ -290,7 +290,7 @@ def main() -> None:
         model_name,
         revision=model_revision,
         dtype=dtype,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     ).to(args.device)
     model.eval()
     resolved_model_revision = str(
@@ -527,7 +527,7 @@ def main() -> None:
             ),
         }
     run_report = {
-        "schema_version": "experience-memory-e1-run-report-v7",
+        "schema_version": "experience-memory-e1-run-report-v8",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "completed",
         "sample_count": len(records),

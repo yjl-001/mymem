@@ -13,6 +13,8 @@ from transformers import GenerationConfig
 
 from memgen.experience.e1 import GateObservation
 from memgen.model.side_kv import (
+    SDPAAttentionEntropyObserver,
+    SIDE_KV_ATTENTION_BACKEND,
     SideKVAttentionController,
     SideKVAttentionTrace,
     SideKVMemory,
@@ -124,6 +126,7 @@ class EntropyRiskGateConfig:
     sink_token_count: int
     entropy_threshold: float
     risk_threshold: float
+    attention_backend: str = SIDE_KV_ATTENTION_BACKEND
 
     def __post_init__(self) -> None:
         if self.layer_number <= 0 or self.sink_token_count < 0:
@@ -132,6 +135,8 @@ class EntropyRiskGateConfig:
             self.risk_threshold
         ):
             raise ValueError("Entropy-risk thresholds must be finite")
+        if self.attention_backend != SIDE_KV_ATTENTION_BACKEND:
+            raise ValueError("Entropy-risk gate requires SDPA")
 
 
 @dataclass(frozen=True)
@@ -163,6 +168,9 @@ class EntropyRiskGate:
 
     @classmethod
     def from_artifact(cls, artifact: dict[str, Any]) -> "EntropyRiskGate":
+        reasoner = artifact.get("reasoner", {})
+        if reasoner.get("attention_implementation") != SIDE_KV_ATTENTION_BACKEND:
+            raise ValueError("Risk artifact was not compiled under SDPA")
         construction = artifact.get("construction", {})
         risk = artifact.get("risk_gate", {})
         required = (
@@ -198,6 +206,7 @@ class EntropyRiskGate:
             "sink_token_count": self.config.sink_token_count,
             "entropy_threshold": self.config.entropy_threshold,
             "risk_threshold": self.config.risk_threshold,
+            "attention_backend": self.config.attention_backend,
             "selection_policy": "first_joint_entropy_and_risk_boundary",
         }
 
@@ -216,35 +225,27 @@ class EntropyRiskGate:
         attention_mask: torch.Tensor,
         past_key_values: Any,
     ) -> GateProbe:
-        output = model(
-            input_ids=boundary_token,
-            attention_mask=attention_mask,
-            output_attentions=True,
-            output_hidden_states=True,
-            past_key_values=clone_cache(past_key_values),
-            use_cache=True,
-            return_dict=True,
+        observer = SDPAAttentionEntropyObserver(
+            model=model,
+            sink_token_count=self.config.sink_token_count,
         )
-        attentions = output.attentions
-        if not attentions or attentions[-1] is None:
-            raise RuntimeError("Entropy-risk gate requires eager attention weights")
-        valid_positions = attention_mask[0].nonzero(as_tuple=True)[0]
-        keys = valid_positions[self.config.sink_token_count :]
-        raw = attentions[-1][0, :, -1, :].float()
-        if raw.shape[-1] != valid_positions.numel():
+        try:
+            with observer.capture():
+                output = model(
+                    input_ids=boundary_token,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    past_key_values=clone_cache(past_key_values),
+                    use_cache=True,
+                    return_dict=True,
+                )
+            observation = observer.observation
+        finally:
+            observer.close()
+        valid_key_count = int(attention_mask[0].sum().item())
+        if observation.native_key_length != valid_key_count:
             raise RuntimeError("Attention key length differs from the live prefix")
-        if keys.numel() == 0:
-            raise RuntimeError("Sink mask removed every attention key")
-        probabilities = raw.index_select(1, keys)
-        normalizer = probabilities.sum(dim=-1, keepdim=True)
-        if torch.any(normalizer <= 0):
-            raise RuntimeError("Attention mass after sink masking is zero")
-        probabilities = probabilities / normalizer
-        entropy = -(
-            probabilities
-            * probabilities.clamp_min(torch.finfo(probabilities.dtype).tiny).log()
-        ).sum(dim=-1)
-        entropy_value = float(entropy.mean().item())
+        entropy_value = float(observation.entropy_by_query[0, -1].item())
         hidden_states = output.hidden_states
         if hidden_states is None or self.config.layer_number >= len(hidden_states):
             raise RuntimeError("Risk-gate hidden state layer is unavailable")

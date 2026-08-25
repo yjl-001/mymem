@@ -16,7 +16,7 @@ source "$E1_ENV"
 LIMIT=32
 OFFSET=0
 LOGICAL_SPLIT="calibration-val"
-ATTENTION_IMPLEMENTATION="eager"
+ATTENTION_IMPLEMENTATION="sdpa"
 POSITIONAL=()
 while [[ "$#" -gt 0 ]]; do
   case "$1" in

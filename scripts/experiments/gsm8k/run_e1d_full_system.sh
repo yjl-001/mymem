@@ -116,12 +116,13 @@ if [[ "$PRINT_CONFIG" == "1" ]]; then
   printf 'limit=%s\n' "$LIMIT"
   printf 'max_new_tokens=%s\n' '1024'
   printf 'cuda_visible_devices=%s\n' "$CUDA_VISIBLE_DEVICES"
-  printf 'system_profile=%s\n' 'layer24-bm25-top1-gate-persistent-logslots-log10-v1'
+  printf 'attention_implementation=%s\n' 'sdpa'
+  printf 'system_profile=%s\n' 'layer24-bm25-top1-gate-persistent-logslots-log10-sdpa-v2'
   exit 0
 fi
 
 RUN_TAG="${MEMGEN_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
-RUN_ID="gsm8k_e1d_full-system_layer24_${LOGICAL_SPLIT}_${RUN_TAG}"
+RUN_ID="gsm8k_e1d_full-system_layer24_sdpa_${LOGICAL_SPLIT}_${RUN_TAG}"
 RUN_DIR="$MEMGEN_OUTPUT_ROOT/e1/gsm8k/$RUN_ID"
 ASSIGNMENT_MANIFEST="$RUN_DIR/assignment_manifest.json"
 EVALUATION_DIR="$RUN_DIR/evaluation"

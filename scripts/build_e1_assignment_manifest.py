@@ -133,7 +133,12 @@ def main() -> None:
     })
     if expected_e0_hash != actual_e0_hash:
         raise ValueError("E0 final report hash mismatch")
-    if e0_final.get("status") != "passed" or e0_final.get("formal_e0_passed") is not True:
+    if (
+        e0_final.get("schema_version") != "experience-memory-e0-final-report-v2"
+        or e0_final.get("status") != "passed"
+        or e0_final.get("formal_e0_passed") is not True
+        or e0_final.get("attention_implementation") != "sdpa"
+    ):
         raise ValueError("E1 requires a formally passed E0 artifact set")
     if e0_final.get("task_accuracy_used") is not False:
         raise ValueError("E0 artifact does not prove answer-blind mechanism qualification")
@@ -180,7 +185,11 @@ def main() -> None:
     if expected_side_hash != actual_side_hash:
         raise ValueError("Side-KV manifest hash mismatch")
     profile = ExperienceMemorySystemProfile()
-    if int(side_manifest.get("layer_number", -1)) != profile.layer_number:
+    if (
+        int(side_manifest.get("layer_number", -1)) != profile.layer_number
+        or side_manifest.get("compiler", {}).get("attention_backend")
+        != profile.attention_backend
+    ):
         raise ValueError("System profile and side-KV layer differ")
     side_entries = {
         str(item["memory_id"]): item for item in side_manifest.get("records", [])
@@ -200,7 +209,7 @@ def main() -> None:
     )
     if risk_artifact.get("schema_version") != ENTROPY_RISK_ARTIFACT_SCHEMA:
         raise ValueError(
-            "Entropy-risk artifact predates the canonical GSM8K prompt; "
+            "Entropy-risk artifact predates the canonical SDPA runtime; "
             "rebuild it with run_entropy_risk_gate.sh"
         )
     prompt_contract = GSM8K_PROMPT_CONTRACT.metadata(
@@ -244,7 +253,7 @@ def main() -> None:
         model_name,
         revision=model_revision,
         dtype=dtype,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     ).to(args.device)
     model.eval()
     resolved_model_revision = str(
@@ -369,7 +378,7 @@ def main() -> None:
             "tokenizer_revision": tokenizer_revision,
             "layer": profile.layer_number,
             "dtype": args.dtype,
-            "attention_implementation": "eager",
+            "attention_implementation": profile.attention_backend,
         },
         "configuration": {
             "max_new_tokens": args.max_new_tokens,
@@ -437,7 +446,7 @@ def main() -> None:
         "assignment_build_report.json"
     )
     report = {
-        "schema_version": "experience-memory-e1-assignment-build-report-v7",
+        "schema_version": "experience-memory-e1-assignment-build-report-v8",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed",
         "answer_or_reward_used": False,

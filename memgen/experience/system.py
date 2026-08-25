@@ -20,7 +20,7 @@ from memgen.experience.retrieval import (
 )
 
 
-EXPERIENCE_MEMORY_SYSTEM_PROFILE_SCHEMA = "experience-memory-system-profile-v1"
+EXPERIENCE_MEMORY_SYSTEM_PROFILE_SCHEMA = "experience-memory-system-profile-v2"
 SEMANTIC_RETRIEVAL_DECISION_SCHEMA = "semantic-memory-retrieval-decision-v1"
 
 
@@ -36,6 +36,7 @@ class ExperienceMemorySystemProfile:
     memory_score_bias: float = math.log(10.0)
     gate_policy: str = "first_joint_entropy_and_risk_boundary"
     injection_policy: str = "persistent_from_trigger_through_eos"
+    attention_backend: str = "sdpa"
     schema_version: str = EXPERIENCE_MEMORY_SYSTEM_PROFILE_SCHEMA
 
     def __post_init__(self) -> None:
@@ -55,6 +56,8 @@ class ExperienceMemorySystemProfile:
             raise ValueError("Unexpected system gate policy")
         if self.injection_policy != "persistent_from_trigger_through_eos":
             raise ValueError("Unexpected system injection policy")
+        if self.attention_backend != "sdpa":
+            raise ValueError("Reference system requires SDPA")
 
     @property
     def memory_odds_multiplier(self) -> float:

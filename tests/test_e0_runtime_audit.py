@@ -38,7 +38,9 @@ class CompileArtifactValidationTests(unittest.TestCase):
         }
         artifact_entries["side_kv"] = side_kv
         report = {
+            "schema_version": "experience-memory-e0-report-v3",
             "status": "kv_compilation_passed_pending_runtime_audit",
+            "configuration": {"attention_implementation": "sdpa"},
             "artifacts": artifact_entries,
             "artifact_set_sha256": canonical_json_sha256(
                 {
@@ -84,7 +86,7 @@ class AuditCaseValidationTests(unittest.TestCase):
     def valid_case(self) -> dict:
         prefix = [10, 11, 12]
         return {
-            "schema_version": "side-kv-mechanism-audit-case-input-v1",
+            "schema_version": "side-kv-mechanism-audit-case-input-v2",
             "case_id": "calibration-case",
             "memory_id": "memory-id",
             "logical_split": "calibration-val",

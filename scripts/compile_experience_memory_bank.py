@@ -181,7 +181,7 @@ def persist_no_survivor_diagnostics(
     write_json(paths.payload_audit, audit_report)
 
     e0_report = {
-        "schema_version": "experience-memory-e0-report-v2",
+        "schema_version": "experience-memory-e0-report-v3",
         "created_at": created_at,
         "status": "failed_no_runtime_safe_records",
         "formal_e0_passed": False,
@@ -195,6 +195,7 @@ def persist_no_survivor_diagnostics(
             "layer": layer,
             "dtype": dtype,
             "text_only": text_only,
+            "attention_implementation": "sdpa",
         },
         "artifacts": {
             "memory_records": None,
@@ -316,8 +317,8 @@ def main() -> None:
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
             revision=args.model_revision,
-            torch_dtype=dtype,
-            attn_implementation="eager",
+            dtype=dtype,
+            attn_implementation="sdpa",
         ).to(args.device)
         model.eval()
         compiler = CanonicalSideKVCompiler(
@@ -408,7 +409,7 @@ def main() -> None:
     write_json(audit_path, audit_report)
 
     e0_report = {
-        "schema_version": "experience-memory-e0-report-v2",
+        "schema_version": "experience-memory-e0-report-v3",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": (
             "text_only_passed"
@@ -425,6 +426,7 @@ def main() -> None:
             "layer": args.layer,
             "dtype": args.dtype,
             "text_only": args.text_only,
+            "attention_implementation": "sdpa",
         },
         "artifacts": {
             "memory_records": {

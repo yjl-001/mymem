@@ -128,7 +128,7 @@ if [[ "$PRINT_CONFIG" == "1" ]]; then
 fi
 
 RUN_TAG="${MEMGEN_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
-RUN_ID="gsm8k_e0_experience-memory_layer24_${RUN_TAG}"
+RUN_ID="gsm8k_e0_experience-memory_layer24_sdpa_${RUN_TAG}"
 RUN_DIR="$MEMGEN_OUTPUT_ROOT/e0/gsm8k/$RUN_ID"
 mkdir -p "$RUN_DIR"
 

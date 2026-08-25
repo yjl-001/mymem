@@ -83,7 +83,12 @@ def validate_compile_report(
     if not report_path.is_file():
         raise ValueError(f"E0 compile report is missing: {report_path}")
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    if report.get("status") != "kv_compilation_passed_pending_runtime_audit":
+    if (
+        report.get("schema_version") != "experience-memory-e0-report-v3"
+        or report.get("status") != "kv_compilation_passed_pending_runtime_audit"
+        or report.get("configuration", {}).get("attention_implementation")
+        != "sdpa"
+    ):
         raise ValueError("E0 compile report is not ready for runtime-audit finalization")
     artifacts = report.get("artifacts")
     if not isinstance(artifacts, dict):
@@ -202,7 +207,7 @@ def validate_case(record: dict[str, Any]) -> tuple[str, str, list[int], int]:
     memory_id = str(record.get("memory_id", ""))
     prefix = record.get("prefix_token_ids")
     prompt_token_count = record.get("prompt_token_count")
-    if record.get("schema_version") != "side-kv-mechanism-audit-case-input-v1":
+    if record.get("schema_version") != "side-kv-mechanism-audit-case-input-v2":
         raise ValueError(f"Audit case {case_id} has an unexpected schema")
     if record.get("logical_split") != "calibration-val":
         raise ValueError(f"Audit case {case_id} is not from calibration-val")
@@ -267,8 +272,8 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         revision=args.model_revision,
-        torch_dtype=dtype,
-        attn_implementation="eager",
+        dtype=dtype,
+        attn_implementation="sdpa",
     ).to(args.device)
     model.eval()
     resolved_model_revision = str(
@@ -414,7 +419,7 @@ def main() -> None:
         )
         records.append(
             {
-                "schema_version": "side-kv-mechanism-audit-case-v1",
+                "schema_version": "side-kv-mechanism-audit-case-v2",
                 "case_id": case_id,
                 "memory_id": memory_id,
                 "prefix_token_ids_sha256": canonical_json_sha256(prefix),
@@ -446,7 +451,7 @@ def main() -> None:
     active_logits_effect_detected = max_logits_kl > args.min_active_logits_kl
     mechanism_passed = not failed and active_logits_effect_detected
     report = {
-        "schema_version": "side-kv-mechanism-audit-report-v1",
+        "schema_version": "side-kv-mechanism-audit-report-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed" if mechanism_passed else "failed",
         "formal_e0_mechanism_passed": mechanism_passed,
@@ -479,6 +484,7 @@ def main() -> None:
             "tokenizer_revision": resolved_tokenizer_revision,
             "layer": args.layer,
             "dtype": args.dtype,
+            "attention_implementation": "sdpa",
         },
         "trace": {"path": trace_path.name, "sha256": file_sha256(trace_path)},
     }
@@ -492,11 +498,12 @@ def main() -> None:
         )
 
     final_report = {
-        "schema_version": "experience-memory-e0-final-report-v1",
+        "schema_version": "experience-memory-e0-final-report-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed",
         "formal_e0_passed": True,
         "task_accuracy_used": False,
+        "attention_implementation": "sdpa",
         "compile_report": {
             "path": str(compile_report_path.resolve()),
             "sha256": file_sha256(compile_report_path),
@@ -518,6 +525,7 @@ def main() -> None:
             "memory_attention_mass_recorded_and_positive": True,
             "active_memory_changes_logits_above_noise_floor": True,
             "calibration_cases_answer_blind_and_preanswer": True,
+            "sdpa_runtime_used": True,
         },
     }
     final_report["final_report_sha256"] = canonical_json_sha256(final_report)

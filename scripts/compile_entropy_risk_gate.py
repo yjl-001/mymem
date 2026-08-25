@@ -70,12 +70,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--model-revision", default="main")
+    parser.add_argument("--tokenizer-revision")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
-    parser.add_argument("--attn-implementation", default="eager")
+    parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--layer", type=int, default=24)
     parser.add_argument("--experience-types", default="answer_correctness")
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--sink-token-count", type=int, default=4)
     parser.add_argument("--high-entropy-quantile", type=float, default=0.85)
@@ -165,25 +166,6 @@ def pad_batch(tokenizer: Any, pairs: Iterable[TokenizedPair], device: str):
     )
 
 
-def sink_masked_entropy_at(attention: Any, attention_mask: Any, row: int, query_index: int, sink_count: int) -> float:
-    import torch
-
-    valid = attention_mask[row].nonzero(as_tuple=True)[0]
-    keys = valid[sink_count:]
-    if keys.numel() == 0:
-        raise ValueError("Sink mask removed every attention key")
-    raw = attention[row, :, query_index, :].float().index_select(1, keys)
-    normalizer = raw.sum(dim=-1, keepdim=True)
-    if torch.any(normalizer <= 0):
-        raise RuntimeError("Attention mass after sink masking is zero")
-    probs = raw / normalizer
-    entropy = -(probs * probs.clamp_min(torch.finfo(probs.dtype).tiny).log()).sum(dim=-1)
-    value = float(entropy.mean().item())
-    if not math.isfinite(value):
-        raise RuntimeError("Non-finite sink-masked entropy")
-    return value
-
-
 def cosine_score(state: Any, *, recovery: Any, persistence: Any) -> float:
     import torch
 
@@ -206,8 +188,8 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.attn_implementation != "eager":
-        raise ValueError("Entropy-risk compilation requires --attn-implementation eager")
+    if args.attn_implementation != "sdpa":
+        raise ValueError("Entropy-risk compilation requires --attn-implementation sdpa")
     if args.layer <= 0 or args.batch_size <= 0 or args.limit < 0 or args.sink_token_count < 0:
         raise ValueError("Invalid layer/batch/limit/sink configuration")
     if args.min_events_per_label <= 0 or not 0.0 <= args.min_heldout_roc_auc <= 1.0:
@@ -219,6 +201,7 @@ def main() -> None:
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from memgen.model.side_kv import SDPAAttentionEntropyObserver
 
     selected, selection_report = approved_experiences(
         list(iter_jsonl(args.approved_bank)),
@@ -228,7 +211,11 @@ def main() -> None:
     if args.limit:
         selected = selected[: args.limit]
         selection_report["selected_count_after_limit"] = len(selected)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.model_revision)
+    tokenizer_revision_request = args.tokenizer_revision or args.model_revision
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        revision=tokenizer_revision_request,
+    )
     tokenizer.chat_template = CONVERSATION_TEMPLATE
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
@@ -238,7 +225,7 @@ def main() -> None:
         args.model,
         revision=args.model_revision,
         dtype=dtype,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     ).to(args.device)
     model.eval()
     context_limit = args.max_sequence_length or model_context_limit(model)
@@ -262,24 +249,39 @@ def main() -> None:
     entropy_by_trajectory: dict[tuple[int, str], list[float]] = {}
     train_entropies: list[float] = []
     all_entropies: list[float] = []
-    for start in range(0, len(pairs), args.batch_size):
-        batch = pairs[start : start + args.batch_size]
-        ids, mask, offsets = pad_batch(tokenizer, batch, args.device)
-        with torch.inference_mode():
-            output = model(input_ids=ids, attention_mask=mask, output_attentions=True, use_cache=False, return_dict=True)
-        if not output.attentions or output.attentions[-1] is None:
-            raise RuntimeError("Model did not return eager attention weights")
-        final_attention = output.attentions[-1]
-        for offset, pair in enumerate(batch):
-            for row, side, trajectory in ((offset * 2, "target", pair.target), (offset * 2 + 1, "reference", pair.reference)):
-                values = [
-                    sink_masked_entropy_at(final_attention, mask, row, offsets[row] + boundary, args.sink_token_count)
-                    for boundary in trajectory.boundaries
-                ]
-                entropy_by_trajectory[(start + offset, side)] = values
-                all_entropies.extend(values)
-                if pair.is_train:
-                    train_entropies.extend(values)
+    entropy_observer = SDPAAttentionEntropyObserver(
+        model=model,
+        sink_token_count=args.sink_token_count,
+    )
+    try:
+        for start in range(0, len(pairs), args.batch_size):
+            batch = pairs[start : start + args.batch_size]
+            ids, mask, offsets = pad_batch(tokenizer, batch, args.device)
+            with torch.inference_mode(), entropy_observer.capture():
+                model(
+                    input_ids=ids,
+                    attention_mask=mask,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            entropy_by_query = entropy_observer.observation.entropy_by_query
+            for offset, pair in enumerate(batch):
+                for row, side, trajectory in (
+                    (offset * 2, "target", pair.target),
+                    (offset * 2 + 1, "reference", pair.reference),
+                ):
+                    values = [
+                        float(entropy_by_query[row, offsets[row] + boundary].item())
+                        for boundary in trajectory.boundaries
+                    ]
+                    if not all(math.isfinite(value) for value in values):
+                        raise RuntimeError("Non-finite SDPA sink-masked entropy")
+                    entropy_by_trajectory[(start + offset, side)] = values
+                    all_entropies.extend(values)
+                    if pair.is_train:
+                        train_entropies.extend(values)
+    finally:
+        entropy_observer.close()
     if not train_entropies:
         raise RuntimeError("No training delimiter boundaries were available for the risk diagnostic")
     high_threshold = entropy_quantile(train_entropies, args.high_entropy_quantile)
@@ -327,7 +329,7 @@ def main() -> None:
         if counts.get(label, 0) < args.min_events_per_label
     ]
     base_report = {
-        "schema_version": "entropy-risk-diagnostic-v1",
+        "schema_version": "entropy-risk-diagnostic-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "selected_pair_count": len(selected), "context_eligible_pair_count": len(pairs),
         "candidate_boundary_count": len(all_entropies),
@@ -347,6 +349,8 @@ def main() -> None:
             "verified_experiences_sha256": file_sha256(args.experiences), "selection": selection_report,
             "compiler_git_revision": git_revision(), "risk_split_seed": args.risk_split_seed,
             "risk_train_fraction": args.risk_train_fraction, "layer": args.layer,
+            "attention_implementation": args.attn_implementation,
+            "tokenizer_revision_request": tokenizer_revision_request,
         },
     }
     report_path = output_dir / "entropy_risk_diagnostic_report.json"
@@ -418,7 +422,11 @@ def main() -> None:
         "reasoner": {
             "model_name": args.model,
             "model_revision": str(getattr(model.config, "_commit_hash", None) or args.model_revision),
-            "tokenizer_revision": str(getattr(tokenizer, "init_kwargs", {}).get("_commit_hash") or args.model_revision),
+            "tokenizer_revision": str(
+                getattr(tokenizer, "init_kwargs", {}).get("_commit_hash")
+                or tokenizer_revision_request
+            ),
+            "attention_implementation": args.attn_implementation,
         },
         "prompt_contract": GSM8K_PROMPT_CONTRACT.metadata(
             chat_template=CONVERSATION_TEMPLATE
