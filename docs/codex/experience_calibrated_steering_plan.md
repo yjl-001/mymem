@@ -85,6 +85,11 @@ question + generated partial CoT
 
 ## 3. 当前评测条件
 
+GSM8K 输入统一使用 `GSM8KPromptContract(gsm8k-memgen-builder-v1)`，严格复现
+原始 dataset builder 的 `\boxed{}.Question:` 拼接；不允许 E1 单独维护 prompt。
+生成预算固定为 1024。`vanilla` 使用 HuggingFace 原生 greedy generation，
+gate/side-KV 使用显式 live KV-cache，并记录首个 token 分叉位置。
+
 只保留三个条件：
 
 - `vanilla`：不运行 gate，不检索，不注入 memory；
@@ -104,6 +109,19 @@ question + generated partial CoT
 subset 与全样本 intention-to-treat。
 
 ## 4. 运行与 artifact
+
+先进行 base parity 预检：
+
+```bash
+MEMGEN_RUN_TAG=base-parity-v1 \
+bash scripts/experiments/gsm8k/run_base_reasoner_parity.sh \
+  --logical-split final-test \
+  --limit 32 \
+  "$PHASE1_DIR" "$E0_DIR"
+```
+
+只有 `base_parity_summary.json.status=passed` 且 native baseline 回到已知合理区间，
+才继续解释 E1。该预检不加载 gate、BM25 或 side-KV，不产生 memory 效果结论。
 
 服务器环境文件只保留输出目录和可选 GPU：
 

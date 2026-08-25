@@ -10,28 +10,12 @@ from typing import Any, Iterable, Mapping, Sequence
 from memgen.experience.phase1 import canonical_json_sha256
 
 
-# The serialized value stays stable so qualified server artifacts remain usable.
-ENTROPY_RISK_ARTIFACT_SCHEMA = "steering-vector-artifact-v1"
+ENTROPY_RISK_ARTIFACT_SCHEMA = "entropy-risk-gate-artifact-v2"
 RISK_ELIGIBLE_EXPERIENCE_TYPES = frozenset({
     "answer_correctness",
     "format_compliance",
     "mixed_or_unclassified_task_failure",
 })
-FORMAT_INSTRUCTION = (
-    "Solve the math problem with proper reasoning, and make sure to put the "
-    "FINAL ANSWER inside \\boxed{}."
-)
-
-
-def build_gsm8k_messages(question: str) -> list[dict[str, str]]:
-    """Return the exact frozen GSM8K user message."""
-
-    return [{
-        "role": "user",
-        "content": f"{FORMAT_INSTRUCTION}\nQuestion: {question.strip()}\n",
-    }]
-
-
 def approved_experiences(
     approved_records: Iterable[Mapping[str, Any]],
     experiences: Iterable[Mapping[str, Any]],

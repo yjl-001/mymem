@@ -189,11 +189,20 @@ def main() -> None:
 
     run_report = json.loads(args.run_report.read_text(encoding="utf-8"))
     if (
-        run_report.get("schema_version") != "experience-memory-e1-run-report-v4"
+        run_report.get("schema_version") != "experience-memory-e1-run-report-v5"
         or run_report.get("status") != "completed"
         or run_report.get("logical_split") != manifest.get("logical_split")
         or run_report.get("dataset_split") != manifest.get("dataset_split")
         or run_report.get("evaluation_role") != manifest.get("evaluation_role")
+        or run_report.get("prompt_contract") != manifest.get("prompt_contract")
+        or run_report.get("generation_contract", {}).get("max_new_tokens")
+        != manifest.get("configuration", {}).get("max_new_tokens")
+        or run_report.get("generation_contract", {}).get("vanilla")
+        != manifest.get("configuration", {}).get("vanilla_generation")
+        or run_report.get("generation_contract", {}).get(
+            "gate_observation_only"
+        )
+        != manifest.get("configuration", {}).get("gate_generation")
         or run_report.get("system_profile") != profile.to_dict()
         or run_report.get("results", {}).get("sha256") != file_sha256(args.results)
         or run_report.get("inputs", {}).get("assignment_manifest_sha256")

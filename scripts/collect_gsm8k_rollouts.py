@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from data.gsm8k.prompt import GSM8K_PROMPT_CONTRACT
 from memgen.experience.phase1 import (
     ROLLOUT_SCHEMA,
     canonical_json_sha256,
@@ -24,12 +25,6 @@ from memgen.experience.phase1 import (
 from memgen.chat_templates import CONVERSATION_TEMPLATE
 from data.utils.math_utils import (
     diagnose_gsm8k_completion,
-)
-
-
-FORMAT_INSTRUCTION = (
-    "Solve the math problem with proper reasoning, and make sure to put the "
-    "FINAL ANSWER inside \\boxed{}."
 )
 
 
@@ -162,7 +157,10 @@ def main() -> None:
         "top_k": args.top_k,
         "base_seed": args.seed,
         "chat_template_sha256": text_sha256(CONVERSATION_TEMPLATE),
-        "prompt_version": "gsm8k-memgen-chatml-v1",
+        "prompt_version": GSM8K_PROMPT_CONTRACT.version,
+        "prompt_contract": GSM8K_PROMPT_CONTRACT.metadata(
+            chat_template=CONVERSATION_TEMPLATE
+        ),
     }
     student = {
         "model_name": args.model,
@@ -197,17 +195,7 @@ def main() -> None:
             for sample, _ in batch_tasks:
                 source = dataset[int(sample["source_index"])]
                 question = str(source["question"]).strip()
-                messages = [{
-                    "role": "user",
-                    "content": f"{FORMAT_INSTRUCTION}\nQuestion: {question}\n",
-                }]
-                prompts.append(
-                    tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                )
+                prompts.append(GSM8K_PROMPT_CONTRACT.render(tokenizer, question))
                 source_rows.append(source)
 
             encoded = tokenizer(

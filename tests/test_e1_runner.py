@@ -91,6 +91,7 @@ class E1RunnerConfigurationTests(unittest.TestCase):
         self.assertEqual(parsed["dataset_revision"], "dataset-revision")
         self.assertEqual(parsed["logical_split"], "calibration-val")
         self.assertEqual(parsed["limit"], "8")
+        self.assertEqual(parsed["max_new_tokens"], "1024")
         self.assertEqual(parsed["cuda_visible_devices"], "2")
         self.assertEqual(
             parsed["system_profile"],

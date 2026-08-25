@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Compile the qualified high-entropy persistence-risk gate artifact.
+"""Compile the prompt-bound high-entropy persistence-risk gate artifact.
 
-The serialized schema remains stable so qualified server artifacts stay
-loadable. The compiler emits risk prototypes and diagnostics only; it does not
-authorize or evaluate a residual-vector intervention.
+The compiler emits risk prototypes and diagnostics only; it does not authorize
+or evaluate a residual-vector intervention.
 """
 
 from __future__ import annotations
@@ -24,6 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from data.gsm8k.prompt import GSM8K_PROMPT_CONTRACT
 from memgen.chat_templates import CONVERSATION_TEMPLATE
 from memgen.experience.phase1 import file_sha256, iter_jsonl, write_jsonl
 from memgen.experience.risk import (
@@ -31,7 +31,6 @@ from memgen.experience.risk import (
     approved_experiences,
     binary_average_precision,
     binary_roc_auc,
-    build_gsm8k_messages,
     deterministic_train_partition,
     entropy_quantile,
     entropy_transition_label,
@@ -133,10 +132,9 @@ def tokenize_trajectory(tokenizer: Any, prompt_ids: list[int], completion: str) 
 
 
 def tokenize_pair(tokenizer: Any, experience: dict[str, Any], *, is_train: bool) -> TokenizedPair:
-    prompt = tokenizer.apply_chat_template(
-        build_gsm8k_messages(str(experience["context"])), tokenize=False, add_generation_prompt=True
+    prompt_ids = GSM8K_PROMPT_CONTRACT.token_ids(
+        tokenizer, str(experience["context"])
     )
-    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     return TokenizedPair(
         experience=experience,
         target=tokenize_trajectory(tokenizer, prompt_ids, str(experience["trajectory"])),
@@ -340,6 +338,9 @@ def main() -> None:
         },
         "four_cell_counts": four_cell_counts,
         "event_counts": event_counts,
+        "prompt_contract": GSM8K_PROMPT_CONTRACT.metadata(
+            chat_template=CONVERSATION_TEMPLATE
+        ),
         "evidence_trace": {"path": trace_path.name, "sha256": file_sha256(trace_path)},
         "inputs": {
             "approved_bank_sha256": file_sha256(args.approved_bank),
@@ -419,6 +420,9 @@ def main() -> None:
             "model_revision": str(getattr(model.config, "_commit_hash", None) or args.model_revision),
             "tokenizer_revision": str(getattr(tokenizer, "init_kwargs", {}).get("_commit_hash") or args.model_revision),
         },
+        "prompt_contract": GSM8K_PROMPT_CONTRACT.metadata(
+            chat_template=CONVERSATION_TEMPLATE
+        ),
         "construction": {
             "source": "frozen_phase1_ai_approved_bank_no_additional_ai",
             "method": "entropy_risk_prototype_classifier",

@@ -34,13 +34,29 @@ bash scripts/experiments/gsm8k/run_phase1_verified_bank.sh
 bash scripts/experiments/gsm8k/run_entropy_risk_gate.sh "$PHASE1_DIR"
 ```
 
+风险 artifact 与 prompt contract 绑定。旧 artifact 使用过带额外换行的 prompt，
+不能与当前 canonical baseline 混用，必须重新编译；这一步不调用 Teacher/Pro。
+
 3. 构造并审计 MemoryRecord 与 canonical side-KV：
 
 ```bash
 bash scripts/experiments/gsm8k/run_e0_experience_memory.sh "$PHASE1_DIR"
 ```
 
-4. 运行 gate、BM25 和 persistent side-KV 完整评测：
+4. 验证 canonical base reasoner 与 E1 live-cache runtime 对齐：
+
+```bash
+bash scripts/experiments/gsm8k/run_base_reasoner_parity.sh \
+  --logical-split final-test \
+  --limit 32 \
+  "$PHASE1_DIR" "$E0_DIR"
+```
+
+`base_parity_summary.json` 同时报告原生 HuggingFace greedy 与显式 KV-cache
+greedy 的严格准确率、诊断准确率和逐 token parity。正式 E1 前要求
+`exact_token_parity=true`；正式 GSM8K 生成预算固定为 1024。
+
+5. 运行 gate、BM25 和 persistent side-KV 完整评测：
 
 ```bash
 bash scripts/experiments/gsm8k/run_e1d_full_system.sh \

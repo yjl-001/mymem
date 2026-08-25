@@ -13,6 +13,8 @@ from memgen.experience.e1 import (
 )
 from memgen.experience.phase1 import canonical_json_sha256, file_sha256
 from memgen.experience.system import ExperienceMemorySystemProfile
+from data.gsm8k.prompt import GSM8K_PROMPT_CONTRACT
+from memgen.chat_templates import CONVERSATION_TEMPLATE
 
 from test_e1_experience import assignment, memory_choice
 
@@ -30,6 +32,21 @@ class E1SummaryTests(unittest.TestCase):
                 for index in range(2)
             ]
             profile = ExperienceMemorySystemProfile()
+            prompt_contract = GSM8K_PROMPT_CONTRACT.metadata(
+                chat_template=CONVERSATION_TEMPLATE
+            )
+            vanilla_generation = {
+                "implementation": "transformers_generate",
+                "decoding": "greedy",
+                "use_cache": True,
+                "batch_size": 1,
+            }
+            gate_generation = {
+                "implementation": "explicit_live_kv_cache",
+                "decoding": "greedy",
+                "use_cache": True,
+                "batch_size": 1,
+            }
             manifest = {
                 "schema_version": E1_MANIFEST_SCHEMA,
                 "created_at": "fixture",
@@ -38,8 +55,14 @@ class E1SummaryTests(unittest.TestCase):
                 "logical_split": "dev-test",
                 "dataset_split": "train",
                 "evaluation_role": "development_diagnostic",
+                "prompt_contract": prompt_contract,
                 "reasoner": {"layer": 24},
-                "configuration": {"system_profile": profile.to_dict()},
+                "configuration": {
+                    "max_new_tokens": 1024,
+                    "vanilla_generation": vanilla_generation,
+                    "gate_generation": gate_generation,
+                    "system_profile": profile.to_dict(),
+                },
                 "summary": {"sample_count": len(assignments)},
                 "assignments": [item.to_dict() for item in assignments],
             }
@@ -135,11 +158,17 @@ class E1SummaryTests(unittest.TestCase):
                     handle.write(json.dumps(record) + "\n")
 
             run_report = {
-                "schema_version": "experience-memory-e1-run-report-v4",
+                "schema_version": "experience-memory-e1-run-report-v5",
                 "status": "completed",
                 "logical_split": "dev-test",
                 "dataset_split": "train",
                 "evaluation_role": "development_diagnostic",
+                "prompt_contract": prompt_contract,
+                "generation_contract": {
+                    "max_new_tokens": 1024,
+                    "vanilla": vanilla_generation,
+                    "gate_observation_only": gate_generation,
+                },
                 "system_profile": profile.to_dict(),
                 "results": {"sha256": file_sha256(results_path)},
                 "inputs": {

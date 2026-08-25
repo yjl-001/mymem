@@ -114,6 +114,7 @@ if [[ "$PRINT_CONFIG" == "1" ]]; then
   printf 'evaluation_role=%s\n' "$EVALUATION_ROLE"
   printf 'offset=%s\n' "$OFFSET"
   printf 'limit=%s\n' "$LIMIT"
+  printf 'max_new_tokens=%s\n' '1024'
   printf 'cuda_visible_devices=%s\n' "$CUDA_VISIBLE_DEVICES"
   printf 'system_profile=%s\n' 'layer24-bm25-top1-gate-persistent-logslots-log10-v1'
   exit 0
@@ -137,7 +138,7 @@ python scripts/build_e1_assignment_manifest.py \
   --logical-split "$LOGICAL_SPLIT" \
   --offset "$OFFSET" \
   --limit "$LIMIT" \
-  --max-new-tokens 768 \
+  --max-new-tokens 1024 \
   --device cuda \
   --dtype bfloat16
 

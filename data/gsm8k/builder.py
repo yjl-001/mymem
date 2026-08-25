@@ -3,6 +3,7 @@ from typing import Dict
  
 from data.base_builder import BaseBuilder
 from data.gsm8k.env import GSM8KEnv
+from data.gsm8k.prompt import GSM8K_PROMPT_CONTRACT
 
 class GSM8KBuilder(BaseBuilder):   # Env
     
@@ -49,13 +50,10 @@ class GSM8KBuilder(BaseBuilder):   # Env
             new_string = rationale + boxed_answer
             return new_string.strip()
         
-        format_template = r"""Solve the math problem with proper reasoning, and make sure to put the FINAL ANSWER inside \boxed{}."""
-        prompt_template = "Question: {prompt}\n"
-         
         question = example["question"].strip()
         answer = example["answer"].strip()
 
-        processed_prompt = format_template + prompt_template.format(prompt=question)
+        processed_prompt = GSM8K_PROMPT_CONTRACT.user_content(question)
         processed_label = _preprocess_answer(answer)
 
         text_output = {

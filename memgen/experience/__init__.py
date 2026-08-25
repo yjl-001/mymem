@@ -14,7 +14,6 @@ from memgen.experience.risk import (
     RISK_ELIGIBLE_EXPERIENCE_TYPES,
     ENTROPY_RISK_ARTIFACT_SCHEMA,
     approved_experiences,
-    build_gsm8k_messages,
 )
 from memgen.experience.memory import (
     ApprovedMemorySourceSelector,
@@ -68,7 +67,6 @@ __all__ = [
     "RISK_ELIGIBLE_EXPERIENCE_TYPES",
     "ENTROPY_RISK_ARTIFACT_SCHEMA",
     "approved_experiences",
-    "build_gsm8k_messages",
     "ApprovedMemorySourceSelector",
     "MemoryArtifactAuditor",
     "BM25Config",

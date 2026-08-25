@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from data.gsm8k.prompt import GSM8K_PROMPT_CONTRACT
 from memgen.chat_templates import CONVERSATION_TEMPLATE
 from memgen.experience.memory import MemoryRecord
 from memgen.experience.phase1 import (
@@ -25,7 +26,6 @@ from memgen.experience.phase1 import (
 )
 from memgen.experience.risk import (
     ENTROPY_RISK_ARTIFACT_SCHEMA,
-    build_gsm8k_messages,
 )
 from memgen.experience.retrieval import (
     BM25MemoryIndex,
@@ -47,7 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--e0-final-report", type=Path, required=True)
     parser.add_argument("--risk-artifact", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--max-new-tokens", type=int, default=768)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=GSM8K_PROMPT_CONTRACT.max_new_tokens,
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16"
@@ -131,7 +135,14 @@ def main() -> None:
         args.risk_artifact, map_location="cpu", weights_only=False
     )
     if risk_artifact.get("schema_version") != ENTROPY_RISK_ARTIFACT_SCHEMA:
-        raise ValueError("Unexpected entropy-risk artifact schema")
+        raise ValueError(
+            "Entropy-risk artifact predates the canonical GSM8K prompt; "
+            "rebuild it with run_entropy_risk_gate.sh"
+        )
+    if risk_artifact.get("prompt_contract") != GSM8K_PROMPT_CONTRACT.metadata(
+        chat_template=CONVERSATION_TEMPLATE
+    ):
+        raise ValueError("Entropy-risk artifact uses a different prompt contract")
     heldout = risk_artifact.get("risk_gate", {}).get("heldout_diagnostic", {})
     if float(heldout.get("heldout_roc_auc", 0.0)) < float(
         heldout.get("minimum_heldout_roc_auc", 1.0)
@@ -216,15 +227,7 @@ def main() -> None:
         controller=controller,
         profile=profile,
     )
-    prompt = tokenizer.apply_chat_template(
-        build_gsm8k_messages(question),
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    prompt_ids = [
-        int(token)
-        for token in tokenizer.encode(prompt, add_special_tokens=False)
-    ]
+    prompt_ids = GSM8K_PROMPT_CONTRACT.token_ids(tokenizer, question)
     try:
         result = system.generate(
             question=question, prompt_token_ids=prompt_ids
@@ -240,6 +243,9 @@ def main() -> None:
         "status": "completed",
         "answer_or_reward_used": False,
         "question_sha256": text_sha256(question),
+        "prompt_contract": GSM8K_PROMPT_CONTRACT.metadata(
+            chat_template=CONVERSATION_TEMPLATE
+        ),
         "prompt_token_count": len(prompt_ids),
         "prompt_token_ids_sha256": canonical_json_sha256(prompt_ids),
         "completion": completion,

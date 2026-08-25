@@ -15,10 +15,10 @@ from typing import Any, Mapping, Sequence
 from memgen.experience.phase1 import canonical_json_sha256
 
 
-E1_ASSIGNMENT_SCHEMA = "experience-memory-e1-assignment-v4"
-E1_MANIFEST_SCHEMA = "experience-memory-e1-assignment-manifest-v4"
-E1_RESULTS_SCHEMA = "experience-memory-e1-results-v4"
-E1_SUMMARY_SCHEMA = "experience-memory-e1-summary-v4"
+E1_ASSIGNMENT_SCHEMA = "experience-memory-e1-assignment-v5"
+E1_MANIFEST_SCHEMA = "experience-memory-e1-assignment-manifest-v5"
+E1_RESULTS_SCHEMA = "experience-memory-e1-results-v5"
+E1_SUMMARY_SCHEMA = "experience-memory-e1-summary-v5"
 E1_CONDITIONS = (
     "vanilla",
     "gate_observation_only",

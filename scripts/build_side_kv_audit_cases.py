@@ -16,6 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from data.gsm8k.prompt import GSM8K_PROMPT_CONTRACT
 from memgen.chat_templates import CONVERSATION_TEMPLATE
 from memgen.experience.phase1 import (
     canonical_json_sha256,
@@ -24,7 +25,6 @@ from memgen.experience.phase1 import (
     text_sha256,
     write_jsonl,
 )
-from memgen.experience.risk import build_gsm8k_messages
 
 
 _ANSWER_MARKER_RE = re.compile(
@@ -145,12 +145,7 @@ def main() -> None:
         question = str(source["question"]).strip()
         if text_sha256(question) != sample["question_sha256"]:
             raise ValueError(f"Question hash mismatch for {sample['sample_id']}")
-        prompt = tokenizer.apply_chat_template(
-            build_gsm8k_messages(question),
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        prompt_ids = GSM8K_PROMPT_CONTRACT.token_ids(tokenizer, question)
         inputs = torch.tensor([prompt_ids], dtype=torch.long, device=args.device)
         attention_mask = torch.ones_like(inputs)
         with torch.inference_mode():

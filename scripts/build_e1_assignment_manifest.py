@@ -16,6 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from data.gsm8k.prompt import GSM8K_PROMPT_CONTRACT
 from memgen.chat_templates import CONVERSATION_TEMPLATE
 from memgen.experience.e1 import (
     E1_MANIFEST_SCHEMA,
@@ -33,7 +34,6 @@ from memgen.experience.phase1 import (
 )
 from memgen.experience.risk import (
     ENTROPY_RISK_ARTIFACT_SCHEMA,
-    build_gsm8k_messages,
 )
 from memgen.experience.retrieval import (
     BM25MemoryIndex,
@@ -68,7 +68,11 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Maximum samples after offset; zero selects the full split.",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=768)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=GSM8K_PROMPT_CONTRACT.max_new_tokens,
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--dtype",
@@ -102,21 +106,17 @@ def load_hashed_manifest(path: Path) -> dict[str, Any]:
 
 
 def prompt_token_ids(tokenizer: Any, question: str) -> list[int]:
-    prompt = tokenizer.apply_chat_template(
-        build_gsm8k_messages(question),
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    return [
-        int(value)
-        for value in tokenizer.encode(prompt, add_special_tokens=False)
-    ]
+    return GSM8K_PROMPT_CONTRACT.token_ids(tokenizer, question)
 
 
 def main() -> None:
     args = parse_args()
     if args.offset < 0 or args.limit < 0 or args.max_new_tokens <= 0:
         raise ValueError("E1 requires non-negative slices and a positive token budget")
+    if args.max_new_tokens != GSM8K_PROMPT_CONTRACT.max_new_tokens:
+        raise ValueError(
+            "E1 max-new-tokens must match the canonical GSM8K baseline"
+        )
 
     import torch
     from datasets import load_dataset
@@ -199,7 +199,15 @@ def main() -> None:
         args.risk_artifact, map_location="cpu", weights_only=False
     )
     if risk_artifact.get("schema_version") != ENTROPY_RISK_ARTIFACT_SCHEMA:
-        raise ValueError("Unexpected entropy-risk artifact schema")
+        raise ValueError(
+            "Entropy-risk artifact predates the canonical GSM8K prompt; "
+            "rebuild it with run_entropy_risk_gate.sh"
+        )
+    prompt_contract = GSM8K_PROMPT_CONTRACT.metadata(
+        chat_template=CONVERSATION_TEMPLATE
+    )
+    if risk_artifact.get("prompt_contract") != prompt_contract:
+        raise ValueError("Entropy-risk artifact uses a different prompt contract")
     heldout = risk_artifact.get("risk_gate", {}).get("heldout_diagnostic", {})
     if float(heldout.get("heldout_roc_auc", 0.0)) < float(
         heldout.get("minimum_heldout_roc_auc", 1.0)
@@ -354,6 +362,7 @@ def main() -> None:
         "logical_split": args.logical_split,
         "dataset_split": expected_dataset_split,
         "evaluation_role": scope.evaluation_role,
+        "prompt_contract": prompt_contract,
         "reasoner": {
             "model_name": model_name,
             "model_revision": model_revision,
@@ -364,6 +373,18 @@ def main() -> None:
         },
         "configuration": {
             "max_new_tokens": args.max_new_tokens,
+            "vanilla_generation": {
+                "implementation": "transformers_generate",
+                "decoding": "greedy",
+                "use_cache": True,
+                "batch_size": 1,
+            },
+            "gate_generation": {
+                "implementation": "explicit_live_kv_cache",
+                "decoding": "greedy",
+                "use_cache": True,
+                "batch_size": 1,
+            },
             "offset": args.offset,
             "limit": args.limit,
             "memory_count_per_trigger": 1,
@@ -420,7 +441,7 @@ def main() -> None:
         "assignment_build_report.json"
     )
     report = {
-        "schema_version": "experience-memory-e1-assignment-build-report-v4",
+        "schema_version": "experience-memory-e1-assignment-build-report-v5",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed",
         "answer_or_reward_used": False,

@@ -220,8 +220,59 @@ class TriggeredPersistentMemoryGenerationResult:
     baseline_first_token_id: int
 
 
+@dataclass(frozen=True)
+class TokenSequenceParity:
+    """Exact comparison between a native and cache-driven generation."""
+
+    exact_match: bool
+    reference_length: int
+    candidate_length: int
+    shared_prefix_length: int
+    first_mismatch_index: int | None
+    reference_token_id: int | None
+    candidate_token_id: int | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exact_match": self.exact_match,
+            "reference_length": self.reference_length,
+            "candidate_length": self.candidate_length,
+            "shared_prefix_length": self.shared_prefix_length,
+            "first_mismatch_index": self.first_mismatch_index,
+            "reference_token_id": self.reference_token_id,
+            "candidate_token_id": self.candidate_token_id,
+        }
+
+
+def compare_token_sequences(
+    reference: Sequence[int], candidate: Sequence[int]
+) -> TokenSequenceParity:
+    """Locate the first token-level divergence without decoding text."""
+
+    shared = 0
+    for reference_token, candidate_token in zip(reference, candidate):
+        if int(reference_token) != int(candidate_token):
+            break
+        shared += 1
+    exact = shared == len(reference) == len(candidate)
+    mismatch = None if exact else shared
+    return TokenSequenceParity(
+        exact_match=exact,
+        reference_length=len(reference),
+        candidate_length=len(candidate),
+        shared_prefix_length=shared,
+        first_mismatch_index=mismatch,
+        reference_token_id=(
+            int(reference[shared]) if shared < len(reference) else None
+        ),
+        candidate_token_id=(
+            int(candidate[shared]) if shared < len(candidate) else None
+        ),
+    )
+
+
 class GreedyE1Runtime:
-    """Deterministic batch-one generation used by every E1 condition."""
+    """Deterministic native-reference and live-cache E1 generation."""
 
     def __init__(
         self,
@@ -245,8 +296,71 @@ class GreedyE1Runtime:
         text = self.tokenizer.decode([int(token_id)], skip_special_tokens=False)
         return text.rstrip(" \t").endswith((",", ".", "\n"))
 
+    def _replay_prefix_cache(
+        self, *, prefix_token_ids: Sequence[int], prompt_token_count: int
+    ) -> Any:
+        """Recreate the observation rollout's prompt-prefill/token-decode cache."""
+
+        prefix = list(prefix_token_ids)
+        if prompt_token_count <= 0 or len(prefix) <= prompt_token_count:
+            raise ValueError("Replay prefix must contain prompt and completion")
+        prompt = self._tensor(prefix[:prompt_token_count])
+        output = self.model(
+            input_ids=prompt,
+            attention_mask=torch.ones_like(prompt),
+            use_cache=True,
+            return_dict=True,
+        )
+        past = output.past_key_values
+        replayed_length = prompt_token_count
+        for token_id in prefix[prompt_token_count:-1]:
+            replayed_length += 1
+            token = self._tensor([token_id])
+            output = self.model(
+                input_ids=token,
+                attention_mask=torch.ones(
+                    (1, replayed_length),
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+                past_key_values=past,
+                use_cache=True,
+                return_dict=True,
+            )
+            past = output.past_key_values
+        return past
+
     @torch.inference_mode()
     def generate_vanilla(self, prompt_token_ids: Sequence[int]) -> tuple[int, ...]:
+        """Run the base reasoner through Hugging Face's native greedy path."""
+
+        inputs = self._tensor(prompt_token_ids)
+        generated = self.model.generate(
+            input_ids=inputs,
+            attention_mask=torch.ones_like(inputs),
+            do_sample=False,
+            max_new_tokens=self.max_new_tokens,
+            use_cache=True,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
+        if generated.ndim != 2 or generated.shape[0] != 1:
+            raise RuntimeError("Native vanilla generation returned an invalid shape")
+        if generated.shape[1] < inputs.shape[1]:
+            raise RuntimeError("Native vanilla generation lost the prompt prefix")
+        if not torch.equal(generated[:, : inputs.shape[1]], inputs):
+            raise RuntimeError("Native vanilla generation changed the prompt prefix")
+        return tuple(
+            int(value)
+            for value in generated[0, inputs.shape[1] :].tolist()
+        )
+
+    @torch.inference_mode()
+    def generate_cache_greedy(
+        self, prompt_token_ids: Sequence[int]
+    ) -> tuple[int, ...]:
+        """Run the explicit live-cache loop required by gate and side-KV."""
+
         ids = list(prompt_token_ids)
         prompt_length = len(ids)
         past = None
@@ -358,22 +472,18 @@ class GreedyE1Runtime:
         partial_length = len(prefix) - prompt_token_count
         if partial_length >= self.max_new_tokens:
             raise ValueError("Treatment boundary leaves no generation budget")
-        before_boundary = self._tensor(prefix[:-1])
         boundary = self._tensor([prefix[-1]])
-        prefill_mask = torch.ones_like(before_boundary)
         full_mask = torch.ones(
-            (1, len(prefix)), dtype=prefill_mask.dtype, device=self.device
+            (1, len(prefix)), dtype=torch.long, device=self.device
         )
-        prefill = self.model(
-            input_ids=before_boundary,
-            attention_mask=prefill_mask,
-            use_cache=True,
-            return_dict=True,
+        replayed_past = self._replay_prefix_cache(
+            prefix_token_ids=prefix,
+            prompt_token_count=prompt_token_count,
         )
         baseline = self.model(
             input_ids=boundary,
             attention_mask=full_mask,
-            past_key_values=clone_cache(prefill.past_key_values),
+            past_key_values=clone_cache(replayed_past),
             use_cache=True,
             return_dict=True,
         )
@@ -382,7 +492,7 @@ class GreedyE1Runtime:
             treatment = self.model(
                 input_ids=boundary,
                 attention_mask=full_mask,
-                past_key_values=clone_cache(prefill.past_key_values),
+                past_key_values=clone_cache(replayed_past),
                 use_cache=True,
                 return_dict=True,
             )

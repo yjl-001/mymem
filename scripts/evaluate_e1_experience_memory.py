@@ -17,6 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from data.gsm8k.prompt import GSM8K_PROMPT_CONTRACT
 from data.utils.math_utils import diagnose_gsm8k_completion
 from memgen.chat_templates import CONVERSATION_TEMPLATE
 from memgen.experience.e1 import (
@@ -31,7 +32,6 @@ from memgen.experience.phase1 import (
     file_sha256,
     text_sha256,
 )
-from memgen.experience.risk import build_gsm8k_messages
 from memgen.experience.system import ExperienceMemorySystemProfile
 
 
@@ -64,15 +64,7 @@ def processed_solution(answer: str) -> str:
 
 
 def prompt_token_ids(tokenizer: Any, question: str) -> list[int]:
-    prompt = tokenizer.apply_chat_template(
-        build_gsm8k_messages(question),
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    return [
-        int(value)
-        for value in tokenizer.encode(prompt, add_special_tokens=False)
-    ]
+    return GSM8K_PROMPT_CONTRACT.token_ids(tokenizer, question)
 
 
 def condition_result(
@@ -186,7 +178,7 @@ def main() -> None:
     from datasets import load_dataset
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from memgen.model.e1_runtime import GreedyE1Runtime
+    from memgen.model.e1_runtime import GreedyE1Runtime, compare_token_sequences
     from memgen.model.side_kv import (
         SideKVAttentionController,
         SideKVBankLoader,
@@ -207,6 +199,11 @@ def main() -> None:
         raise ValueError("E1 assignment manifest hash mismatch")
     if manifest.get("status") != "frozen" or manifest.get("answer_or_reward_used") is not False:
         raise ValueError("E1 assignments are not frozen and answer-blind")
+    expected_prompt_contract = GSM8K_PROMPT_CONTRACT.metadata(
+        chat_template=CONVERSATION_TEMPLATE
+    )
+    if manifest.get("prompt_contract") != expected_prompt_contract:
+        raise ValueError("E1 assignment uses a different GSM8K prompt contract")
     inputs = manifest.get("inputs", {})
     for path, expected_hash, label in (
         (
@@ -368,6 +365,9 @@ def main() -> None:
                 vanilla_ids = runtime.generate_vanilla(prompt_ids)
                 vanilla_seconds = time.perf_counter() - started
                 gate_ids = assignment.observation_completion_token_ids
+                vanilla_gate_parity = compare_token_sequences(
+                    vanilla_ids, gate_ids
+                )
                 conditions: dict[str, dict[str, Any]] = {
                     "vanilla": condition_result(
                         tokenizer=tokenizer,
@@ -476,8 +476,9 @@ def main() -> None:
                         else None
                     ),
                     "vanilla_matches_gate_observation_only": (
-                        vanilla_ids == gate_ids
+                        vanilla_gate_parity.exact_match
                     ),
+                    "vanilla_gate_parity": vanilla_gate_parity.to_dict(),
                     "conditions": conditions,
                 }
                 output_handle.write(
@@ -515,7 +516,7 @@ def main() -> None:
             ),
         }
     run_report = {
-        "schema_version": "experience-memory-e1-run-report-v4",
+        "schema_version": "experience-memory-e1-run-report-v5",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "completed",
         "sample_count": len(records),
@@ -524,9 +525,26 @@ def main() -> None:
         "logical_split": manifest["logical_split"],
         "dataset_split": dataset_split,
         "evaluation_role": manifest.get("evaluation_role"),
+        "prompt_contract": expected_prompt_contract,
+        "generation_contract": {
+            "max_new_tokens": runtime.max_new_tokens,
+            "vanilla": manifest["configuration"]["vanilla_generation"],
+            "gate_observation_only": manifest["configuration"][
+                "gate_generation"
+            ],
+        },
         "vanilla_gate_token_parity": all(
             item["vanilla_matches_gate_observation_only"] for item in records
         ),
+        "vanilla_gate_parity_mismatch_count": sum(
+            not item["vanilla_matches_gate_observation_only"]
+            for item in records
+        ),
+        "vanilla_gate_parity_mismatch_sample_ids": [
+            item["sample_id"]
+            for item in records
+            if not item["vanilla_matches_gate_observation_only"]
+        ],
         "conditions": condition_summaries,
         "system_profile": profile.to_dict(),
         "inputs": {
