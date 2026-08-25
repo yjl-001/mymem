@@ -124,6 +124,20 @@ bash scripts/experiments/gsm8k/run_base_reasoner_parity.sh \
 只有 `base_parity_summary.json.status=passed` 且 native baseline 回到已知合理区间，
 才继续解释 E1。该预检不加载 gate、BM25 或 side-KV，不产生 memory 效果结论。
 
+当前低 baseline 的首要诊断固定 `batch_size=1`，只比较 eager 与 FlashAttention2：
+
+```bash
+MEMGEN_RUN_TAG=base-attention-final32-v1 \
+bash scripts/experiments/gsm8k/run_base_attention_backend_comparison.sh \
+  --logical-split final-test \
+  --limit 32 \
+  "$PHASE1_DIR" "$E0_DIR"
+```
+
+输出 `comparison_summary.json`。若 FlashAttention2 的 native accuracy 回到合理区间而 eager 没有，
+则 attention backend 是主要差异来源，正式 matched 路径需要先解决 side-KV 与高质量 backend 的兼容性；
+若两者准确率接近，则继续对照已知 50%+ 运行的 prompt token、模型 artifact 和评分记录。
+
 服务器环境文件只保留输出目录和可选 GPU：
 
 ```bash

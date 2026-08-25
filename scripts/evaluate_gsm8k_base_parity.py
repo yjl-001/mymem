@@ -48,6 +48,12 @@ def parse_args() -> argparse.Namespace:
         choices=("bfloat16", "float16", "float32"),
         default="bfloat16",
     )
+    parser.add_argument(
+        "--attention-implementation",
+        choices=("eager", "flash_attention_2"),
+        default="eager",
+        help="The only model-execution variable in the backend diagnostic.",
+    )
     return parser.parse_args()
 
 
@@ -162,7 +168,7 @@ def main() -> None:
         model_name,
         revision=model_revision,
         dtype=dtype,
-        attn_implementation="eager",
+        attn_implementation=args.attention_implementation,
     ).to(args.device)
     model.eval()
     if str(getattr(model.config, "_commit_hash", None) or model_revision) != model_revision:
@@ -208,7 +214,7 @@ def main() -> None:
             parity = compare_token_sequences(native_ids, cache_ids)
             ground_truth = processed_solution(answer)
             record = {
-                "schema_version": "gsm8k-base-generation-parity-result-v2",
+                "schema_version": "gsm8k-base-generation-parity-result-v3",
                 "sample_id": sample["sample_id"],
                 "logical_split": scope.logical_split,
                 "dataset_split": scope.dataset_split,
@@ -216,6 +222,7 @@ def main() -> None:
                 "question_sha256": sample["question_sha256"],
                 "prompt_token_count": len(prompt_ids),
                 "prompt_token_ids_sha256": canonical_json_sha256(prompt_ids),
+                "attention_implementation": args.attention_implementation,
                 "parity": parity.to_dict(),
                 "runtime_seconds": {
                     "native_transformers_generate": native_seconds,
@@ -261,7 +268,7 @@ def main() -> None:
         )
     }
     summary = {
-        "schema_version": "gsm8k-base-generation-parity-report-v2",
+        "schema_version": "gsm8k-base-generation-parity-report-v3",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed" if not mismatch_ids else "failed_token_parity",
         "formal_memory_claim": False,
@@ -284,7 +291,7 @@ def main() -> None:
             chat_template=CONVERSATION_TEMPLATE
         ),
         "generation_contract": {
-            "attention_implementation": "eager",
+            "attention_implementation": args.attention_implementation,
             "native_transformers_generate": {
                 **runtime.native_generation_config_dict,
                 "implementation": "transformers_generate",
@@ -310,6 +317,7 @@ def main() -> None:
             "model_revision": model_revision,
             "tokenizer_revision": tokenizer_revision,
             "dtype": args.dtype,
+            "attention_implementation": args.attention_implementation,
         },
         "conditions": conditions,
         "inputs": {
