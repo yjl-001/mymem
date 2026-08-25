@@ -15,8 +15,11 @@
 ### 何时需要经验
 
 - 高熵和 layer-24 hidden state 可以区分“高熵后自然恢复”与“持续发散”。
-- eager 历史 artifact 的 held-out ROC-AUC 为 `0.8053`，balanced accuracy 为 `0.7158`；该数值不能
-  直接用于 SDPA，正式运行前必须重新编译并通过相同 held-out 门槛。
+- SDPA 重新编译后的 held-out ROC-AUC 为 `0.8026`，balanced accuracy 为 `0.7180`，与 eager
+  历史结果 `0.8053/0.7158` 基本一致。
+- SDPA holdout 包含 353 个 persistence 和 48 个 recovery 事件；每个 partition/label 的最低事件数
+  门槛在看到 48 之后由 50 事后调整为 40，必须作为实验限制披露。该调整不改变 prototype、entropy
+  threshold 或固定的 `risk_threshold=0`。
 - gate 只负责决定何时访问经验，不负责决定经验内容。
 
 ### 已关闭路线
@@ -24,16 +27,15 @@
 - 全局 `recovery - persistence` residual vector 在独立确认中无效；不再调整 alpha、layer、符号或样本量。
 - 同题 local-action raw hidden-state 检索 margin 很低；不再用于具体经验检索。
 
-### E0 side-KV 机制（历史 eager 证据）
+### E0 side-KV 机制
 
-- 161 条 payload 已编译为 layer-24 canonical pre-RoPE side-KV。
-- 8/8 answer-blind runtime audit cases 通过。
-- mean memory attention mass 为 `0.3331`，mean first-step logits KL 为 `0.00507`。
-- maximum canonical RoPE score relative error 为 `0.00109`。
-- memory K/V 不写入 HuggingFace native cache，disabled path 与原始 logits 保持一致。
+- 161 条 payload 已在 SDPA 下重新编译为 layer-24 canonical pre-RoPE side-KV。
+- 8/8 answer-blind、pre-answer runtime audit cases 通过，`formal_e0_passed=true`。
+- canonical shared-phase RoPE、disabled-path logits parity、native cache prefix/length、正 attention mass 和
+  active logits effect 均通过审计。
+- memory K/V 不写入 HuggingFace native cache，只在 layer-24 SDPA side path 中与 native K/V 联合归一化。
 
-这些结果只证明旧 eager 机制正确且能够影响 logits，不证明 memory 内容改善任务表现，也不替代新的
-SDPA E0 审计。
+这些结果只证明 SDPA 机制正确且能够影响 logits，不证明 memory 内容改善任务表现。
 
 ### Attention backend 基线
 
@@ -48,8 +50,8 @@ SDPA E0 审计。
 - FlashAttention2 仍是质量参考（严格准确率 `0.65625`），SDPA 结果只能表述为“SDPA runtime 下”的
   系统效果，不能表述为 FlashAttention2 等价效果。
 
-当前代码已迁移到 SDPA；旧 risk artifact、side-KV bank、E0 final report 和 E1 assignment 均由 schema
-拒绝复用。服务器必须重新生成这些 artifact。
+当前代码与正式 artifact 已迁移到 SDPA；旧 eager risk artifact、side-KV bank、E0 final report 和
+E1 assignment 均由 schema 拒绝复用。
 
 ### 经验内容、检索与通道诊断
 
@@ -128,7 +130,44 @@ gate observation completion 仍在 assignment 阶段生成，用于冻结触发�
 未触发或检索 abstain 的样本在 matched 条件中精确复用 vanilla completion。`matched - vanilla`
 同时包含 gate、检索、经验内容和 side-KV 激活效应，不能单独识别任一组件的贡献。
 
-## 4. 运行与 artifact
+## 4. SDPA 全量 final-test 结果
+
+冻结系统已在 official GSM8K test 的全部 1319 题上运行；643 题触发并全部完成 BM25 top-1 assignment，
+占 `48.75%`。运行完整性通过：assignment/runtime 无违规，vanilla 与内部 observation 逐 token 一致。
+
+| 指标 | vanilla | matched | 全量差值 |
+|---|---:|---:|---:|
+| 严格准确率 | `0.478393` | `0.478393` | `0.000000` |
+| diagnostic answer accuracy | `0.684610` | `0.680819` | `-0.003791` |
+| 格式准确率 | `0.669447` | `0.668688` | `-0.000758` |
+| 平均生成长度 | `281.875` | `282.576` | `+0.701` token |
+
+在 643 个 assigned samples 上：
+
+- 严格正确性 14 题由错变对、14 题由对变错，净效应为零，95% bootstrap CI 为
+  `[-0.01555, 0.01555]`，McNemar `p=1.0`；
+- diagnostic answer 8 题改善、13 题退化，差值 `-0.00778`，95% CI 为
+  `[-0.02177, 0.00622]`；
+- 格式 12 题改善、13 题退化，差值 `-0.00156`，95% CI 为
+  `[-0.01711, 0.01400]`。
+
+机制持续生效：mean memory attention mass 为 `0.07765`，mean first-step logits KL 为 `0.001116`，
+每个触发样本平均记录约 149 个 persistent-memory decode steps。由此可以排除 memory 未进入 attention、
+只使用一次、cache 损坏或 baseline replay 漂移；但当前影响没有正确方向，表现为收益与损失相互抵消。
+
+Gate 选中的题在 vanilla 下 diagnostic answer accuracy 为 `0.6096`，未触发题约为 `0.7559`，说明 gate
+确实富集了数学上更困难的样本。相反，触发题格式准确率为 `0.7745`，未触发题约为 `0.5695`；当前
+pre-answer delimiter gate 不是格式失败检测器。
+
+正式结论是：当前 `SDPA gate + BM25 top-1 + layer-24 persistent side-KV` 端到端任务收益为零，预设
+effect acceptance 未通过；但机制与运行完整性通过。该结果不能单独证明经验库、BM25 或 side-KV 中
+任一模块无效。结合既有文本 payload 能传递格式行为而 side-KV 未能复现的证据，当前首要嫌疑仍是
+side-KV 内容表示，其次是检索与经验抽象；不应先盲调 memory bias 或 gate timing。
+
+official GSM8K test 已不再是未查看的 pristine final set。后续只能对该结果做描述性/只读误差分析；
+所有配置优化必须在 calibration/dev 上进行，不能再次使用同一 test 调参后声称独立 final confirmation。
+
+## 5. 运行与 artifact
 
 先进行 base parity 预检：
 
@@ -177,18 +216,18 @@ cp scripts/experiments/gsm8k/e1.server.env.example \
   scripts/experiments/gsm8k/.e1.server.env
 ```
 
-正式 E1 前必须依次重建 SDPA artifact（旧 eager 目录不可复用）：
+重建 SDPA artifact（旧 eager 目录不可复用）：
 
 ```bash
-MEMGEN_RUN_TAG=risk-sdpa-v1 \
+MEMGEN_RUN_TAG=risk-sdpa-v2 \
 bash scripts/experiments/gsm8k/run_entropy_risk_gate.sh "$PHASE1_DIR"
 
 MEMGEN_RUN_TAG=e0-sdpa-v1 \
 bash scripts/experiments/gsm8k/run_e0_experience_memory.sh "$PHASE1_DIR"
 ```
 
-确认新的 risk report 通过 held-out AUC 门槛，且新的 `e0_final_report.json` 中
-`attention_implementation=sdpa`、`formal_e0_passed=true` 后，再运行开发诊断：
+risk report 已通过 held-out AUC 门槛，`e0_final_report.json` 已满足
+`attention_implementation=sdpa`、`formal_e0_passed=true`。
 
 SDPA risk qualification 固定要求 train/holdout 的 recovery、persistence 各至少 40 个事件；该门槛只判断
 诊断样本是否充足，不参与 prototype、entropy threshold 或 risk threshold 的拟合。
@@ -204,10 +243,10 @@ bash scripts/experiments/gsm8k/run_e1d_full_system.sh \
   "$PHASE1_DIR" "$E0_DIR" "$RISK_ARTIFACT"
 ```
 
-经明确决策，当前冻结系统允许在官方 GSM8K `final-test` 上进行一次全量评测：
+已完成的官方 GSM8K `final-test` 全量冻结评测命令：
 
 ```bash
-MEMGEN_RUN_TAG=e1d-final-test-full-v1 \
+MEMGEN_RUN_TAG=e1-sdpa-final-full-v1 \
 bash scripts/experiments/gsm8k/run_e1d_full_system.sh \
   --logical-split final-test \
   --offset 0 \
@@ -216,9 +255,8 @@ bash scripts/experiments/gsm8k/run_e1d_full_system.sh \
 ```
 
 `--limit 0` 表示选择该 split 的全部样本。assignment 阶段只读取 test question；test answer 只在冻结
-assignment 后的 evaluation 阶段用于评分。artifact 会记录 `dataset_split=test` 和
-`evaluation_role=final_evaluation`。从本次运行开始，官方 test 不再是未查看的 pristine final set；其结果
-不得用于反向调整同一版本后再宣称独立 final-test confirmation。
+assignment 后的 evaluation 阶段用于评分。artifact 记录 `dataset_split=test` 和
+`evaluation_role=final_evaluation`。
 
 如需重建风险 artifact，只运行风险分类编译，不执行 residual 干预：
 
@@ -246,12 +284,16 @@ python scripts/run_online_experience_memory.py \
   --output /tmp/experience_memory_online.json
 ```
 
-## 5. 后续优化顺序
+## 6. 下一阶段
 
-1. 提高 `MemoryRecord` 中数学策略的具体性、可执行性和验证能力；
-2. 改进语义检索 query/index，使检索与当前错误状态更相关；
-3. 重新设计 side-KV 内容表示，使其能够传递文本 payload 已证明存在的行为效应；
-4. 前三项得到正证据后，再优化 gate 触发位置。
+1. 先对 final-test artifact 做只读 discordant audit：交叉分析 14/14 strict flips、8/13 answer flips、
+   12/13 format flips 与 memory ID、payload、BM25 score/margin、trigger 位置、attention mass 和 KL；该分析
+   只能用于形成假设，不能用于选择配置。
+2. 在 calibration/dev 上冻结同一 assignment 和 memory ID，对比 no-memory、matched payload text 与
+   matched side-KV，直接判断瓶颈属于经验/检索还是表示通道。
+3. 若 matched text 有效而 side-KV 无效，优先研究 query-conditioned 编译、多层 side-KV 或学习式 memory
+   adapter；若 matched text 也无效，再改进经验抽象与检索。
+4. 在内容与通道得到正证据前，不调整 `log(10)` bias，不优先优化 gate timing。
 
 后续仍不新增 Teacher/Pro 调用，不恢复 residual-vector 路线，也不把完整系统的工程可运行性表述为任务
 收益。final-test 结果可以报告冻结系统的实际表现，但在当前双条件端到端设计中，不能单独
