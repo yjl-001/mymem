@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--low-entropy-quantile", type=float, default=0.50)
     parser.add_argument("--risk-train-fraction", type=float, default=0.5)
     parser.add_argument("--risk-split-seed", type=int, default=42)
-    parser.add_argument("--min-events-per-label", type=int, default=50)
+    parser.add_argument("--min-events-per-label", type=int, default=40)
     parser.add_argument("--min-heldout-roc-auc", type=float, default=0.60)
     parser.add_argument("--max-sequence-length", type=int, default=0)
     return parser.parse_args()
@@ -340,6 +340,15 @@ def main() -> None:
         },
         "four_cell_counts": four_cell_counts,
         "event_counts": event_counts,
+        "evidence_requirement": {
+            "minimum_events_per_partition_label": args.min_events_per_label,
+            "applies_to": [
+                "train_recovery",
+                "train_persistence",
+                "holdout_recovery",
+                "holdout_persistence",
+            ],
+        },
         "prompt_contract": GSM8K_PROMPT_CONTRACT.metadata(
             chat_template=CONVERSATION_TEMPLATE
         ),
@@ -437,6 +446,7 @@ def main() -> None:
             "fixed_layer": args.layer,
             "boundary_definition": "preboxed_delimiter_with_next_reasoning_boundary",
             "condition": "high_entropy_recovery_vs_persistence_all_outcomes_train_only",
+            "minimum_events_per_partition_label": args.min_events_per_label,
             "sink_token_count": args.sink_token_count,
             "high_entropy_quantile": args.high_entropy_quantile, "high_entropy_threshold": high_threshold,
             "low_entropy_quantile": args.low_entropy_quantile, "low_entropy_threshold": low_threshold,

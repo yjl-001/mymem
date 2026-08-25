@@ -74,7 +74,7 @@ python scripts/compile_entropy_risk_gate.py \
   --low-entropy-quantile 0.50 \
   --risk-train-fraction 0.50 \
   --risk-split-seed 42 \
-  --min-events-per-label 50 \
+  --min-events-per-label 40 \
   --min-heldout-roc-auc 0.60
 
 ARTIFACT="$RUN_DIR/entropy-risk-gate-answer_correctness.pt"

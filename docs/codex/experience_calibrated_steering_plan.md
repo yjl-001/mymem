@@ -190,6 +190,9 @@ bash scripts/experiments/gsm8k/run_e0_experience_memory.sh "$PHASE1_DIR"
 确认新的 risk report 通过 held-out AUC 门槛，且新的 `e0_final_report.json` 中
 `attention_implementation=sdpa`、`formal_e0_passed=true` 后，再运行开发诊断：
 
+SDPA risk qualification 固定要求 train/holdout 的 recovery、persistence 各至少 40 个事件；该门槛只判断
+诊断样本是否充足，不参与 prototype、entropy threshold 或 risk threshold 的拟合。
+
 ```bash
 source scripts/experiments/gsm8k/.e1.server.env
 
