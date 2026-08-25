@@ -32,11 +32,18 @@ class E1RuntimeParityTests(unittest.TestCase):
             eos_token_id = 0
 
         class FakeModel:
+            generation_config = SimpleNamespace(repetition_penalty=1.1)
+
             @staticmethod
-            def generate(*, input_ids, **kwargs):
+            def get_input_embeddings():
+                return lambda input_ids: input_ids.unsqueeze(-1).float()
+
+            @staticmethod
+            def generate(*, inputs_embeds, generation_config, **kwargs):
                 del kwargs
-                suffix = torch.tensor([[3, 0]], device=input_ids.device)
-                return torch.cat((input_ids, suffix), dim=1)
+                self.assertFalse(generation_config.use_cache)
+                self.assertEqual(generation_config.repetition_penalty, 1.0)
+                return torch.tensor([[3, 0]], device=inputs_embeds.device)
 
             @staticmethod
             def __call__(*, input_ids, attention_mask, past_key_values=None, **kwargs):
@@ -60,6 +67,12 @@ class E1RuntimeParityTests(unittest.TestCase):
         self.assertEqual(native, (3, 0))
         self.assertEqual(cached, native)
         self.assertTrue(compare_token_sequences(native, cached).exact_match)
+        self.assertEqual(
+            runtime.native_generation_config_dict["model_input"],
+            "inputs_embeds",
+        )
+        self.assertFalse(runtime.native_generation_config_dict["use_cache"])
+        self.assertTrue(runtime.cache_generation_config_dict["use_cache"])
 
     def test_trigger_prefix_replay_preserves_observation_chunking(self) -> None:
         from memgen.model.e1_runtime import GreedyE1Runtime

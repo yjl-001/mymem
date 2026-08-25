@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -207,7 +208,7 @@ def main() -> None:
             parity = compare_token_sequences(native_ids, cache_ids)
             ground_truth = processed_solution(answer)
             record = {
-                "schema_version": "gsm8k-base-generation-parity-result-v1",
+                "schema_version": "gsm8k-base-generation-parity-result-v2",
                 "sample_id": sample["sample_id"],
                 "logical_split": scope.logical_split,
                 "dataset_split": scope.dataset_split,
@@ -247,6 +248,11 @@ def main() -> None:
         for record in records
         if not record["parity"]["exact_match"]
     ]
+    mismatch_index_counts = Counter(
+        int(record["parity"]["first_mismatch_index"])
+        for record in records
+        if record["parity"]["first_mismatch_index"] is not None
+    )
     conditions = {
         name: aggregate(records, name)
         for name in (
@@ -255,7 +261,7 @@ def main() -> None:
         )
     }
     summary = {
-        "schema_version": "gsm8k-base-generation-parity-report-v1",
+        "schema_version": "gsm8k-base-generation-parity-report-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed" if not mismatch_ids else "failed_token_parity",
         "formal_memory_claim": False,
@@ -265,16 +271,39 @@ def main() -> None:
         "exact_token_parity": not mismatch_ids,
         "parity_mismatch_count": len(mismatch_ids),
         "parity_mismatch_sample_ids": mismatch_ids,
+        "first_mismatch_index_counts": {
+            str(index): count
+            for index, count in sorted(mismatch_index_counts.items())
+        },
+        "first_token_mismatch_count": mismatch_index_counts.get(0, 0),
+        "mean_shared_prefix_length": sum(
+            int(record["parity"]["shared_prefix_length"])
+            for record in records
+        ) / len(records),
         "prompt_contract": GSM8K_PROMPT_CONTRACT.metadata(
             chat_template=CONVERSATION_TEMPLATE
         ),
         "generation_contract": {
-            "max_new_tokens": GSM8K_PROMPT_CONTRACT.max_new_tokens,
-            "decoding": "greedy",
-            "batch_size": 1,
             "attention_implementation": "eager",
-            "native_use_cache": True,
-            "explicit_runtime_use_cache": True,
+            "native_transformers_generate": {
+                **runtime.native_generation_config_dict,
+                "implementation": "transformers_generate",
+            },
+            "explicit_live_kv_cache": {
+                **runtime.cache_generation_config_dict,
+                "implementation": "explicit_live_kv_cache",
+            },
+        },
+        "model_generation_defaults": {
+            "do_sample": bool(model.generation_config.do_sample),
+            "repetition_penalty": float(
+                model.generation_config.repetition_penalty
+            ),
+            "temperature": float(model.generation_config.temperature),
+            "top_p": float(model.generation_config.top_p),
+            "top_k": int(model.generation_config.top_k),
+            "eos_token_id": model.generation_config.eos_token_id,
+            "pad_token_id": model.generation_config.pad_token_id,
         },
         "reasoner": {
             "model_name": model_name,

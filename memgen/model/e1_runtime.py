@@ -9,6 +9,7 @@ import re
 from typing import Any, Sequence
 
 import torch
+from transformers import GenerationConfig
 
 from memgen.experience.e1 import GateObservation
 from memgen.model.side_kv import (
@@ -50,6 +51,71 @@ def logits_kl(reference: torch.Tensor, treatment: torch.Tensor) -> float:
         reference_probs * (reference_log_probs - treatment_log_probs)
     ).sum(dim=-1)
     return float(value.mean().item())
+
+
+@dataclass(frozen=True)
+class GreedyDecodingConfig:
+    """Frozen generation semantics shared by native and explicit-cache paths."""
+
+    repetition_penalty: float
+    pad_token_id: int
+    eos_token_id: int
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.repetition_penalty) or self.repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be finite and positive")
+        if self.pad_token_id < 0 or self.eos_token_id < 0:
+            raise ValueError("pad/eos token IDs must be non-negative")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "decoding": "greedy",
+            "do_sample": False,
+            "repetition_penalty": self.repetition_penalty,
+            "pad_token_id": self.pad_token_id,
+            "eos_token_id": self.eos_token_id,
+        }
+
+
+class GreedyDecodingPolicy:
+    """Freeze the raw-argmax policy used by the repository vanilla baseline."""
+
+    def __init__(self, *, tokenizer: Any, device: str):
+        if tokenizer.pad_token_id is None or tokenizer.eos_token_id is None:
+            raise ValueError("Greedy decoding requires tokenizer pad/eos IDs")
+        self.config = GreedyDecodingConfig(
+            repetition_penalty=1.0,
+            pad_token_id=int(tokenizer.pad_token_id),
+            eos_token_id=int(tokenizer.eos_token_id),
+        )
+        self.device = device
+
+    def generation_config(
+        self, *, max_new_tokens: int, use_cache: bool
+    ) -> GenerationConfig:
+        return GenerationConfig(
+            do_sample=False,
+            max_new_tokens=max_new_tokens,
+            use_cache=use_cache,
+            repetition_penalty=self.config.repetition_penalty,
+            pad_token_id=self.config.pad_token_id,
+            eos_token_id=self.config.eos_token_id,
+        )
+
+    def processed_scores(
+        self, *, token_ids: Sequence[int], logits: torch.Tensor
+    ) -> torch.Tensor:
+        del token_ids
+        return logits[:, -1, :]
+
+    def next_token(
+        self, *, token_ids: Sequence[int], logits: torch.Tensor
+    ) -> int:
+        scores = self.processed_scores(token_ids=token_ids, logits=logits)
+        return int(scores.argmax(dim=-1).item())
+
+    def is_eos(self, token_id: int) -> bool:
+        return int(token_id) == self.config.eos_token_id
 
 
 @dataclass(frozen=True)
@@ -288,6 +354,27 @@ class GreedyE1Runtime:
         self.tokenizer = tokenizer
         self.device = device
         self.max_new_tokens = max_new_tokens
+        self.decoding = GreedyDecodingPolicy(tokenizer=tokenizer, device=device)
+
+    @property
+    def native_generation_config_dict(self) -> dict[str, Any]:
+        return {
+            **self.decoding.config.to_dict(),
+            "max_new_tokens": self.max_new_tokens,
+            "use_cache": False,
+            "batch_size": 1,
+            "model_input": "inputs_embeds",
+        }
+
+    @property
+    def cache_generation_config_dict(self) -> dict[str, Any]:
+        return {
+            **self.decoding.config.to_dict(),
+            "max_new_tokens": self.max_new_tokens,
+            "use_cache": True,
+            "batch_size": 1,
+            "model_input": "input_ids_then_single_token_cache",
+        }
 
     def _tensor(self, token_ids: Sequence[int]) -> torch.Tensor:
         return torch.tensor([list(token_ids)], dtype=torch.long, device=self.device)
@@ -335,25 +422,20 @@ class GreedyE1Runtime:
         """Run the base reasoner through Hugging Face's native greedy path."""
 
         inputs = self._tensor(prompt_token_ids)
+        inputs_embeds = self.model.get_input_embeddings()(inputs)
         generated = self.model.generate(
-            input_ids=inputs,
+            inputs_embeds=inputs_embeds,
             attention_mask=torch.ones_like(inputs),
-            do_sample=False,
-            max_new_tokens=self.max_new_tokens,
-            use_cache=True,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
+            generation_config=self.decoding.generation_config(
+                max_new_tokens=self.max_new_tokens,
+                use_cache=False,
+            ),
         )
         if generated.ndim != 2 or generated.shape[0] != 1:
             raise RuntimeError("Native vanilla generation returned an invalid shape")
-        if generated.shape[1] < inputs.shape[1]:
-            raise RuntimeError("Native vanilla generation lost the prompt prefix")
-        if not torch.equal(generated[:, : inputs.shape[1]], inputs):
-            raise RuntimeError("Native vanilla generation changed the prompt prefix")
-        return tuple(
-            int(value)
-            for value in generated[0, inputs.shape[1] :].tolist()
-        )
+        if generated.shape[1] > self.max_new_tokens:
+            raise RuntimeError("Native vanilla generation exceeded its token budget")
+        return tuple(int(value) for value in generated[0].tolist())
 
     @torch.inference_mode()
     def generate_cache_greedy(
@@ -364,7 +446,6 @@ class GreedyE1Runtime:
         ids = list(prompt_token_ids)
         prompt_length = len(ids)
         past = None
-        eos = self.tokenizer.eos_token_id
         for _ in range(self.max_new_tokens):
             full = self._tensor(ids)
             kwargs: dict[str, Any] = {
@@ -376,10 +457,12 @@ class GreedyE1Runtime:
             if past is not None:
                 kwargs["past_key_values"] = past
             output = self.model(**kwargs)
-            next_token = int(output.logits[:, -1, :].argmax(dim=-1).item())
+            next_token = self.decoding.next_token(
+                token_ids=ids, logits=output.logits
+            )
             ids.append(next_token)
             past = output.past_key_values
-            if eos is not None and next_token == eos:
+            if self.decoding.is_eos(next_token):
                 break
         return tuple(ids[prompt_length:])
 
@@ -393,7 +476,6 @@ class GreedyE1Runtime:
         ids = list(prompt_token_ids)
         prompt_length = len(ids)
         past = None
-        eos = self.tokenizer.eos_token_id
         selected: GateObservation | None = None
         selected_prefix: tuple[int, ...] = ()
         candidate_count = 0
@@ -443,10 +525,12 @@ class GreedyE1Runtime:
                 if past is not None:
                     kwargs["past_key_values"] = past
                 output = self.model(**kwargs)
-            next_token = int(output.logits[:, -1, :].argmax(dim=-1).item())
+            next_token = self.decoding.next_token(
+                token_ids=ids, logits=output.logits
+            )
             ids.append(next_token)
             past = output.past_key_values
-            if eos is not None and next_token == eos:
+            if self.decoding.is_eos(next_token):
                 break
         return ObservationRolloutResult(
             completion_token_ids=tuple(ids[prompt_length:]),
@@ -496,14 +580,17 @@ class GreedyE1Runtime:
                 use_cache=True,
                 return_dict=True,
             )
-            baseline_logits = baseline.logits[:, -1, :]
-            treatment_logits = treatment.logits[:, -1, :]
-            first_token = int(treatment_logits.argmax(dim=-1).item())
+            baseline_scores = self.decoding.processed_scores(
+                token_ids=prefix, logits=baseline.logits
+            )
+            treatment_scores = self.decoding.processed_scores(
+                token_ids=prefix, logits=treatment.logits
+            )
+            first_token = int(treatment_scores.argmax(dim=-1).item())
             ids = prefix + [first_token]
             past = treatment.past_key_values
-            eos = self.tokenizer.eos_token_id
             remaining = self.max_new_tokens - partial_length - 1
-            if eos is None or first_token != eos:
+            if not self.decoding.is_eos(first_token):
                 for _ in range(remaining):
                     full = self._tensor(ids)
                     output = self.model(
@@ -513,10 +600,12 @@ class GreedyE1Runtime:
                         use_cache=True,
                         return_dict=True,
                     )
-                    next_token = int(output.logits[:, -1, :].argmax(dim=-1).item())
+                    next_token = self.decoding.next_token(
+                        token_ids=ids, logits=output.logits
+                    )
                     ids.append(next_token)
                     past = output.past_key_values
-                    if eos is not None and next_token == eos:
+                    if self.decoding.is_eos(next_token):
                         break
 
         traces = controller.traces
@@ -535,10 +624,10 @@ class GreedyE1Runtime:
         return TriggeredPersistentMemoryGenerationResult(
             completion_token_ids=tuple(ids[prompt_token_count:]),
             attention_traces=traces,
-            first_step_logits_kl=logits_kl(baseline_logits, treatment_logits),
+            first_step_logits_kl=logits_kl(baseline_scores, treatment_scores),
             first_step_top1_changed=bool(
-                baseline_logits.argmax(dim=-1).item()
-                != treatment_logits.argmax(dim=-1).item()
+                baseline_scores.argmax(dim=-1).item()
+                != treatment_scores.argmax(dim=-1).item()
             ),
-            baseline_first_token_id=int(baseline_logits.argmax(dim=-1).item()),
+            baseline_first_token_id=int(baseline_scores.argmax(dim=-1).item()),
         )

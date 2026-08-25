@@ -374,16 +374,12 @@ def main() -> None:
         "configuration": {
             "max_new_tokens": args.max_new_tokens,
             "vanilla_generation": {
+                **runtime.native_generation_config_dict,
                 "implementation": "transformers_generate",
-                "decoding": "greedy",
-                "use_cache": True,
-                "batch_size": 1,
             },
             "gate_generation": {
+                **runtime.cache_generation_config_dict,
                 "implementation": "explicit_live_kv_cache",
-                "decoding": "greedy",
-                "use_cache": True,
-                "batch_size": 1,
             },
             "offset": args.offset,
             "limit": args.limit,
@@ -441,7 +437,7 @@ def main() -> None:
         "assignment_build_report.json"
     )
     report = {
-        "schema_version": "experience-memory-e1-assignment-build-report-v5",
+        "schema_version": "experience-memory-e1-assignment-build-report-v6",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed",
         "answer_or_reward_used": False,

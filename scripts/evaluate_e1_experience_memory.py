@@ -325,6 +325,21 @@ def main() -> None:
         device=args.device,
         max_new_tokens=int(manifest["configuration"]["max_new_tokens"]),
     )
+    expected_vanilla_generation = {
+        **runtime.native_generation_config_dict,
+        "implementation": "transformers_generate",
+    }
+    expected_gate_generation = {
+        **runtime.cache_generation_config_dict,
+        "implementation": "explicit_live_kv_cache",
+    }
+    if (
+        manifest["configuration"].get("vanilla_generation")
+        != expected_vanilla_generation
+        or manifest["configuration"].get("gate_generation")
+        != expected_gate_generation
+    ):
+        raise ValueError("E1 decoding policy differs from the frozen assignment")
     dataset = load_dataset(
         "openai/gsm8k",
         "main",
@@ -516,7 +531,7 @@ def main() -> None:
             ),
         }
     run_report = {
-        "schema_version": "experience-memory-e1-run-report-v5",
+        "schema_version": "experience-memory-e1-run-report-v6",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "completed",
         "sample_count": len(records),

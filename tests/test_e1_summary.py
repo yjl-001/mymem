@@ -38,14 +38,26 @@ class E1SummaryTests(unittest.TestCase):
             vanilla_generation = {
                 "implementation": "transformers_generate",
                 "decoding": "greedy",
-                "use_cache": True,
+                "do_sample": False,
+                "repetition_penalty": 1.0,
+                "pad_token_id": 0,
+                "eos_token_id": 0,
+                "max_new_tokens": 1024,
+                "use_cache": False,
                 "batch_size": 1,
+                "model_input": "inputs_embeds",
             }
             gate_generation = {
                 "implementation": "explicit_live_kv_cache",
                 "decoding": "greedy",
+                "do_sample": False,
+                "repetition_penalty": 1.0,
+                "pad_token_id": 0,
+                "eos_token_id": 0,
+                "max_new_tokens": 1024,
                 "use_cache": True,
                 "batch_size": 1,
+                "model_input": "input_ids_then_single_token_cache",
             }
             manifest = {
                 "schema_version": E1_MANIFEST_SCHEMA,
@@ -158,7 +170,7 @@ class E1SummaryTests(unittest.TestCase):
                     handle.write(json.dumps(record) + "\n")
 
             run_report = {
-                "schema_version": "experience-memory-e1-run-report-v5",
+                "schema_version": "experience-memory-e1-run-report-v6",
                 "status": "completed",
                 "logical_split": "dev-test",
                 "dataset_split": "train",

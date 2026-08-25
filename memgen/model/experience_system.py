@@ -15,7 +15,12 @@ from memgen.experience.system import (
     SemanticMemoryRetriever,
     SemanticRetrievalDecision,
 )
-from memgen.model.e1_runtime import EntropyRiskGate, clone_cache, logits_kl
+from memgen.model.e1_runtime import (
+    EntropyRiskGate,
+    GreedyDecodingPolicy,
+    clone_cache,
+    logits_kl,
+)
 from memgen.model.side_kv import (
     SideKVAttentionController,
     SideKVAttentionTrace,
@@ -150,6 +155,7 @@ class OnlineExperienceMemorySystem:
         self.loader = loader
         self.controller = controller
         self.profile = profile
+        self.decoding = GreedyDecodingPolicy(tokenizer=tokenizer, device=device)
 
     def _tensor(self, token_ids: Sequence[int]) -> torch.Tensor:
         return torch.tensor([list(token_ids)], dtype=torch.long, device=self.device)
@@ -184,7 +190,6 @@ class OnlineExperienceMemorySystem:
             raise ValueError("Online experience system requires a non-empty prompt")
         prompt_length = len(ids)
         past = None
-        eos = self.tokenizer.eos_token_id
         gate_candidates: list[GateCandidateTrace] = []
         selected_gate: GateObservation | None = None
         retrieval_decision: SemanticRetrievalDecision | None = None
@@ -243,7 +248,9 @@ class OnlineExperienceMemorySystem:
                         memory = self._load_selected_memory(
                             retrieval_decision.matched_memory
                         )
-                        baseline_logits = probe.output.logits[:, -1, :]
+                        baseline_scores = self.decoding.processed_scores(
+                            token_ids=ids, logits=probe.output.logits
+                        )
                         self.controller.clear_traces()
                         with self.controller.use_memory(memory):
                             treatment = self.model(
@@ -257,7 +264,7 @@ class OnlineExperienceMemorySystem:
                                 ids=ids,
                                 prompt_length=prompt_length,
                                 initial_output=treatment,
-                                baseline_logits=baseline_logits,
+                                baseline_scores=baseline_scores,
                                 gate_candidates=gate_candidates,
                                 gate_observation=selected_gate,
                                 retrieval_decision=retrieval_decision,
@@ -276,10 +283,12 @@ class OnlineExperienceMemorySystem:
                 if past is not None:
                     kwargs["past_key_values"] = past
                 output = self.model(**kwargs)
-            next_token = int(output.logits[:, -1, :].argmax(dim=-1).item())
+            next_token = self.decoding.next_token(
+                token_ids=ids, logits=output.logits
+            )
             ids.append(next_token)
             past = output.past_key_values
-            if eos is not None and next_token == eos:
+            if self.decoding.is_eos(next_token):
                 break
 
         return ExperienceMemoryGenerationResult(
@@ -300,7 +309,7 @@ class OnlineExperienceMemorySystem:
         ids: list[int],
         prompt_length: int,
         initial_output: Any,
-        baseline_logits: torch.Tensor,
+        baseline_scores: torch.Tensor,
         gate_candidates: Sequence[GateCandidateTrace],
         gate_observation: GateObservation,
         retrieval_decision: SemanticRetrievalDecision,
@@ -308,13 +317,14 @@ class OnlineExperienceMemorySystem:
     ) -> ExperienceMemoryGenerationResult:
         """Finish decoding while ``controller.use_memory`` remains active."""
 
-        treatment_logits = initial_output.logits[:, -1, :]
-        next_token = int(treatment_logits.argmax(dim=-1).item())
+        treatment_scores = self.decoding.processed_scores(
+            token_ids=ids, logits=initial_output.logits
+        )
+        next_token = int(treatment_scores.argmax(dim=-1).item())
         ids.append(next_token)
         past = initial_output.past_key_values
-        eos = self.tokenizer.eos_token_id
         while len(ids) - prompt_length < self.max_new_tokens:
-            if eos is not None and ids[-1] == eos:
+            if self.decoding.is_eos(ids[-1]):
                 break
             output = self.model(
                 input_ids=self._tensor([ids[-1]]),
@@ -325,7 +335,9 @@ class OnlineExperienceMemorySystem:
                 use_cache=True,
                 return_dict=True,
             )
-            next_token = int(output.logits[:, -1, :].argmax(dim=-1).item())
+            next_token = self.decoding.next_token(
+                token_ids=ids, logits=output.logits
+            )
             ids.append(next_token)
             past = output.past_key_values
 
@@ -367,13 +379,13 @@ class OnlineExperienceMemorySystem:
             matched_memory=retrieval_decision.matched_memory,
             attention_traces=traces,
             activation_first_step_logits_kl=logits_kl(
-                baseline_logits, treatment_logits
+                baseline_scores, treatment_scores
             ),
             activation_first_step_top1_changed=bool(
-                baseline_logits.argmax(dim=-1).item()
-                != treatment_logits.argmax(dim=-1).item()
+                baseline_scores.argmax(dim=-1).item()
+                != treatment_scores.argmax(dim=-1).item()
             ),
             activation_baseline_first_token_id=int(
-                baseline_logits.argmax(dim=-1).item()
+                baseline_scores.argmax(dim=-1).item()
             ),
         )

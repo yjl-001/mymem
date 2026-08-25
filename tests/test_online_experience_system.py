@@ -38,6 +38,7 @@ class OnlineExperienceMemorySystemTests(unittest.TestCase):
         )
 
         class FakeTokenizer:
+            pad_token_id = 0
             eos_token_id = 0
 
             @staticmethod

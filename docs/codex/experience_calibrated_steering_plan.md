@@ -87,8 +87,9 @@ question + generated partial CoT
 
 GSM8K 输入统一使用 `GSM8KPromptContract(gsm8k-memgen-builder-v1)`，严格复现
 原始 dataset builder 的 `\boxed{}.Question:` 拼接；不允许 E1 单独维护 prompt。
-生成预算固定为 1024。`vanilla` 使用 HuggingFace 原生 greedy generation，
-gate/side-KV 使用显式 live KV-cache，并记录首个 token 分叉位置。
+生成预算固定为 1024。`vanilla` 精确复现仓库原始 baseline：以 `inputs_embeds`
+调用 HuggingFace greedy generation，`use_cache=False`、`repetition_penalty=1.0`；
+gate/side-KV 使用 raw-argmax 显式 live KV-cache，并记录首个 token 分叉位置。
 
 只保留三个条件：
 

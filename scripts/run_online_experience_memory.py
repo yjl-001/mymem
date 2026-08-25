@@ -238,7 +238,7 @@ def main() -> None:
         list(result.completion_token_ids), skip_special_tokens=True
     ).strip()
     output = {
-        "schema_version": "experience-memory-online-generation-v1",
+        "schema_version": "experience-memory-online-generation-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "completed",
         "answer_or_reward_used": False,
@@ -248,6 +248,12 @@ def main() -> None:
         ),
         "prompt_token_count": len(prompt_ids),
         "prompt_token_ids_sha256": canonical_json_sha256(prompt_ids),
+        "generation_contract": system.decoding.config.to_dict() | {
+            "max_new_tokens": args.max_new_tokens,
+            "use_cache": True,
+            "batch_size": 1,
+            "implementation": "explicit_live_kv_cache",
+        },
         "completion": completion,
         "completion_token_ids_sha256": canonical_json_sha256(
             list(result.completion_token_ids)
