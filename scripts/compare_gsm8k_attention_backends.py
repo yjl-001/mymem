@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare authenticated eager and FlashAttention2 GSM8K base runs."""
+"""Compare two authenticated GSM8K attention-backend base runs."""
 
 from __future__ import annotations
 
@@ -23,14 +23,24 @@ CONDITIONS = (
     "native_transformers_generate",
     "explicit_live_kv_cache",
 )
+SUPPORTED_BACKENDS = ("eager", "sdpa", "flash_attention_2")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--eager-dir", type=Path, required=True)
-    parser.add_argument("--flash-dir", type=Path, required=True)
+    parser.add_argument(
+        "--reference-name", choices=SUPPORTED_BACKENDS, required=True
+    )
+    parser.add_argument("--reference-dir", type=Path, required=True)
+    parser.add_argument(
+        "--candidate-name", choices=SUPPORTED_BACKENDS, required=True
+    )
+    parser.add_argument("--candidate-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.reference_name == args.candidate_name:
+        parser.error("reference and candidate backends must differ")
+    return args
 
 
 @dataclass(frozen=True)
@@ -87,31 +97,34 @@ def shared_prefix(reference: list[int], candidate: list[int]) -> int:
 
 
 def compare_condition(
-    *, eager: BackendArtifacts, flash: BackendArtifacts, condition: str
+    *,
+    reference: BackendArtifacts,
+    candidate: BackendArtifacts,
+    condition: str,
 ) -> dict[str, Any]:
-    eager_rows = eager.records_by_id
-    flash_rows = flash.records_by_id
-    sample_ids = sorted(eager_rows)
+    reference_rows = reference.records_by_id
+    candidate_rows = candidate.records_by_id
+    sample_ids = sorted(reference_rows)
     mismatches: list[str] = []
     first_token_mismatches: list[str] = []
     shared_lengths: list[int] = []
-    flash_only_correct = 0
-    eager_only_correct = 0
+    candidate_only_correct = 0
+    reference_only_correct = 0
     for sample_id in sample_ids:
-        eager_row = eager_rows[sample_id]["conditions"][condition]
-        flash_row = flash_rows[sample_id]["conditions"][condition]
-        eager_ids = eager_row["completion_token_ids"]
-        flash_ids = flash_row["completion_token_ids"]
-        shared = shared_prefix(eager_ids, flash_ids)
+        reference_row = reference_rows[sample_id]["conditions"][condition]
+        candidate_row = candidate_rows[sample_id]["conditions"][condition]
+        reference_ids = reference_row["completion_token_ids"]
+        candidate_ids = candidate_row["completion_token_ids"]
+        shared = shared_prefix(reference_ids, candidate_ids)
         shared_lengths.append(shared)
-        if shared != len(eager_ids) or shared != len(flash_ids):
+        if shared != len(reference_ids) or shared != len(candidate_ids):
             mismatches.append(sample_id)
             if shared == 0:
                 first_token_mismatches.append(sample_id)
-        eager_correct = bool(eager_row["final_reward"])
-        flash_correct = bool(flash_row["final_reward"])
-        flash_only_correct += flash_correct and not eager_correct
-        eager_only_correct += eager_correct and not flash_correct
+        reference_correct = bool(reference_row["final_reward"])
+        candidate_correct = bool(candidate_row["final_reward"])
+        candidate_only_correct += candidate_correct and not reference_correct
+        reference_only_correct += reference_correct and not candidate_correct
     return {
         "sample_count": len(sample_ids),
         "exact_token_match_count": len(sample_ids) - len(mismatches),
@@ -120,16 +133,19 @@ def compare_condition(
         "first_token_mismatch_count": len(first_token_mismatches),
         "first_token_mismatch_sample_ids": first_token_mismatches,
         "mean_shared_prefix_length": sum(shared_lengths) / len(shared_lengths),
-        "flash_correct_eager_wrong": flash_only_correct,
-        "eager_correct_flash_wrong": eager_only_correct,
+        "candidate_correct_reference_wrong": candidate_only_correct,
+        "reference_correct_candidate_wrong": reference_only_correct,
     }
 
 
 def metric_deltas(
-    *, eager: BackendArtifacts, flash: BackendArtifacts, condition: str
+    *,
+    reference: BackendArtifacts,
+    candidate: BackendArtifacts,
+    condition: str,
 ) -> dict[str, float]:
-    eager_values = eager.summary["conditions"][condition]
-    flash_values = flash.summary["conditions"][condition]
+    reference_values = reference.summary["conditions"][condition]
+    candidate_values = candidate.summary["conditions"][condition]
     fields = (
         "accuracy",
         "diagnostic_answer_accuracy",
@@ -137,19 +153,19 @@ def metric_deltas(
         "mean_generation_length",
     )
     return {
-        f"flash_minus_eager_{field}": (
-            float(flash_values[field]) - float(eager_values[field])
+        f"candidate_minus_reference_{field}": (
+            float(candidate_values[field]) - float(reference_values[field])
         )
         for field in fields
     }
 
 
 def validate_shared_contract(
-    eager: BackendArtifacts, flash: BackendArtifacts
+    reference: BackendArtifacts, candidate: BackendArtifacts
 ) -> None:
-    eager_ids = set(eager.records_by_id)
-    flash_ids = set(flash.records_by_id)
-    if eager_ids != flash_ids:
+    reference_ids = set(reference.records_by_id)
+    candidate_ids = set(candidate.records_by_id)
+    if reference_ids != candidate_ids:
         raise ValueError("Attention backend runs cover different samples")
     comparable_summary_fields = (
         "logical_split",
@@ -159,30 +175,34 @@ def validate_shared_contract(
         "inputs",
     )
     if any(
-        eager.summary.get(field) != flash.summary.get(field)
+        reference.summary.get(field) != candidate.summary.get(field)
         for field in comparable_summary_fields
     ):
         raise ValueError("Attention backend runs do not share one input contract")
-    eager_reasoner = dict(eager.summary.get("reasoner", {}))
-    flash_reasoner = dict(flash.summary.get("reasoner", {}))
-    eager_reasoner.pop("attention_implementation", None)
-    flash_reasoner.pop("attention_implementation", None)
-    if eager_reasoner != flash_reasoner:
+    reference_reasoner = dict(reference.summary.get("reasoner", {}))
+    candidate_reasoner = dict(candidate.summary.get("reasoner", {}))
+    reference_reasoner.pop("attention_implementation", None)
+    candidate_reasoner.pop("attention_implementation", None)
+    if reference_reasoner != candidate_reasoner:
         raise ValueError("Attention backend runs use different reasoners")
-    eager_generation = dict(eager.summary.get("generation_contract", {}))
-    flash_generation = dict(flash.summary.get("generation_contract", {}))
-    eager_generation.pop("attention_implementation", None)
-    flash_generation.pop("attention_implementation", None)
-    if eager_generation != flash_generation:
+    reference_generation = dict(
+        reference.summary.get("generation_contract", {})
+    )
+    candidate_generation = dict(
+        candidate.summary.get("generation_contract", {})
+    )
+    reference_generation.pop("attention_implementation", None)
+    candidate_generation.pop("attention_implementation", None)
+    if reference_generation != candidate_generation:
         raise ValueError("Attention backend runs use different decoding contracts")
     if any(
-        eager_generation.get(condition, {}).get("batch_size") != 1
+        reference_generation.get(condition, {}).get("batch_size") != 1
         for condition in CONDITIONS
     ):
         raise ValueError("Attention backend diagnostic requires batch_size=1")
-    for sample_id in eager_ids:
-        eager_row = eager.records_by_id[sample_id]
-        flash_row = flash.records_by_id[sample_id]
+    for sample_id in reference_ids:
+        reference_row = reference.records_by_id[sample_id]
+        candidate_row = candidate.records_by_id[sample_id]
         identity_fields = (
             "logical_split",
             "dataset_split",
@@ -191,67 +211,86 @@ def validate_shared_contract(
             "prompt_token_count",
             "prompt_token_ids_sha256",
         )
-        if any(eager_row.get(field) != flash_row.get(field) for field in identity_fields):
+        if any(
+            reference_row.get(field) != candidate_row.get(field)
+            for field in identity_fields
+        ):
             raise ValueError(f"Input identity differs for {sample_id}")
 
 
 def main() -> None:
     args = parse_args()
-    eager = BackendArtifacts.load(name="eager", directory=args.eager_dir)
-    flash = BackendArtifacts.load(
-        name="flash_attention_2", directory=args.flash_dir
+    reference = BackendArtifacts.load(
+        name=args.reference_name, directory=args.reference_dir
     )
-    validate_shared_contract(eager, flash)
+    candidate = BackendArtifacts.load(
+        name=args.candidate_name, directory=args.candidate_dir
+    )
+    validate_shared_contract(reference, candidate)
     comparisons = {
         condition: compare_condition(
-            eager=eager, flash=flash, condition=condition
+            reference=reference,
+            candidate=candidate,
+            condition=condition,
         )
         for condition in CONDITIONS
     }
     output: dict[str, Any] = {
-        "schema_version": "gsm8k-attention-backend-comparison-v1",
+        "schema_version": "gsm8k-attention-backend-comparison-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed",
         "formal_memory_claim": False,
         "diagnostic_variable": "attention_implementation",
+        "reference_backend": reference.name,
+        "candidate_backend": candidate.name,
         "fixed_contract": {
             "batch_size": 1,
-            "logical_split": eager.summary["logical_split"],
-            "dataset_split": eager.summary["dataset_split"],
-            "sample_count": eager.summary["sample_count"],
-            "prompt_contract": eager.summary["prompt_contract"],
+            "logical_split": reference.summary["logical_split"],
+            "dataset_split": reference.summary["dataset_split"],
+            "sample_count": reference.summary["sample_count"],
+            "prompt_contract": reference.summary["prompt_contract"],
             "reasoner": {
                 key: value
-                for key, value in eager.summary["reasoner"].items()
+                for key, value in reference.summary["reasoner"].items()
                 if key != "attention_implementation"
             },
         },
         "backends": {
-            "eager": {
-                "within_backend_token_parity": eager.summary["exact_token_parity"],
-                "conditions": eager.summary["conditions"],
+            reference.name: {
+                "within_backend_token_parity": reference.summary[
+                    "exact_token_parity"
+                ],
+                "conditions": reference.summary["conditions"],
             },
-            "flash_attention_2": {
-                "within_backend_token_parity": flash.summary["exact_token_parity"],
-                "conditions": flash.summary["conditions"],
+            candidate.name: {
+                "within_backend_token_parity": candidate.summary[
+                    "exact_token_parity"
+                ],
+                "conditions": candidate.summary["conditions"],
             },
         },
-        "flash_minus_eager": {
+        "candidate_minus_reference": {
             condition: metric_deltas(
-                eager=eager, flash=flash, condition=condition
+                reference=reference,
+                candidate=candidate,
+                condition=condition,
             )
             for condition in CONDITIONS
         },
         "cross_backend_token_comparison": comparisons,
         "inputs": {
-            "eager_summary_sha256": file_sha256(
-                args.eager_dir / "base_parity_summary.json"
+            "reference_summary_sha256": file_sha256(
+                args.reference_dir / "base_parity_summary.json"
             ),
-            "eager_results_sha256": file_sha256(args.eager_dir / "results.jsonl"),
-            "flash_summary_sha256": file_sha256(
-                args.flash_dir / "base_parity_summary.json"
+            "reference_results_sha256": file_sha256(
+                args.reference_dir / "results.jsonl"
             ),
-            "flash_results_sha256": file_sha256(args.flash_dir / "results.jsonl"),
+            "candidate_summary_sha256": file_sha256(
+                args.candidate_dir / "base_parity_summary.json"
+            ),
+            "candidate_results_sha256": file_sha256(
+                args.candidate_dir / "results.jsonl"
+            ),
         },
     }
     output["comparison_sha256"] = canonical_json_sha256(output)

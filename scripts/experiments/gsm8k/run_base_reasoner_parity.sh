@@ -48,7 +48,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 if [[ "${#POSITIONAL[@]}" -ne 2 ]]; then
-  echo "Usage: $0 [--limit N (0=all)] [--offset N] [--logical-split calibration-val|dev-test|final-test] [--attention-implementation eager|flash_attention_2] PHASE1_DIR E0_DIR" >&2
+  echo "Usage: $0 [--limit N (0=all)] [--offset N] [--logical-split calibration-val|dev-test|final-test] [--attention-implementation eager|sdpa|flash_attention_2] PHASE1_DIR E0_DIR" >&2
   exit 2
 fi
 if [[ "$LOGICAL_SPLIT" != "calibration-val" && "$LOGICAL_SPLIT" != "dev-test" && "$LOGICAL_SPLIT" != "final-test" ]]; then
@@ -59,7 +59,7 @@ if ! [[ "$LIMIT" =~ ^[0-9]+$ ]] || ! [[ "$OFFSET" =~ ^[0-9]+$ ]]; then
   echo "--limit and --offset must be non-negative integers" >&2
   exit 2
 fi
-if [[ "$ATTENTION_IMPLEMENTATION" != "eager" && "$ATTENTION_IMPLEMENTATION" != "flash_attention_2" ]]; then
+if [[ "$ATTENTION_IMPLEMENTATION" != "eager" && "$ATTENTION_IMPLEMENTATION" != "sdpa" && "$ATTENTION_IMPLEMENTATION" != "flash_attention_2" ]]; then
   echo "Unsupported attention implementation: $ATTENTION_IMPLEMENTATION" >&2
   exit 2
 fi

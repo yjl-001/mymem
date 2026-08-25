@@ -56,19 +56,33 @@ bash scripts/experiments/gsm8k/run_base_reasoner_parity.sh \
 HuggingFace greedy 与显式 KV-cache greedy 的严格准确率、诊断准确率和逐 token parity。正式 E1 前要求
 `exact_token_parity=true`；正式 GSM8K 生成预算固定为 1024。
 
-若需隔离 attention backend，使用同一命令一次运行 eager 与 FlashAttention2：
+若需隔离 attention backend，使用同一命令运行任意两个受支持的 backend：
 
 ```bash
 MEMGEN_RUN_TAG=base-attention-final32-v1 \
 bash scripts/experiments/gsm8k/run_base_attention_backend_comparison.sh \
   --logical-split final-test \
   --limit 32 \
+  --reference-backend eager \
+  --candidate-backend flash_attention_2 \
   "$PHASE1_DIR" "$E0_DIR"
 ```
 
 该诊断固定 `batch_size=1`、题目、prompt token、模型 revision、dtype 和 decoding，只改变
 `attention_implementation`。`comparison_summary.json` 报告两个 backend 各自的 native/cache parity、
 准确率差以及跨 backend 的逐 token 分叉；不运行 gate、检索或 memory 注入。
+
+已确认 eager 会显著破坏当前 reasoner 后，使用同一诊断检查 SDPA：
+
+```bash
+MEMGEN_RUN_TAG=base-sdpa-final32-v1 \
+bash scripts/experiments/gsm8k/run_base_attention_backend_comparison.sh \
+  --logical-split final-test \
+  --limit 32 \
+  --reference-backend flash_attention_2 \
+  --candidate-backend sdpa \
+  "$PHASE1_DIR" "$E0_DIR"
+```
 
 5. 运行 gate、BM25 和 persistent side-KV 完整评测：
 

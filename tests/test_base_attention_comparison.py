@@ -121,9 +121,13 @@ class BaseAttentionComparisonTests(unittest.TestCase):
                 [
                     "python",
                     str(SCRIPT),
-                    "--eager-dir",
+                    "--reference-name",
+                    "eager",
+                    "--reference-dir",
                     str(eager),
-                    "--flash-dir",
+                    "--candidate-name",
+                    "flash_attention_2",
+                    "--candidate-dir",
                     str(flash),
                     "--output",
                     str(output),
@@ -139,14 +143,18 @@ class BaseAttentionComparisonTests(unittest.TestCase):
                 "native_transformers_generate"
             ]
             self.assertEqual(native["token_mismatch_count"], 1)
-            self.assertEqual(native["flash_correct_eager_wrong"], 1)
+            self.assertEqual(native["candidate_correct_reference_wrong"], 1)
             self.assertEqual(
-                report["flash_minus_eager"]["native_transformers_generate"][
-                    "flash_minus_eager_accuracy"
+                report["candidate_minus_reference"][
+                    "native_transformers_generate"
+                ][
+                    "candidate_minus_reference_accuracy"
                 ],
                 0.5,
             )
             self.assertEqual(report["fixed_contract"]["batch_size"], 1)
+            self.assertEqual(report["reference_backend"], "eager")
+            self.assertEqual(report["candidate_backend"], "flash_attention_2")
 
 
 if __name__ == "__main__":

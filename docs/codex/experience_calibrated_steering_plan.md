@@ -33,6 +33,17 @@
 
 这些结果只证明机制正确且能够影响 logits，不证明 memory 内容改善任务表现。
 
+### Attention backend 基线
+
+- 在同一 32 道 official GSM8K test 题、`batch_size=1` 和相同生成契约下，eager 严格准确率为
+  `0.09375`，FlashAttention2 为 `0.65625`。
+- 两个 backend 各自的 native generation 与 explicit live-cache generation 都逐 token 完全一致；
+  因此低 baseline 不是 KV cache 或手工 decode 导致的。
+- 32/32 completion 在 backend 之间最终分叉，但首 token 全部一致，平均共享前缀为 23.125 token。
+- 正式 E1 不再允许使用 eager，也不允许 vanilla 与 matched 使用不同 backend。
+
+现有 eager E0 仍可作为机制正确性证据，但迁移到合格 backend 后必须重新编译 risk artifact 和 side-KV bank。
+
 ### 经验内容、检索与通道诊断
 
 - 固定经验文本目录明显提高严格格式准确率，但没有稳定提高数学答案正确率。
@@ -124,19 +135,31 @@ bash scripts/experiments/gsm8k/run_base_reasoner_parity.sh \
 只有 `base_parity_summary.json.status=passed` 且 native baseline 回到已知合理区间，
 才继续解释 E1。该预检不加载 gate、BM25 或 side-KV，不产生 memory 效果结论。
 
-当前低 baseline 的首要诊断固定 `batch_size=1`，只比较 eager 与 FlashAttention2：
+已完成的 eager/FlashAttention2 诊断固定 `batch_size=1`：
 
 ```bash
 MEMGEN_RUN_TAG=base-attention-final32-v1 \
 bash scripts/experiments/gsm8k/run_base_attention_backend_comparison.sh \
   --logical-split final-test \
   --limit 32 \
+  --reference-backend eager \
+  --candidate-backend flash_attention_2 \
   "$PHASE1_DIR" "$E0_DIR"
 ```
 
-输出 `comparison_summary.json`。若 FlashAttention2 的 native accuracy 回到合理区间而 eager 没有，
-则 attention backend 是主要差异来源，正式 matched 路径需要先解决 side-KV 与高质量 backend 的兼容性；
-若两者准确率接近，则继续对照已知 50%+ 运行的 prompt token、模型 artifact 和评分记录。
+结果已确认 attention backend 是主要差异来源。下一步以 FlashAttention2 为参考检查 SDPA：
+
+```bash
+MEMGEN_RUN_TAG=base-sdpa-final32-v1 \
+bash scripts/experiments/gsm8k/run_base_attention_backend_comparison.sh \
+  --logical-split final-test \
+  --limit 32 \
+  --reference-backend flash_attention_2 \
+  --candidate-backend sdpa \
+  "$PHASE1_DIR" "$E0_DIR"
+```
+
+只有 SDPA 的 baseline 质量和 native/cache parity 合格，才考虑将 gate 与 side-KV 迁移到 SDPA。
 
 服务器环境文件只保留输出目录和可选 GPU：
 

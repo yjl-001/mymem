@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attention-implementation",
-        choices=("eager", "flash_attention_2"),
+        choices=("eager", "sdpa", "flash_attention_2"),
         default="eager",
         help="The only model-execution variable in the backend diagnostic.",
     )
