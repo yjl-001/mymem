@@ -77,8 +77,7 @@ class E1AssignmentTests(unittest.TestCase):
             E1_CONDITIONS,
             (
                 "vanilla",
-                "gate_observation_only",
-                "matched_persistent_memory",
+                "matched",
             ),
         )
 

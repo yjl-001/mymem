@@ -377,7 +377,7 @@ def main() -> None:
                 **runtime.native_generation_config_dict,
                 "implementation": "transformers_generate",
             },
-            "gate_generation": {
+            "observation_generation": {
                 **runtime.cache_generation_config_dict,
                 "implementation": "explicit_live_kv_cache",
             },
@@ -437,7 +437,7 @@ def main() -> None:
         "assignment_build_report.json"
     )
     report = {
-        "schema_version": "experience-memory-e1-assignment-build-report-v6",
+        "schema_version": "experience-memory-e1-assignment-build-report-v7",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "passed",
         "answer_or_reward_used": False,

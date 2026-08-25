@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute the three frozen E1 conditions and score GSM8K after generation."""
+"""Execute the frozen vanilla/matched E1 comparison and score GSM8K."""
 
 from __future__ import annotations
 
@@ -164,8 +164,8 @@ def compact_persistent_trace(
             profile.memory_score_bias
         },
         "baseline_first_token_id": actual_baseline_first_token_id,
-        "expected_gate_only_first_token_id": expected_baseline_first_token_id,
-        "baseline_first_token_matches_gate_observation": (
+        "expected_observation_first_token_id": expected_baseline_first_token_id,
+        "baseline_first_token_matches_observation": (
             actual_baseline_first_token_id == expected_baseline_first_token_id
         ),
     }
@@ -329,15 +329,15 @@ def main() -> None:
         **runtime.native_generation_config_dict,
         "implementation": "transformers_generate",
     }
-    expected_gate_generation = {
+    expected_observation_generation = {
         **runtime.cache_generation_config_dict,
         "implementation": "explicit_live_kv_cache",
     }
     if (
         manifest["configuration"].get("vanilla_generation")
         != expected_vanilla_generation
-        or manifest["configuration"].get("gate_generation")
-        != expected_gate_generation
+        or manifest["configuration"].get("observation_generation")
+        != expected_observation_generation
     ):
         raise ValueError("E1 decoding policy differs from the frozen assignment")
     dataset = load_dataset(
@@ -379,9 +379,9 @@ def main() -> None:
                 started = time.perf_counter()
                 vanilla_ids = runtime.generate_vanilla(prompt_ids)
                 vanilla_seconds = time.perf_counter() - started
-                gate_ids = assignment.observation_completion_token_ids
-                vanilla_gate_parity = compare_token_sequences(
-                    vanilla_ids, gate_ids
+                observation_ids = assignment.observation_completion_token_ids
+                vanilla_observation_parity = compare_token_sequences(
+                    vanilla_ids, observation_ids
                 )
                 conditions: dict[str, dict[str, Any]] = {
                     "vanilla": condition_result(
@@ -389,12 +389,6 @@ def main() -> None:
                         completion_token_ids=vanilla_ids,
                         ground_truth=ground_truth,
                         runtime_seconds=vanilla_seconds,
-                    ),
-                    "gate_observation_only": condition_result(
-                        tokenizer=tokenizer,
-                        completion_token_ids=gate_ids,
-                        ground_truth=ground_truth,
-                        runtime_seconds=None,
                     ),
                 }
 
@@ -446,7 +440,7 @@ def main() -> None:
                         ),
                         profile=profile,
                     )
-                    conditions["matched_persistent_memory"] = condition_result(
+                    conditions["matched"] = condition_result(
                         tokenizer=tokenizer,
                         completion_token_ids=matched_runtime.completion_token_ids,
                         ground_truth=ground_truth,
@@ -458,14 +452,14 @@ def main() -> None:
                         first_step_top1_changed=matched_runtime.first_step_top1_changed,
                     )
                 else:
-                    conditions["matched_persistent_memory"] = condition_result(
+                    conditions["matched"] = condition_result(
                         tokenizer=tokenizer,
-                        completion_token_ids=gate_ids,
+                        completion_token_ids=vanilla_ids,
                         ground_truth=ground_truth,
                         runtime_seconds=None,
                     )
                 if set(conditions) != set(E1_CONDITIONS):
-                    raise RuntimeError("E1 runner did not produce all three conditions")
+                    raise RuntimeError("E1 runner did not produce both conditions")
                 record = {
                     "schema_version": E1_RESULTS_SCHEMA,
                     "sample_id": assignment.sample_id,
@@ -490,10 +484,12 @@ def main() -> None:
                         if assignment.matched_memory is not None
                         else None
                     ),
-                    "vanilla_matches_gate_observation_only": (
-                        vanilla_gate_parity.exact_match
+                    "vanilla_matches_internal_observation": (
+                        vanilla_observation_parity.exact_match
                     ),
-                    "vanilla_gate_parity": vanilla_gate_parity.to_dict(),
+                    "vanilla_observation_parity": (
+                        vanilla_observation_parity.to_dict()
+                    ),
                     "conditions": conditions,
                 }
                 output_handle.write(
@@ -531,7 +527,7 @@ def main() -> None:
             ),
         }
     run_report = {
-        "schema_version": "experience-memory-e1-run-report-v6",
+        "schema_version": "experience-memory-e1-run-report-v7",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "completed",
         "sample_count": len(records),
@@ -544,21 +540,22 @@ def main() -> None:
         "generation_contract": {
             "max_new_tokens": runtime.max_new_tokens,
             "vanilla": manifest["configuration"]["vanilla_generation"],
-            "gate_observation_only": manifest["configuration"][
-                "gate_generation"
-            ],
+            "matched": {
+                **manifest["configuration"]["observation_generation"],
+                "memory_injection_policy": profile.injection_policy,
+            },
         },
-        "vanilla_gate_token_parity": all(
-            item["vanilla_matches_gate_observation_only"] for item in records
+        "vanilla_observation_token_parity": all(
+            item["vanilla_matches_internal_observation"] for item in records
         ),
-        "vanilla_gate_parity_mismatch_count": sum(
-            not item["vanilla_matches_gate_observation_only"]
+        "vanilla_observation_parity_mismatch_count": sum(
+            not item["vanilla_matches_internal_observation"]
             for item in records
         ),
-        "vanilla_gate_parity_mismatch_sample_ids": [
+        "vanilla_observation_parity_mismatch_sample_ids": [
             item["sample_id"]
             for item in records
-            if not item["vanilla_matches_gate_observation_only"]
+            if not item["vanilla_matches_internal_observation"]
         ],
         "conditions": condition_summaries,
         "system_profile": profile.to_dict(),
@@ -577,7 +574,7 @@ def main() -> None:
     write_json(args.output_dir / "run_report.json", run_report)
     print(
         f"[e1-eval] completed samples={len(records)} "
-        f"parity={run_report['vanilla_gate_token_parity']} "
+        f"parity={run_report['vanilla_observation_token_parity']} "
         f"output={results_path}",
         flush=True,
     )

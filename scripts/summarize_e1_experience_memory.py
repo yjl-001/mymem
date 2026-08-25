@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit and summarize the frozen vanilla/gate/matched E1 evaluation."""
+"""Audit and summarize the frozen vanilla/matched E1 evaluation."""
 
 from __future__ import annotations
 
@@ -121,7 +121,7 @@ def persistent_trace_valid(
         "memory_slot_count_constant_and_matched",
         "normalization_constant_and_matched",
         "memory_score_bias_constant_and_matched",
-        "baseline_first_token_matches_gate_observation",
+        "baseline_first_token_matches_observation",
     )
     return bool(
         trace.get("memory_ids") == [choice.memory_id]
@@ -189,7 +189,7 @@ def main() -> None:
 
     run_report = json.loads(args.run_report.read_text(encoding="utf-8"))
     if (
-        run_report.get("schema_version") != "experience-memory-e1-run-report-v6"
+        run_report.get("schema_version") != "experience-memory-e1-run-report-v7"
         or run_report.get("status") != "completed"
         or run_report.get("logical_split") != manifest.get("logical_split")
         or run_report.get("dataset_split") != manifest.get("dataset_split")
@@ -199,10 +199,13 @@ def main() -> None:
         != manifest.get("configuration", {}).get("max_new_tokens")
         or run_report.get("generation_contract", {}).get("vanilla")
         != manifest.get("configuration", {}).get("vanilla_generation")
-        or run_report.get("generation_contract", {}).get(
-            "gate_observation_only"
-        )
-        != manifest.get("configuration", {}).get("gate_generation")
+        or run_report.get("generation_contract", {}).get("matched")
+        != {
+            **manifest.get("configuration", {}).get(
+                "observation_generation", {}
+            ),
+            "memory_injection_policy": profile.injection_policy,
+        }
         or run_report.get("system_profile") != profile.to_dict()
         or run_report.get("results", {}).get("sha256") != file_sha256(args.results)
         or run_report.get("inputs", {}).get("assignment_manifest_sha256")
@@ -244,8 +247,8 @@ def main() -> None:
             })
             continue
 
-        matched = conditions["matched_persistent_memory"]
-        gate_only = conditions["gate_observation_only"]
+        matched = conditions["matched"]
+        vanilla = conditions["vanilla"]
         if assignment.assigned:
             choice = assignment.matched_memory
             assert choice is not None
@@ -270,12 +273,12 @@ def main() -> None:
             ):
                 violations.append({
                     "sample_id": sample_id,
-                    "reason": "matched_persistent_memory_mismatch",
+                    "reason": "matched_memory_mismatch",
                 })
         elif (
             matched.get("side_kv_applied")
             or matched.get("completion_token_ids_sha256")
-            != gate_only.get("completion_token_ids_sha256")
+            != vanilla.get("completion_token_ids_sha256")
         ):
             violations.append({
                 "sample_id": sample_id,
@@ -285,28 +288,28 @@ def main() -> None:
     ordered = [records_by_id[sample_id] for sample_id in sorted(records_by_id)]
     assigned = lambda record: bool(record.get("assigned"))
     primary = {
-        "matched_vs_gate_accuracy": paired(
+        "matched_vs_vanilla_accuracy": paired(
             ordered,
-            "matched_persistent_memory",
-            "gate_observation_only",
+            "matched",
+            "vanilla",
             "final_reward",
             predicate=assigned,
             seed=args.seed,
             resamples=args.bootstrap_resamples,
         ),
-        "matched_vs_gate_diagnostic_answer": paired(
+        "matched_vs_vanilla_diagnostic_answer": paired(
             ordered,
-            "matched_persistent_memory",
-            "gate_observation_only",
+            "matched",
+            "vanilla",
             "diagnostic_answer_correct",
             predicate=assigned,
             seed=args.seed + 1,
             resamples=args.bootstrap_resamples,
         ),
-        "matched_vs_gate_format": paired(
+        "matched_vs_vanilla_format": paired(
             ordered,
-            "matched_persistent_memory",
-            "gate_observation_only",
+            "matched",
+            "vanilla",
             "format_valid",
             predicate=assigned,
             seed=args.seed + 2,
@@ -316,8 +319,8 @@ def main() -> None:
     intention_to_treat = {
         metric: paired(
             ordered,
-            "matched_persistent_memory",
-            "gate_observation_only",
+            "matched",
+            "vanilla",
             field,
             predicate=None,
             seed=args.seed + offset,
@@ -329,16 +332,6 @@ def main() -> None:
             ("format", "format_valid", 5),
         )
     }
-    matched_vs_vanilla_format = paired(
-        ordered,
-        "matched_persistent_memory",
-        "vanilla",
-        "format_valid",
-        predicate=None,
-        seed=args.seed + 6,
-        resamples=args.bootstrap_resamples,
-    )
-
     condition_summaries: dict[str, dict[str, Any]] = {}
     for condition in E1_CONDITIONS:
         rows = [record["conditions"][condition] for record in ordered]
@@ -371,7 +364,7 @@ def main() -> None:
         }
 
     matched_outputs = [
-        record["conditions"]["matched_persistent_memory"]
+        record["conditions"]["matched"]
         for record in ordered
         if record.get("assigned")
     ]
@@ -392,7 +385,7 @@ def main() -> None:
         ]),
         "baseline_first_token_match_count": sum(
             row["memory_attention"][
-                "baseline_first_token_matches_gate_observation"
+                "baseline_first_token_matches_observation"
             ]
             for row in matched_outputs
         ),
@@ -403,32 +396,33 @@ def main() -> None:
         ]),
     }
 
-    primary_accuracy = primary["matched_vs_gate_accuracy"]
+    primary_accuracy = primary["matched_vs_vanilla_accuracy"]
     interval = primary_accuracy.get("bootstrap_95_ci")
     accuracy_positive = bool(
         primary_accuracy.get("paired_sample_count", 0) >= args.min_primary_pairs
         and isinstance(interval, list)
         and interval[0] > 0
     )
-    format_effect = matched_vs_vanilla_format.get(
+    format_effect = intention_to_treat["format"].get(
         "mean_treatment_minus_control"
     )
     acceptance = {
         "assignment_and_runtime_integrity": not violations,
-        "vanilla_matches_gate_observation_only": all(
-            record.get("vanilla_matches_gate_observation_only") for record in ordered
+        "vanilla_matches_internal_observation": all(
+            record.get("vanilla_matches_internal_observation")
+            for record in ordered
         ),
         "minimum_primary_pair_count": (
             primary_accuracy["paired_sample_count"] >= args.min_primary_pairs
         ),
-        "matched_accuracy_above_gate_only": accuracy_positive,
+        "matched_accuracy_above_vanilla": accuracy_positive,
         "matched_format_not_below_vanilla": (
             format_effect is not None and format_effect >= 0
         ),
     }
     runtime_integrity = (
         acceptance["assignment_and_runtime_integrity"]
-        and acceptance["vanilla_matches_gate_observation_only"]
+        and acceptance["vanilla_matches_internal_observation"]
     )
     output = {
         "schema_version": E1_SUMMARY_SCHEMA,
@@ -453,19 +447,20 @@ def main() -> None:
         "conditions": condition_summaries,
         "primary_assigned_subset": primary,
         "intention_to_treat": intention_to_treat,
-        "matched_vs_vanilla_format": matched_vs_vanilla_format,
         "mechanism_diagnostics": mechanism,
         "integrity_violations": violations,
         "acceptance": acceptance,
         "interpretation_limit": (
-            "Without a mismatched-memory control, matched-vs-gate estimates the "
-            "combined effect of retrieval, memory content, and side-KV activation."
+            "Matched-vs-vanilla estimates the end-to-end effect of gate, retrieval, "
+            "memory content, and persistent side-KV activation together; it does not "
+            "identify any component's isolated contribution."
         ),
         "criterion": {
             "bootstrap_resamples": args.bootstrap_resamples,
             "minimum_primary_pairs": args.min_primary_pairs,
             "accuracy": (
-                "matched-vs-gate paired 95% bootstrap CI lower bound above zero"
+                "assigned-subset matched-vs-vanilla paired 95% bootstrap CI "
+                "lower bound above zero"
             ),
             "format": "matched format accuracy must not be below vanilla",
         },

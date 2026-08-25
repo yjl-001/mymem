@@ -24,7 +24,7 @@ SUMMARY_SCRIPT = PROJECT_ROOT / "scripts/summarize_e1_experience_memory.py"
 
 
 class E1SummaryTests(unittest.TestCase):
-    def test_summarizes_authenticated_gate_vs_matched_results(self) -> None:
+    def test_summarizes_authenticated_vanilla_vs_matched_results(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             assignments = [
@@ -47,7 +47,7 @@ class E1SummaryTests(unittest.TestCase):
                 "batch_size": 1,
                 "model_input": "inputs_embeds",
             }
-            gate_generation = {
+            observation_generation = {
                 "implementation": "explicit_live_kv_cache",
                 "decoding": "greedy",
                 "do_sample": False,
@@ -72,7 +72,7 @@ class E1SummaryTests(unittest.TestCase):
                 "configuration": {
                     "max_new_tokens": 1024,
                     "vanilla_generation": vanilla_generation,
-                    "gate_generation": gate_generation,
+                    "observation_generation": observation_generation,
                     "system_profile": profile.to_dict(),
                 },
                 "summary": {"sample_count": len(assignments)},
@@ -92,7 +92,7 @@ class E1SummaryTests(unittest.TestCase):
                     assert item.matched_memory is not None
                     conditions = {}
                     for condition in E1_CONDITIONS:
-                        applied = condition == "matched_persistent_memory"
+                        applied = condition == "matched"
                         completion = [31, 50 + index] if applied else [31, 40 + index]
                         conditions[condition] = {
                             "final_reward": float(applied and index == 0),
@@ -141,7 +141,7 @@ class E1SummaryTests(unittest.TestCase):
                                     "memory_slot_count_constant_and_matched": True,
                                     "normalization_constant_and_matched": True,
                                     "memory_score_bias_constant_and_matched": True,
-                                    "baseline_first_token_matches_gate_observation": True,
+                                    "baseline_first_token_matches_observation": True,
                                 }
                                 if applied
                                 else None
@@ -164,13 +164,13 @@ class E1SummaryTests(unittest.TestCase):
                         "retrieval_query": item.retrieval_query,
                         "matched_memory": item.matched_memory.to_dict(),
                         "system_profile": profile.to_dict(),
-                        "vanilla_matches_gate_observation_only": True,
+                        "vanilla_matches_internal_observation": True,
                         "conditions": conditions,
                     }
                     handle.write(json.dumps(record) + "\n")
 
             run_report = {
-                "schema_version": "experience-memory-e1-run-report-v6",
+                "schema_version": "experience-memory-e1-run-report-v7",
                 "status": "completed",
                 "logical_split": "dev-test",
                 "dataset_split": "train",
@@ -179,7 +179,10 @@ class E1SummaryTests(unittest.TestCase):
                 "generation_contract": {
                     "max_new_tokens": 1024,
                     "vanilla": vanilla_generation,
-                    "gate_observation_only": gate_generation,
+                    "matched": {
+                        **observation_generation,
+                        "memory_injection_policy": profile.injection_policy,
+                    },
                 },
                 "system_profile": profile.to_dict(),
                 "results": {"sha256": file_sha256(results_path)},
@@ -217,6 +220,11 @@ class E1SummaryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             summary = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(summary["assigned_count"], 2)
+            self.assertEqual(set(summary["conditions"]), {"vanilla", "matched"})
+            self.assertIn(
+                "matched_vs_vanilla_accuracy",
+                summary["primary_assigned_subset"],
+            )
             self.assertEqual(summary["integrity_violations"], [])
             self.assertTrue(
                 summary["acceptance"]["assignment_and_runtime_integrity"]

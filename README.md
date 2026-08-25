@@ -38,6 +38,6 @@ bash scripts/experiments/<dataset>/run_<method>.sh
 
 ## 当前经验记忆评测
 
-完整系统只评测三种条件：`vanilla`、`gate_observation_only` 和
-`matched_persistent_memory`。服务器同步 `main` 后按顺序运行 Phase 1、risk gate、E0 与 E1D；
+完整系统只比较 `vanilla` 和 `matched`；gate observation 仅用于冻结触发位置与内部 parity 审计。
+服务器同步 `main` 后按顺序运行 Phase 1、risk gate、E0 与 E1D；
 命令和所需 artifact 路径见实验入口文档。旧过程性实验与负向路线可从 Git 历史恢复。

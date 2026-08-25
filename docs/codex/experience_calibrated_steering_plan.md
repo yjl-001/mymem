@@ -89,25 +89,25 @@ GSM8K 输入统一使用 `GSM8KPromptContract(gsm8k-memgen-builder-v1)`，严格
 原始 dataset builder 的 `\boxed{}.Question:` 拼接；不允许 E1 单独维护 prompt。
 生成预算固定为 1024。`vanilla` 精确复现仓库原始 baseline：以 `inputs_embeds`
 调用 HuggingFace greedy generation，`use_cache=False`、`repetition_penalty=1.0`；
-gate/side-KV 使用 raw-argmax 显式 live KV-cache，并记录首个 token 分叉位置。
+matched 路径使用 raw-argmax 显式 live KV-cache，并记录首个 token 分叉位置。所有正式评测均固定
+`batch_size=1`。
 
-只保留三个条件：
+只保留两个测评条件：
 
 - `vanilla`：不运行 gate，不检索，不注入 memory；
-- `gate_observation_only`：观察并冻结 gate/retrieval，但不注入 memory；
-- `matched_persistent_memory`：在同一冻结 trigger prefix 注入 BM25 top-1 side-KV，并持续到 EOS。
+- `matched`：运行 gate/retrieval，在冻结 trigger prefix 注入 BM25 top-1 side-KV，并持续到 EOS。
 
 主要比较：
 
-- `vanilla == gate-only` token parity：证明 gate probe 不改变原始生成；
-- `matched - gate-only`：估计整个 memory treatment 的增量；
+- assigned subset 的 `matched - vanilla`：检查实际收到 memory 的样本；
+- 全样本 intention-to-treat 的 `matched - vanilla`：估计完整系统的总体增量；
 - `matched format - vanilla format`：检查格式安全性。
 
-删除 mismatched/shuffled 对照后，`matched - gate-only` 同时包含检索、经验内容和 side-KV 激活效应，不能
-单独识别“BM25 是否选对了经验”。汇总 artifact 会明确记录这一解释限制。
+gate observation completion 仍在 assignment 阶段生成，用于冻结触发位置和检索输入，但不作为测评条件。
+系统内部要求它与 vanilla 逐 token 相同；该 parity 只是一项运行完整性审计。
 
-未触发或检索 abstain 的样本在 matched 条件中精确复用 gate-only completion。报告同时给出 assigned
-subset 与全样本 intention-to-treat。
+未触发或检索 abstain 的样本在 matched 条件中精确复用 vanilla completion。`matched - vanilla`
+同时包含 gate、检索、经验内容和 side-KV 激活效应，不能单独识别任一组件的贡献。
 
 ## 4. 运行与 artifact
 
@@ -169,7 +169,7 @@ bash scripts/experiments/gsm8k/run_entropy_risk_gate.sh "$PHASE1_DIR"
 输出包括：
 
 - `assignment_manifest.json`：answer-blind gate、query 和 matched ID；
-- `evaluation/results.jsonl`：三条件逐题结果和逐 token side-KV trace；
+- `evaluation/results.jsonl`：vanilla/matched 逐题结果和逐 token side-KV trace；
 - `evaluation/run_report.json`：运行完整性与聚合指标；
 - `e1d_summary.json`：paired effects、mechanism diagnostics 和解释边界。
 
@@ -194,5 +194,5 @@ python scripts/run_online_experience_memory.py \
 4. 前三项得到正证据后，再优化 gate 触发位置。
 
 后续仍不新增 Teacher/Pro 调用，不恢复 residual-vector 路线，也不把完整系统的工程可运行性表述为任务
-收益。final-test 结果可以报告冻结系统的实际表现，但在没有内容错配对照的当前三条件设计中，不能单独
+收益。final-test 结果可以报告冻结系统的实际表现，但在当前双条件端到端设计中，不能单独
 归因于 BM25 匹配质量。

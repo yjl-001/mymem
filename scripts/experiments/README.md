@@ -76,5 +76,6 @@ bash scripts/experiments/gsm8k/run_e1d_full_system.sh \
 
 `--limit 0` 表示运行整个 logical split；final-test artifact 会显式标记为 `final_evaluation`。
 
-E1 只包含 `vanilla`、`gate_observation_only` 和 `matched_persistent_memory`。完整结论、系统契约与解释
-限制见 [`experience_calibrated_steering_plan.md`](../../docs/codex/experience_calibrated_steering_plan.md)。
+E1 只比较 `vanilla` 和 `matched`；gate observation 仅作为冻结触发位置与检索输入的内部审计路径，
+不作为测评条件。完整结论、系统契约与解释限制见
+[`experience_calibrated_steering_plan.md`](../../docs/codex/experience_calibrated_steering_plan.md)。
