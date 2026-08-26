@@ -236,13 +236,38 @@ class V3AnalysisTests(unittest.TestCase):
             "independent_final_confirmation": False,
             "logical_split": "final-test",
             "dataset_revision": "dataset",
-            "selected_sample_count": 4,
+            "selected_sample_count": 5,
             "system_profile": {"layer_number": 24},
             "hysteresis_gate": {"risk_role": "diagnostic_only"},
             "generation": {"max_new_tokens": 4},
             "inputs": {"results": "fixture"},
         }
         profile["profile_sha256"] = ANALYSIS.evaluation_profile_sha256(profile)
+        margin_abstain = attempt(
+            1,
+            boundary_index=0,
+            memory_id="memory-a",
+            outcome="activated",
+        )
+        margin_abstain.update({
+            "outcome": "abstained",
+            "selected_memory_id": None,
+            "active_memory_id_after": None,
+            "memory_load_seconds": None,
+            "activation_forward_seconds": None,
+            "activation_first_step_logits_kl": None,
+            "activation_first_step_top1_changed": None,
+            "activation_baseline_first_token_id": None,
+        })
+        margin_abstain["retrieval_decision"].update({
+            "status": "below_margin",
+            "matched_memory": None,
+        })
+        margin_abstain["retrieval_decision"]["query"].update({
+            "abstention_policy": "top1_top2_margin",
+            "minimum_top1_top2_margin": 0.9,
+            "margin_qualified": False,
+        })
         rows = [
             make_row(
                 profile_sha256=profile["profile_sha256"],
@@ -320,6 +345,18 @@ class V3AnalysisTests(unittest.TestCase):
                 attentions=[],
                 final_memory_id=None,
             ),
+            make_row(
+                profile_sha256=profile["profile_sha256"],
+                sample_id="sample-4",
+                vanilla_ids=(4, 0),
+                v3_ids=(4, 0),
+                vanilla_strict=False,
+                v3_strict=False,
+                attempts=[margin_abstain],
+                boundaries=[boundary(0, action="retrieval_attempt")],
+                attentions=[],
+                final_memory_id=None,
+            ),
         ]
         # A direct KL estimate can be microscopically negative because the
         # float32 softmax/log-softmax reduction is not an exact arithmetic
@@ -380,8 +417,9 @@ class V3AnalysisTests(unittest.TestCase):
             self.assertEqual(
                 strict["paired_table"]["vanilla_only_correct_harmed"], 1
             )
-            self.assertEqual(report["mechanism"]["retrieval_attempt_count"], 3)
+            self.assertEqual(report["mechanism"]["retrieval_attempt_count"], 4)
             self.assertEqual(report["mechanism"]["replacement_count"], 1)
+            self.assertEqual(report["mechanism"]["abstain_count"], 1)
             self.assertEqual(report["zero_attempt_parity"]["mismatch_count"], 0)
             self.assertTrue(output_path.with_suffix(".md").is_file())
 

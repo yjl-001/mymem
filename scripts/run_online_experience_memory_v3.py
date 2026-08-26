@@ -27,6 +27,7 @@ from memgen.experience.phase1 import (
 )
 from memgen.experience.risk import ENTROPY_RISK_ARTIFACT_SCHEMA
 from memgen.experience.v3 import ExperienceMemoryV3Profile
+from memgen.experience.v3_selector import load_margin_selector_calibration
 from memgen.experience.v3_artifacts import (
     authenticate_e0_inputs,
     load_formal_e0_report,
@@ -44,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v3-offline-report", type=Path, required=True)
     parser.add_argument("--e0-final-report", type=Path, required=True)
     parser.add_argument("--risk-artifact", type=Path, required=True)
+    parser.add_argument("--selector-calibration", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -86,7 +88,27 @@ def main() -> None:
         OnlineExperienceMemorySystemV3,
     )
 
-    profile = ExperienceMemoryV3Profile()
+    selector_calibration = None
+    if args.selector_calibration is not None:
+        selector_calibration = load_margin_selector_calibration(
+            args.selector_calibration
+        )
+        if selector_calibration.get("source", {}).get(
+            "retrieval_key_manifest_sha256"
+        ) != file_sha256(args.retrieval_key_manifest):
+            raise ValueError(
+                "V3.1 selector calibration uses a different retrieval key bank"
+            )
+        profile = ExperienceMemoryV3Profile(
+            retrieval_abstention_policy="top1_top2_margin",
+            retrieval_min_top1_top2_margin=float(
+                selector_calibration["calibration"][
+                    "minimum_top1_top2_margin"
+                ]
+            ),
+        )
+    else:
+        profile = ExperienceMemoryV3Profile()
     e0_report = load_formal_e0_report(args.e0_final_report)
     authenticate_e0_inputs(
         e0_report=e0_report,
@@ -263,6 +285,9 @@ def main() -> None:
             "implementation": "explicit_live_native_kv_cache",
         },
         "system_profile": profile.to_dict(),
+        "selector_calibration": (
+            selector_calibration if selector_calibration is not None else None
+        ),
         "hysteresis_gate": gate.config.to_dict(),
         "hysteresis_threshold_provenance": {
             key: risk_artifact.get("construction", {}).get(key)
@@ -292,6 +317,11 @@ def main() -> None:
             "v3_offline_report_sha256": file_sha256(args.v3_offline_report),
             "e0_final_report_sha256": file_sha256(args.e0_final_report),
             "risk_artifact_sha256": file_sha256(args.risk_artifact),
+            "selector_calibration_sha256": (
+                file_sha256(args.selector_calibration)
+                if args.selector_calibration is not None
+                else None
+            ),
         },
     }
     output["output_sha256"] = canonical_json_sha256(output)

@@ -363,6 +363,11 @@ class EmbeddingMemoryRetriever:
         key_ids = set(key_bank.entry_by_id)
         if set(self.record_by_id) != key_ids or set(self.kv_valid_slot_counts) != key_ids:
             raise ValueError("V3 text, embedding, and side-KV banks cover different IDs")
+        if (
+            profile.retrieval_abstention_policy == "top1_top2_margin"
+            and len(key_ids) < 2
+        ):
+            raise ValueError("V3 margin abstention requires at least two memories")
         for memory_id, record in self.record_by_id.items():
             entry = key_bank.entry_by_id[memory_id]
             if entry.get("payload_hash") != record.payload_hash:
@@ -413,9 +418,23 @@ class EmbeddingMemoryRetriever:
         top = hits[0]
         memory_id = str(top["memory_id"])
         record = self.record_by_id[memory_id]
+        query_audit = self._query_audit(
+            query, query_token_ids, prompt_token_count, hits
+        )
+        if (
+            self.profile.retrieval_abstention_policy == "top1_top2_margin"
+            and float(query_audit["top1_top2_margin"])
+            < float(self.profile.retrieval_min_top1_top2_margin)
+        ):
+            return EmbeddingRetrievalDecision(
+                status="below_margin",
+                query=query_audit,
+                hits=tuple(hits),
+                matched_memory=None,
+            )
         return EmbeddingRetrievalDecision(
             status="selected",
-            query=self._query_audit(query, query_token_ids, prompt_token_count, hits),
+            query=query_audit,
             hits=tuple(hits),
             matched_memory=MemoryChoice(
                 memory_id=memory_id,
@@ -442,6 +461,10 @@ class EmbeddingMemoryRetriever:
             "encoder_state": self.profile.query_encoder_state,
             "pooling": self.profile.query_pooling,
             "normalization": self.profile.query_normalization,
+            "abstention_policy": self.profile.retrieval_abstention_policy,
+            "minimum_top1_top2_margin": (
+                self.profile.retrieval_min_top1_top2_margin
+            ),
             "query_token_count": len(token_ids),
             "prompt_token_count": prompt_token_count,
             "partial_cot_token_count": len(token_ids) - prompt_token_count,
@@ -452,4 +475,13 @@ class EmbeddingMemoryRetriever:
             "top1_score": top1,
             "top2_score": top2,
             "top1_top2_margin": top1 - top2 if top2 is not None else None,
+            "margin_qualified": (
+                None
+                if self.profile.retrieval_abstention_policy == "disabled"
+                else (
+                    top2 is not None
+                    and top1 - top2
+                    >= float(self.profile.retrieval_min_top1_top2_margin)
+                )
+            ),
         }

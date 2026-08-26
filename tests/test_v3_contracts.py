@@ -159,6 +159,52 @@ class V3RuntimeStateMachineTests(unittest.TestCase):
         )
         self.assertEqual(decision.matched_memory.memory_id, "memory-a")
 
+    def test_margin_selector_abstains_but_retains_top2_diagnostics(self) -> None:
+        from memgen.model.retrieval_keys import EmbeddingMemoryRetriever
+
+        profile = ExperienceMemoryV3Profile(
+            retrieval_abstention_policy="top1_top2_margin",
+            retrieval_min_top1_top2_margin=0.1,
+        )
+        records = tuple(
+            SimpleNamespace(
+                memory_id=f"memory-{suffix}",
+                payload_hash=f"payload-{suffix}",
+                token_count=2,
+            )
+            for suffix in ("a", "b")
+        )
+        entries = tuple({
+            "index": index,
+            "memory_id": record.memory_id,
+            "payload_hash": record.payload_hash,
+            "payload_token_count": record.token_count,
+            "key_embedding_sha256": f"key-{index}",
+        } for index, record in enumerate(records))
+        key_bank = SimpleNamespace(
+            embeddings=torch.tensor([[1.0, 0.0], [0.999, 0.0447]]),
+            entries=entries,
+            entry_by_id={entry["memory_id"]: entry for entry in entries},
+        )
+        retriever = EmbeddingMemoryRetriever(
+            key_bank=key_bank,
+            records=records,
+            kv_valid_slot_counts={"memory-a": 2, "memory-b": 2},
+            profile=profile,
+        )
+        decision = retriever.retrieve(
+            query_embedding=torch.tensor([1.0, 0.0]),
+            query_token_ids=(10, 11, 12),
+            prompt_token_count=2,
+        )
+        self.assertEqual(decision.status, "below_margin")
+        self.assertIsNone(decision.matched_memory)
+        self.assertEqual(len(decision.hits), 2)
+        self.assertFalse(decision.query["margin_qualified"])
+        self.assertEqual(
+            decision.query["minimum_top1_top2_margin"], 0.1
+        )
+
     def test_rearm_allows_three_attempts_and_replaces_current_memory(self) -> None:
         from memgen.experience.e1 import MemoryChoice
         from memgen.experience.v3 import EmbeddingRetrievalDecision

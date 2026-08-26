@@ -11,6 +11,7 @@ OFFSET=0
 LIMIT=8
 PARITY_SAMPLES=8
 RUN_DIR=""
+SELECTOR_CALIBRATION=""
 POSITIONAL=()
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -20,13 +21,14 @@ while [[ "$#" -gt 0 ]]; do
     --limit) LIMIT="$2"; shift 2 ;;
     --parity-samples) PARITY_SAMPLES="$2"; shift 2 ;;
     --run-dir) RUN_DIR="$2"; shift 2 ;;
+    --selector-calibration) SELECTOR_CALIBRATION="$2"; shift 2 ;;
     -*) echo "Unknown option: $1" >&2; exit 2 ;;
     *) POSITIONAL+=("$1"); shift ;;
   esac
 done
 
 if [[ "${#POSITIONAL[@]}" -ne 4 ]]; then
-  echo "Usage: $0 [options] PHASE1_DIR E0_DIR RISK_ARTIFACT OUTPUT_ROOT" >&2
+  echo "Usage: $0 [--stage offline|eval|all] [--logical-split SPLIT] [--limit N] [--run-dir DIR] [--selector-calibration FILE] PHASE1_DIR E0_DIR RISK_ARTIFACT OUTPUT_ROOT" >&2
   exit 2
 fi
 if [[ "$STAGE" != "offline" && "$STAGE" != "eval" && "$STAGE" != "all" ]]; then
@@ -84,6 +86,14 @@ if [[ "$STAGE" == "eval" || "$STAGE" == "all" ]]; then
       exit 1
     fi
   done
+  SELECTOR_ARGS=()
+  if [[ -n "$SELECTOR_CALIBRATION" ]]; then
+    if [[ ! -s "$SELECTOR_CALIBRATION" ]]; then
+      echo "Missing selector calibration: $SELECTOR_CALIBRATION" >&2
+      exit 1
+    fi
+    SELECTOR_ARGS=(--selector-calibration "$SELECTOR_CALIBRATION")
+  fi
   python scripts/evaluate_v3_experience_memory.py \
     --split-manifest "$SPLIT_MANIFEST" \
     --logical-split "$LOGICAL_SPLIT" \
@@ -93,6 +103,7 @@ if [[ "$STAGE" == "eval" || "$STAGE" == "all" ]]; then
     --v3-offline-report "$V3_BANK_DIR/v3_offline_report.json" \
     --e0-final-report "$E0_FINAL_REPORT" \
     --risk-artifact "$RISK_ARTIFACT" \
+    "${SELECTOR_ARGS[@]}" \
     --output-dir "$RUN_DIR" \
     --offset "$OFFSET" \
     --limit "$LIMIT" \

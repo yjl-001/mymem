@@ -26,6 +26,7 @@ class ExperienceMemoryV3Profile:
     query_normalization: str = "l2"
     retrieval_method: str = "exact_cosine"
     retrieval_abstention_policy: str = "disabled"
+    retrieval_min_top1_top2_margin: float | None = None
     retrieval_top_k: int = 2
     selected_memory_count: int = 1
     max_retrieval_attempts: int = 3
@@ -53,7 +54,6 @@ class ExperienceMemoryV3Profile:
             "query_pooling": "last_valid_token",
             "query_normalization": "l2",
             "retrieval_method": "exact_cosine",
-            "retrieval_abstention_policy": "disabled",
             "gate_policy": "entropy_hysteresis_rearm",
             "risk_role": "diagnostic_only",
             "boundary_policy": "pre_answer_comma_period_newline",
@@ -68,6 +68,23 @@ class ExperienceMemoryV3Profile:
         for field_name, expected_value in expected.items():
             if getattr(self, field_name) != expected_value:
                 raise ValueError(f"Unexpected V3 {field_name}")
+        if self.retrieval_abstention_policy == "disabled":
+            if self.retrieval_min_top1_top2_margin is not None:
+                raise ValueError(
+                    "Disabled V3 retrieval abstention cannot set a margin"
+                )
+        elif self.retrieval_abstention_policy == "top1_top2_margin":
+            threshold = self.retrieval_min_top1_top2_margin
+            if (
+                threshold is None
+                or not math.isfinite(threshold)
+                or threshold < 0.0
+            ):
+                raise ValueError(
+                    "V3 margin abstention needs a finite non-negative threshold"
+                )
+        else:
+            raise ValueError("Unexpected V3 retrieval_abstention_policy")
         if self.retrieval_top_k < 2:
             raise ValueError("V3 retrieval must retain top-2 diagnostics")
         if self.selected_memory_count != 1:
@@ -114,13 +131,18 @@ class EmbeddingRetrievalDecision:
     def __post_init__(self) -> None:
         if self.schema_version != V3_RETRIEVAL_DECISION_SCHEMA:
             raise ValueError("Unexpected V3 retrieval decision schema")
-        if self.status not in {"selected", "empty_bank"}:
+        if self.status not in {"selected", "below_margin", "empty_bank"}:
             raise ValueError(f"Unexpected V3 retrieval status: {self.status}")
         if self.status == "selected":
             if self.matched_memory is None or not self.hits:
                 raise ValueError("Selected V3 retrieval requires hits and memory")
             if self.hits[0].get("memory_id") != self.matched_memory.memory_id:
                 raise ValueError("Top embedding hit and selected memory differ")
+        elif self.status == "below_margin":
+            if self.matched_memory is not None or len(self.hits) < 2:
+                raise ValueError(
+                    "Margin-abstained V3 retrieval requires top-2 hits and no memory"
+                )
         elif self.matched_memory is not None or self.hits:
             raise ValueError("Empty-bank retrieval cannot select a memory")
 

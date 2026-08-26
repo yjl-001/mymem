@@ -110,3 +110,20 @@ bash scripts/experiments/gsm8k/run_e1d_full_system.sh \
 E1 只比较 `vanilla` 和 `matched`；gate observation 仅作为冻结触发位置与检索输入的内部审计路径，
 不作为测评条件。完整结论、系统契约与解释限制见
 [`experience_calibrated_steering_plan.md`](../../docs/codex/experience_calibrated_steering_plan.md)。
+
+## V3.1 margin selector 实验
+
+V3.1 复用已有 layer-24 embedding/side-KV bank，只对 exact-cosine top-2 选择增加由
+calibration-val answer-blind 冻结的 margin abstention。评测 runner 使用：
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_1_selector_experiment.sh \
+  --calibration-limit 0 \
+  --dev-limit 0 \
+  --target-retained-fraction 0.5 \
+  "$PHASE1_DIR" "$E0_DIR" "$RISK_ARTIFACT" "$OUTPUT_ROOT"
+```
+
+完整的 key geometry 审计、calibration artifact 构造和 matched baseline/V3.1 比较命令见
+[`memgen_v3_system.md`](../../docs/codex/memgen_v3_system.md)。本轮不使用 final-test 调阈值，也不修改
+注入层。

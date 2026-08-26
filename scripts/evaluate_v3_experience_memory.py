@@ -34,6 +34,7 @@ from memgen.experience.phase1 import (
 )
 from memgen.experience.risk import ENTROPY_RISK_ARTIFACT_SCHEMA
 from memgen.experience.v3 import ExperienceMemoryV3Profile
+from memgen.experience.v3_selector import load_margin_selector_calibration
 from memgen.experience.v3_artifacts import (
     authenticate_e0_inputs,
     load_formal_e0_report,
@@ -62,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v3-offline-report", type=Path, required=True)
     parser.add_argument("--e0-final-report", type=Path, required=True)
     parser.add_argument("--risk-artifact", type=Path, required=True)
+    parser.add_argument("--selector-calibration", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 evaluates the slice remainder")
@@ -113,6 +115,7 @@ def repository_state() -> dict[str, Any]:
     diff = run("diff", "--binary", "HEAD")
     implementation_paths = (
         "memgen/experience/v3.py",
+        "memgen/experience/v3_selector.py",
         "memgen/experience/v3_artifacts.py",
         "memgen/experience/v3_eval.py",
         "memgen/model/retrieval_keys.py",
@@ -328,7 +331,28 @@ def main() -> None:
     if args.logical_split == "final-test" and dataset_split != "test":
         raise ValueError("V3 final-test must be the official GSM8K test split")
 
-    profile = ExperienceMemoryV3Profile()
+    selector_calibration = None
+    if args.selector_calibration is not None:
+        selector_calibration = load_margin_selector_calibration(
+            args.selector_calibration
+        )
+        expected_key_sha256 = selector_calibration.get("source", {}).get(
+            "retrieval_key_manifest_sha256"
+        )
+        if expected_key_sha256 != file_sha256(args.retrieval_key_manifest):
+            raise ValueError(
+                "V3.1 selector calibration uses a different retrieval key bank"
+            )
+        profile = ExperienceMemoryV3Profile(
+            retrieval_abstention_policy="top1_top2_margin",
+            retrieval_min_top1_top2_margin=float(
+                selector_calibration["calibration"][
+                    "minimum_top1_top2_margin"
+                ]
+            ),
+        )
+    else:
+        profile = ExperienceMemoryV3Profile()
     e0_report = load_formal_e0_report(args.e0_final_report)
     authenticate_e0_inputs(
         e0_report=e0_report,
@@ -465,7 +489,11 @@ def main() -> None:
     interpretation = (
         "reused_official_test_descriptive_evaluation"
         if args.logical_split == "final-test"
-        else "system_validation"
+        else (
+            "answer_blind_margin_selector_validation"
+            if selector_calibration is not None
+            else "system_validation"
+        )
     )
     run_profile = {
         "schema_version": V3_EVAL_PROFILE_SCHEMA,
@@ -482,6 +510,25 @@ def main() -> None:
         "reasoner": reasoner | {"runtime_dtype": args.dtype},
         "prompt_contract": expected_prompt_contract,
         "system_profile": profile.to_dict(),
+        "selector_calibration": (
+            {
+                "schema_version": selector_calibration.get("schema_version"),
+                "artifact_sha256": selector_calibration.get(
+                    "artifact_sha256"
+                ),
+                "policy": selector_calibration.get("policy"),
+                "source": selector_calibration.get("source"),
+                "calibration": selector_calibration.get("calibration"),
+                "task_accuracy_used": selector_calibration.get(
+                    "task_accuracy_used"
+                ),
+                "answer_or_reward_used": selector_calibration.get(
+                    "answer_or_reward_used"
+                ),
+            }
+            if selector_calibration is not None
+            else None
+        ),
         "hysteresis_gate": gate.config.to_dict(),
         "hysteresis_threshold_provenance": {
             key: risk_artifact.get("construction", {}).get(key)
@@ -532,6 +579,11 @@ def main() -> None:
             "v3_offline_report_sha256": file_sha256(args.v3_offline_report),
             "e0_final_report_sha256": file_sha256(args.e0_final_report),
             "risk_artifact_sha256": file_sha256(args.risk_artifact),
+            "selector_calibration_sha256": (
+                file_sha256(args.selector_calibration)
+                if args.selector_calibration is not None
+                else None
+            ),
         },
     }
     run_profile["profile_sha256"] = evaluation_profile_sha256(run_profile)

@@ -507,6 +507,52 @@ def extract_sample(
             "retrieval_hits_are_finite_and_ranked",
             sample_id,
         )
+        abstention_policy = query.get("abstention_policy")
+        if abstention_policy is not None:
+            threshold = _finite_or_none(
+                query.get("minimum_top1_top2_margin")
+            )
+            margin = _finite_or_none(query.get("top1_top2_margin"))
+            qualified = query.get("margin_qualified")
+            if abstention_policy == "disabled":
+                audit.check(
+                    threshold is None and qualified is None,
+                    "disabled_margin_abstention_has_no_threshold",
+                    sample_id,
+                )
+            elif abstention_policy == "top1_top2_margin":
+                status = str(decision.get("status"))
+                expected_qualified = (
+                    threshold is not None
+                    and margin is not None
+                    and margin >= threshold
+                )
+                audit.check(
+                    threshold is not None
+                    and threshold >= 0.0
+                    and qualified is expected_qualified
+                    and (
+                        (
+                            status == "selected"
+                            and expected_qualified
+                            and selected_id is not None
+                        )
+                        or (
+                            status == "below_margin"
+                            and not expected_qualified
+                            and selected_id is None
+                            and outcome == "abstained"
+                        )
+                    ),
+                    "margin_abstention_decision_is_valid",
+                    sample_id,
+                )
+            else:
+                audit.check(
+                    False,
+                    "known_retrieval_abstention_policy",
+                    sample_id,
+                )
         if selected_id is not None:
             selected_id = str(selected_id)
             selected_memory_ids.append(selected_id)
@@ -1204,6 +1250,10 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         "",
         scope_table(report["stratified_analysis"]["by_has_duplicate"]),
         "",
+        "### Margin abstention",
+        "",
+        scope_table(report["stratified_analysis"]["by_has_abstain"]),
+        "",
         "### Activation first-step top-1 change",
         "",
         scope_table(report["stratified_analysis"]["by_activation_top1_change"]),
@@ -1502,6 +1552,10 @@ def main() -> None:
             "by_has_duplicate": grouped_scope_summary(
                 triggered,
                 lambda item: "has_duplicate" if item.duplicate_count else "no_duplicate",
+            ),
+            "by_has_abstain": grouped_scope_summary(
+                triggered,
+                lambda item: "has_abstain" if item.abstain_count else "no_abstain",
             ),
             "by_activation_top1_change": grouped_scope_summary(
                 triggered,

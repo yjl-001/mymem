@@ -163,6 +163,66 @@ profile 和 final report。
 
 ## 6. 最后处理的研究问题
 
+### V3.1 selector-only 实验
+
+V3 全量结果没有显示净收益后，下一步只修改 selector，不修改 layer-24、side-KV、entropy re-arm、
+三次 attempt 上限、replacement 或 duplicate 语义。实验策略是用 calibration-val 首次 retrieval
+attempt 的 top1-top2 margin 分布，answer-blind 地保留置信度最高的 50%；阈值不读取答案、reward、
+strict 或 format 指标，并冻结到带 hash 的 calibration artifact。
+
+先对现有 key bank 做一次 CPU-only 几何与 hubness 审计：
+
+```bash
+python scripts/audit_v3_retrieval_geometry.py \
+  --retrieval-key-manifest "$V3_BANK_DIR/retrieval_key_manifest.json" \
+  --memory-records "$E0_DIR/memory_records.v2.jsonl" \
+  --output "$V31_DIR/retrieval_geometry_audit.json"
+```
+
+从完整、abstention-disabled 的 calibration-val 基线日志冻结阈值：
+
+```bash
+python scripts/calibrate_v3_margin_selector.py \
+  --results "$CALIBRATION_BASELINE_DIR/results.jsonl" \
+  --run-profile "$CALIBRATION_BASELINE_DIR/run_profile.json" \
+  --retrieval-key-manifest "$V3_BANK_DIR/retrieval_key_manifest.json" \
+  --target-retained-fraction 0.5 \
+  --output "$V31_DIR/margin_selector_calibration.json"
+```
+
+低于阈值的 attempt 记录为 `abstained`，保留 top-2 审计信息但不加载或替换 KV；attempt 仍被消耗并
+进入原有 `DISARMED/EXHAUSTED` 状态。使用同一 logical split 分别运行 disabled baseline 与 V3.1
+后，做逐题比较：
+
+```bash
+python scripts/compare_v3_selector_evaluations.py \
+  --baseline-results "$DEV_BASELINE_DIR/results.jsonl" \
+  --baseline-profile "$DEV_BASELINE_DIR/run_profile.json" \
+  --margin-results "$DEV_MARGIN_DIR/results.jsonl" \
+  --margin-profile "$DEV_MARGIN_DIR/run_profile.json" \
+  --output "$V31_DIR/dev_selector_comparison.json"
+```
+
+阈值必须来自 calibration-val；正式比较优先使用匹配的 dev-test baseline/V3.1。当前已经使用过的
+official final-test 不得用于选择阈值，也不在这一轮重跑。
+
+完整流程可由一个可恢复 runner 执行；已有完整 calibration/dev baseline 时可通过对应参数直接复用：
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_1_selector_experiment.sh \
+  --calibration-limit 0 \
+  --dev-limit 0 \
+  --target-retained-fraction 0.5 \
+  --calibration-baseline-dir "$CALIBRATION_BASELINE_DIR" \
+  --dev-baseline-dir "$DEV_BASELINE_DIR" \
+  "$PHASE1_DIR" "$E0_DIR" "$RISK_ARTIFACT" "$OUTPUT_ROOT"
+```
+
+runner 只运行 calibration-val 与 dev-test，并分别生成 key audit、selector calibration、两条件分析及
+matched comparison Markdown。
+
+### Injection layer
+
 当前 V3 只在 layer 24 注入，不做 layer search、multi-layer 或候选层双路编译。等 V3 全流程和全量
 结果完成后，再单独研究校准过的 injection layer；届时必须产生新的 layer-specific key/KV 工件和
 profile，不能原地修改本版 layer-24 结果。
