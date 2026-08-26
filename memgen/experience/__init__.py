@@ -54,6 +54,15 @@ from memgen.experience.system import (
     SemanticMemoryRetriever,
     SemanticRetrievalDecision,
 )
+from memgen.experience.v3 import (
+    V3_GENERATION_RESULT_SCHEMA,
+    V3_OFFLINE_REPORT_SCHEMA,
+    V3_RETRIEVAL_DECISION_SCHEMA,
+    V3_SYSTEM_PROFILE_SCHEMA,
+    EmbeddingRetrievalDecision,
+    ExperienceMemoryV3Profile,
+)
+from memgen.experience.v3_eval import summarize_v3_rows
 
 __all__ = [
     "TEACHER_BANK_REQUIRED_FIELDS",
@@ -98,4 +107,11 @@ __all__ = [
     "ExperienceMemorySystemProfile",
     "SemanticMemoryRetriever",
     "SemanticRetrievalDecision",
+    "V3_GENERATION_RESULT_SCHEMA",
+    "V3_OFFLINE_REPORT_SCHEMA",
+    "V3_RETRIEVAL_DECISION_SCHEMA",
+    "V3_SYSTEM_PROFILE_SCHEMA",
+    "EmbeddingRetrievalDecision",
+    "ExperienceMemoryV3Profile",
+    "summarize_v3_rows",
 ]

@@ -783,8 +783,21 @@ class SideKVAttentionController:
     def traces(self) -> tuple[SideKVAttentionTrace, ...]:
         return tuple(self._traces)
 
+    @property
+    def active_memory(self) -> SideKVMemory | None:
+        """Expose the current value for audited replace/suspend operations."""
+
+        return self._active_memory
+
     def clear_traces(self) -> None:
         self._traces.clear()
+
+    def truncate_traces(self, length: int) -> None:
+        """Discard counterfactual traces while retaining actual-path evidence."""
+
+        if length < 0 or length > len(self._traces):
+            raise ValueError("Invalid side-KV trace truncation length")
+        del self._traces[length:]
 
     def activate(self, memory: SideKVMemory) -> None:
         if self._closed:
@@ -803,6 +816,24 @@ class SideKVAttentionController:
 
     def deactivate(self) -> None:
         self._active_memory = None
+
+    @contextmanager
+    def suspend_memory(self) -> Iterator[SideKVMemory | None]:
+        """Temporarily disable side-KV while preserving the selected memory.
+
+        V3 uses this for pure-prefix retrieval-query re-encoding.  The native
+        cache is not touched and the prior memory is restored even on failure.
+        """
+
+        if self._closed:
+            raise RuntimeError("Cannot suspend a closed SideKVAttentionController")
+        previous = self._active_memory
+        self.deactivate()
+        try:
+            yield previous
+        finally:
+            if previous is not None:
+                self.activate(previous)
 
     @contextmanager
     def use_memory(self, memory: SideKVMemory) -> Iterator["SideKVAttentionController"]:

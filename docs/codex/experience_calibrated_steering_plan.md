@@ -1,6 +1,8 @@
-# MemGen 经验记忆研究：核心结论与当前系统
+# MemGen 经验记忆研究：历史证据与 V2 reference
 
-本文是经验记忆研究的唯一当前文档。历史实验实现和过程性设计已从工作树移除；需要复现时使用 Git 历史。
+本文保留已经完成的实验事实和 V2 reference，用于结果追溯。当前实现与运行契约已经升级为
+[MemGen V3 系统](memgen_v3_system.md)；V2 的 BM25、last-96、单次 joint entropy-risk trigger
+不得用于新的 V3 结果。
 
 ## 1. 已确认结论
 
