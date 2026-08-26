@@ -321,6 +321,17 @@ class V3AnalysisTests(unittest.TestCase):
                 final_memory_id=None,
             ),
         ]
+        # A direct KL estimate can be microscopically negative because the
+        # float32 softmax/log-softmax reduction is not an exact arithmetic
+        # proof of non-negativity. It remains a valid finite diagnostic.
+        rows[1]["conditions"]["v3"]["runtime_trace"]["retrieval_attempts"][0][
+            "activation_first_step_logits_kl"
+        ] = -1e-8
+        rows[1]["row_sha256"] = canonical_json_sha256({
+            key: value
+            for key, value in rows[1].items()
+            if key not in {"created_at", "row_sha256"}
+        })
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             profile_path = root / "run_profile.json"

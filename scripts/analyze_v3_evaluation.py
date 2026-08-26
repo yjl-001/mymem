@@ -558,7 +558,6 @@ def extract_sample(
             (
                 outcome in {"activated", "replaced"}
                 and kl is not None
-                and kl >= 0.0
                 and isinstance(top1_changed, bool)
             )
             or (
@@ -1030,6 +1029,79 @@ def markdown_report(report: Mapping[str, Any]) -> str:
             f"[{percent(interval['lower'])}, {percent(interval['upper'])}]"
         )
 
+    def scope_table(groups: Sequence[Mapping[str, Any]]) -> str:
+        rows = [
+            "| Group | N | Strict net | Improved | Harmed | Format net | Mean token delta |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        for group in groups:
+            group_strict = group["strict"]
+            group_format = group["format"]
+            token_delta = group["tokens"]["paired_delta_v3_minus_vanilla"]
+            rows.append(
+                f"| {group['group']} | {group['sample_count']} | "
+                f"{group_strict['net_correct_count_delta']} | "
+                f"{group_strict['paired_table']['v3_only_correct_improved']} | "
+                f"{group_strict['paired_table']['vanilla_only_correct_harmed']} | "
+                f"{group_format['net_correct_count_delta']} | "
+                f"{token_delta['mean']} |"
+            )
+        return "\n".join(rows)
+
+    def memory_table(items: Sequence[Mapping[str, Any]]) -> str:
+        rows = [
+            "| Memory ID | N | Strict net | Improved | Harmed | Mean token delta |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+        for item in items[:10]:
+            item_strict = item["strict"]
+            rows.append(
+                f"| {item['memory_id']} | {item['sample_count']} | "
+                f"{item_strict['net_correct_count_delta']} | "
+                f"{item_strict['paired_table']['v3_only_correct_improved']} | "
+                f"{item_strict['paired_table']['vanilla_only_correct_harmed']} | "
+                f"{item['tokens']['paired_delta_v3_minus_vanilla']['mean']} |"
+            )
+        return "\n".join(rows)
+
+    def outlier_table(items: Sequence[Mapping[str, Any]]) -> str:
+        rows = [
+            "| Sample | Token delta | Strict | Attempts | Outcomes | Memory |",
+            "|---|---:|---:|---:|---|---|",
+        ]
+        for item in items[:10]:
+            rows.append(
+                f"| {item['sample_id']} | {item['token_delta']} | "
+                f"{item['strict_transition']} | {item['attempt_count']} | "
+                f"{item['outcome_sequence']} | {item['final_memory_id']} |"
+            )
+        return "\n".join(rows)
+
+    def signal_table(attributes: Sequence[str]) -> str:
+        correlations = report["exploratory_associations"]["correlations"]
+        quartiles = report["exploratory_associations"][
+            "equal_count_rank_quartiles"
+        ]
+        rows = [
+            "| Signal | N | Mean | Strict Pearson | Strict Spearman | Q1→Q4 strict net |",
+            "|---|---:|---:|---:|---:|---|",
+        ]
+        for attribute in attributes:
+            association = correlations[attribute]
+            summary = association["attribute_summary"]
+            quartile_nets = [
+                str(item["strict"]["net_correct_count_delta"])
+                for item in quartiles[attribute]
+            ]
+            rows.append(
+                f"| {attribute} | {association['sample_count']} | "
+                f"{summary['mean'] if summary else 'n/a'} | "
+                f"{association['strict_delta']['pearson']} | "
+                f"{association['strict_delta']['spearman']} | "
+                f"{' → '.join(quartile_nets) or 'n/a'} |"
+            )
+        return "\n".join(rows)
+
     strict_net = int(strict["net_correct_count_delta"])
     if strict_net > 0:
         strict_read = f"V3 gained {strict_net} net strict-correct samples."
@@ -1117,6 +1189,61 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         f"{overall['tokens']['paired_delta_v3_minus_vanilla']['p95']} / "
         f"{overall['tokens']['paired_delta_v3_minus_vanilla']['p99']} / "
         f"{overall['tokens']['paired_delta_v3_minus_vanilla']['max']}",
+        "",
+        "## Outcome strata",
+        "",
+        "### Retrieval attempts per question",
+        "",
+        scope_table(report["stratified_analysis"]["by_attempt_count"]),
+        "",
+        "### Replacement",
+        "",
+        scope_table(report["stratified_analysis"]["by_has_replacement"]),
+        "",
+        "### Duplicate retrieval",
+        "",
+        scope_table(report["stratified_analysis"]["by_has_duplicate"]),
+        "",
+        "### Activation first-step top-1 change",
+        "",
+        scope_table(report["stratified_analysis"]["by_activation_top1_change"]),
+        "",
+        "### Outcome sequence",
+        "",
+        scope_table(report["stratified_analysis"]["by_outcome_sequence"]),
+        "",
+        "## Exploratory online-signal associations",
+        "",
+        signal_table((
+            "first_top1_score",
+            "first_top1_top2_margin",
+            "first_trigger_entropy",
+            "first_trigger_boundary_index",
+            "mean_activation_kl",
+            "mean_attention_mass",
+            "attention_step_count",
+            "attempt_count",
+        )),
+        "",
+        "## First-memory diagnostics",
+        "",
+        "### Most frequent",
+        "",
+        memory_table(report["memory_analysis"]["first_memory"]["top_by_frequency"]),
+        "",
+        "### Worst exploratory strict net effects (minimum sample filter applied)",
+        "",
+        memory_table(report["memory_analysis"]["first_memory"]["worst_strict_net_effect"]),
+        "",
+        "## Token outliers",
+        "",
+        "### Largest positive deltas",
+        "",
+        outlier_table(report["token_tail_analysis"]["largest_positive_deltas"]),
+        "",
+        "### Largest negative deltas",
+        "",
+        outlier_table(report["token_tail_analysis"]["largest_negative_deltas"]),
         "",
         "## Quick read",
         "",
