@@ -135,6 +135,21 @@ python scripts/evaluate_v3_experience_memory.py \
   --dtype bfloat16
 ```
 
+全量评估结束后，可在不加载模型的 CPU 环境中对逐题日志做配对诊断：
+
+```bash
+python scripts/analyze_v3_evaluation.py \
+  --results "$RUN_DIR/results.jsonl" \
+  --run-profile "$RUN_DIR/run_profile.json" \
+  --output "$RUN_DIR/analysis_report.json" \
+  --markdown-output "$RUN_DIR/analysis_report.md"
+```
+
+分析器会复核 profile/逐行/completion hash 与 V3 在线不变量，并输出 strict/format 的配对四格表、
+McNemar 检验、bootstrap 区间、零触发 parity、多次 attempt/replacement 分层、检索分数、KL、
+attention mass、memory ID 和 token 尾部异常。Markdown 是结论摘要，JSON 保留完整诊断与样本 ID；
+其中 memory/相关性/分位数组只作为探索性结果，不作为独立最终确认。
+
 ## 5. 压缩实验顺序
 
 1. 离线只跑一次 key/KV 对齐资格验证。
