@@ -269,6 +269,40 @@ delta、bootstrap CI 和 McNemar p；不能只看点估计。V3.2 本轮不运�
 如果 hubness 明显下降但 dev strict 没有改善，下一瓶颈转向 memory/KV 语义；如果 hubness 不下降，
 下一步研究 query/key pooling 或文本构造，而不是 injection layer。
 
+### V3.3 answer-blind pooling audit
+
+V3.2 centering 将 calibration first-memory top-1 share 从 `0.4569` 降到 `0.3421`，但 selected memory
+从 23 降到 12、Gini 从 `0.9573` 升到 `0.9760`，因此未通过 stop gate。V3.3 不继续使用 centering，
+而是检查 last-token query 是否主要编码了触发符号 `,`、`.`、`\n`，从而造成 query/key 结构失配。
+
+审计从完整、已认证的 V3.1 raw calibration 日志重建 418 个 first-attempt prefix。每个 query 只做一次
+layer-24 forward，同时产生四个冻结候选：
+
+| Candidate | Key pooling | Query pooling |
+|---|---|---|
+| `key_last__query_boundary_last` | 当前 key last token | 当前 boundary token；复现基线 |
+| `key_last__query_pre_boundary` | 当前 key last token | boundary 前一个语义 token |
+| `key_mean__query_partial_mean` | `when_facing` 全 token mean | partial CoT mean，排除 boundary |
+| `key_mean__query_full_mean` | `when_facing` 全 token mean | full prefix mean，排除 boundary |
+
+运行命令：
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_3_pooling_audit.sh \
+  --v31-calibration-dir "$V31_CALIBRATION_DIR" \
+  --v31-selector-calibration "$V31_SELECTOR_ARTIFACT" \
+  "$PHASE1_DIR" "$E0_DIR" "$OUTPUT_ROOT"
+```
+
+审计首先要求 prefix hash、原 key embedding hash、原 query embedding hash 和 raw top-1 memory ID 全量
+复现，并要求聚合 concentration 与 V3.1 calibration artifact 完全一致。之后仅以 answer-blind geometry
+准入候选：top-1 share 与 Gini 下降、selected memory 数不下降、normalized entropy 上升。候选按更低
+Gini、更低 top-1 share、更多 selected memory 排序。
+
+输出目录保存 summary Markdown、完整 JSON、逐样本 top-2 JSONL 及可复用的 key/query safetensors。
+该 runner 不接受 logical split，不运行 dev-test 或 final-test；只有 audit 推荐候选后才另行实现在线
+pooling、冻结 50% margin 并运行一次 matched dev-test。
+
 ### Injection layer
 
 当前 V3 只在 layer 24 注入，不做 layer search、multi-layer 或候选层双路编译。等 V3 全流程和全量
