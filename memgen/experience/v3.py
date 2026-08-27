@@ -10,9 +10,11 @@ from memgen.experience.e1 import MemoryChoice
 
 
 V3_SYSTEM_PROFILE_SCHEMA = "experience-memory-system-profile-v3"
+V34_SYSTEM_PROFILE_SCHEMA = "experience-memory-system-profile-v3.4"
 V3_RETRIEVAL_DECISION_SCHEMA = "embedding-memory-retrieval-decision-v1"
 V3_OFFLINE_REPORT_SCHEMA = "experience-memory-v3-offline-report-v1"
 V3_GENERATION_RESULT_SCHEMA = "experience-memory-v3-generation-result-v1"
+V34_GENERATION_RESULT_SCHEMA = "experience-memory-v3.4-generation-result-v1"
 V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE = "none"
 V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED = (
     "key_bank_centroid_center_l2"
@@ -23,9 +25,11 @@ V3_RETRIEVAL_EMBEDDING_TRANSFORMS = frozenset({
 })
 V3_QUERY_POOLING_BOUNDARY_LAST = "last_valid_token"
 V3_QUERY_POOLING_PRE_BOUNDARY = "last_token_before_trigger_boundary"
+V34_QUERY_POOLING_CURRENT_TOKEN = "current_generated_token"
 V3_QUERY_POOLING_METHODS = frozenset({
     V3_QUERY_POOLING_BOUNDARY_LAST,
     V3_QUERY_POOLING_PRE_BOUNDARY,
+    V34_QUERY_POOLING_CURRENT_TOKEN,
 })
 
 
@@ -34,7 +38,7 @@ def query_embedding_token_index(*, token_count: int, pooling: str) -> int:
 
     if pooling not in V3_QUERY_POOLING_METHODS:
         raise ValueError("Unexpected V3 query_pooling")
-    offset = -1 if pooling == V3_QUERY_POOLING_BOUNDARY_LAST else -2
+    offset = -2 if pooling == V3_QUERY_POOLING_PRE_BOUNDARY else -1
     index = token_count + offset
     if index < 0 or index >= token_count:
         raise ValueError("V3 query prefix is too short for its pooling policy")
@@ -63,6 +67,7 @@ class ExperienceMemoryV3Profile:
     risk_role: str = "diagnostic_only"
     boundary_policy: str = "pre_answer_comma_period_newline"
     rearm_policy: str = "low_boundary_rearms_next_future_high_boundary"
+    rearm_low_entropy_token_count: int = 1
     replacement_policy: str = "replace_current_memory"
     duplicate_policy: str = "consume_attempt_keep_current_memory"
     abstain_policy: str = "consume_attempt_keep_current_memory"
@@ -73,7 +78,10 @@ class ExperienceMemoryV3Profile:
     schema_version: str = V3_SYSTEM_PROFILE_SCHEMA
 
     def __post_init__(self) -> None:
-        if self.schema_version != V3_SYSTEM_PROFILE_SCHEMA:
+        if self.schema_version not in {
+            V3_SYSTEM_PROFILE_SCHEMA,
+            V34_SYSTEM_PROFILE_SCHEMA,
+        }:
             raise ValueError("Unexpected V3 system profile schema")
         if self.layer_number != 24:
             raise ValueError("The current V3 system is frozen to layer 24")
@@ -82,10 +90,6 @@ class ExperienceMemoryV3Profile:
             "query_encoder_state": "pure_prefix_reencode_side_kv_disabled",
             "query_normalization": "l2",
             "retrieval_method": "exact_cosine",
-            "gate_policy": "entropy_hysteresis_rearm",
-            "risk_role": "diagnostic_only",
-            "boundary_policy": "pre_answer_comma_period_newline",
-            "rearm_policy": "low_boundary_rearms_next_future_high_boundary",
             "replacement_policy": "replace_current_memory",
             "duplicate_policy": "consume_attempt_keep_current_memory",
             "abstain_policy": "consume_attempt_keep_current_memory",
@@ -96,6 +100,37 @@ class ExperienceMemoryV3Profile:
         for field_name, expected_value in expected.items():
             if getattr(self, field_name) != expected_value:
                 raise ValueError(f"Unexpected V3 {field_name}")
+        if self.schema_version == V3_SYSTEM_PROFILE_SCHEMA:
+            versioned_expected = {
+                "gate_policy": "entropy_hysteresis_rearm",
+                "risk_role": "diagnostic_only",
+                "boundary_policy": "pre_answer_comma_period_newline",
+                "rearm_policy": (
+                    "low_boundary_rearms_next_future_high_boundary"
+                ),
+                "rearm_low_entropy_token_count": 1,
+            }
+        else:
+            versioned_expected = {
+                "query_pooling": V34_QUERY_POOLING_CURRENT_TOKEN,
+                "gate_policy": "continuous_token_entropy_risk_hysteresis",
+                "risk_role": "online_joint_control",
+                "boundary_policy": "none_pre_answer_every_generated_token",
+                "rearm_policy": (
+                    "two_consecutive_low_entropy_tokens_rearm_without_trigger"
+                ),
+                "rearm_low_entropy_token_count": 2,
+            }
+        for field_name, expected_value in versioned_expected.items():
+            if getattr(self, field_name) != expected_value:
+                raise ValueError(f"Unexpected V3 {field_name}")
+        if (
+            self.schema_version == V3_SYSTEM_PROFILE_SCHEMA
+            and self.query_pooling == V34_QUERY_POOLING_CURRENT_TOKEN
+        ):
+            raise ValueError(
+                "V3.4 current-token pooling requires the V3.4 profile schema"
+            )
         if self.query_pooling not in V3_QUERY_POOLING_METHODS:
             raise ValueError("Unexpected V3 query_pooling")
         if self.retrieval_embedding_transform not in (
@@ -139,8 +174,40 @@ class ExperienceMemoryV3Profile:
         }
 
     @classmethod
+    def continuous_token_joint(
+        cls,
+        *,
+        retrieval_embedding_transform: str = (
+            V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE
+        ),
+        retrieval_abstention_policy: str = "disabled",
+        retrieval_min_top1_top2_margin: float | None = None,
+    ) -> "ExperienceMemoryV3Profile":
+        """Build the frozen V3.4 no-boundary, joint entropy-risk profile."""
+
+        return cls(
+            query_pooling=V34_QUERY_POOLING_CURRENT_TOKEN,
+            retrieval_embedding_transform=retrieval_embedding_transform,
+            retrieval_abstention_policy=retrieval_abstention_policy,
+            retrieval_min_top1_top2_margin=(
+                retrieval_min_top1_top2_margin
+            ),
+            gate_policy="continuous_token_entropy_risk_hysteresis",
+            risk_role="online_joint_control",
+            boundary_policy="none_pre_answer_every_generated_token",
+            rearm_policy=(
+                "two_consecutive_low_entropy_tokens_rearm_without_trigger"
+            ),
+            rearm_low_entropy_token_count=2,
+            schema_version=V34_SYSTEM_PROFILE_SCHEMA,
+        )
+
+    @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ExperienceMemoryV3Profile":
-        if value.get("schema_version") != V3_SYSTEM_PROFILE_SCHEMA:
+        if value.get("schema_version") not in {
+            V3_SYSTEM_PROFILE_SCHEMA,
+            V34_SYSTEM_PROFILE_SCHEMA,
+        }:
             raise ValueError("Missing or unexpected V3 system profile schema")
         data = dict(value)
         multiplier = data.pop("memory_odds_multiplier", None)

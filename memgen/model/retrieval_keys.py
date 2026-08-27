@@ -632,6 +632,13 @@ class EmbeddingMemoryRetriever:
             "query_embedding_causal_context_token_count": (
                 embedding_token_index + 1
             ),
+            "trigger_observation_token_index": boundary_token_index,
+            "trigger_observation_token_id": int(token_ids[boundary_token_index]),
+            "trigger_observation_included_in_pooling": (
+                embedding_token_index == boundary_token_index
+            ),
+            # Legacy field names retained so V3.1--V3.3 reports remain
+            # readable by the same authenticated analysis code.
             "trigger_boundary_token_index": boundary_token_index,
             "trigger_boundary_token_id": int(token_ids[boundary_token_index]),
             "trigger_boundary_excluded_from_pooling": (

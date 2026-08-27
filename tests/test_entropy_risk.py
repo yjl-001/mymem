@@ -7,10 +7,14 @@ from memgen.experience.phase1 import ROLLOUT_SCHEMA, build_verified_experiences
 from memgen.experience.risk import (
     approved_experiences,
     binary_average_precision,
+    binary_balanced_accuracy,
     binary_roc_auc,
     deterministic_train_partition,
     entropy_quantile,
     entropy_transition_label,
+    select_recovery_horizon,
+    stable_low_recovery_offset,
+    token_entropy_transition_label,
 )
 
 
@@ -126,6 +130,66 @@ class EntropyRiskContractTests(unittest.TestCase):
             binary_average_precision([0, 0, 1, 1], [0.1, 0.2, 0.8, 0.9]),
             1.0,
         )
+        self.assertEqual(
+            binary_balanced_accuracy([0, 0, 1, 1], [0, 0, 1, 1]),
+            1.0,
+        )
+
+    def test_token_label_requires_stable_low_run_and_censors_tail(self) -> None:
+        entropies = [5.0, 4.0, 2.0, 1.5, 5.5, 4.5]
+        self.assertEqual(
+            stable_low_recovery_offset(
+                entropies,
+                current_index=0,
+                low_threshold=2.0,
+                stable_token_count=2,
+            ),
+            3,
+        )
+        self.assertEqual(
+            token_entropy_transition_label(
+                entropies,
+                current_index=0,
+                high_threshold=5.0,
+                low_threshold=2.0,
+                recovery_horizon=4,
+            ),
+            "recovery",
+        )
+        self.assertIsNone(
+            token_entropy_transition_label(
+                entropies,
+                current_index=4,
+                high_threshold=5.0,
+                low_threshold=2.0,
+                recovery_horizon=3,
+            )
+        )
+        self.assertEqual(
+            token_entropy_transition_label(
+                [5.0, 4.0, 4.0, 4.0],
+                current_index=0,
+                high_threshold=5.0,
+                low_threshold=2.0,
+                recovery_horizon=3,
+            ),
+            "persistence",
+        )
+
+    def test_recovery_horizon_is_train_sequence_derived_and_capped(self) -> None:
+        result = select_recovery_horizon(
+            [
+                [5.0, 1.0, 1.0],
+                [5.0, 4.0, 4.0, 1.0, 1.0],
+            ],
+            high_threshold=5.0,
+            low_threshold=1.0,
+            stable_token_count=2,
+            quantile=0.75,
+            maximum_horizon=4,
+        )
+        self.assertEqual(result["recovery_horizon"], 4)
+        self.assertEqual(result["recovered_event_count"], 2)
 
 
 if __name__ == "__main__":

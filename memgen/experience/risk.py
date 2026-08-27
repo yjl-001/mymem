@@ -11,6 +11,7 @@ from memgen.experience.phase1 import canonical_json_sha256
 
 
 ENTROPY_RISK_ARTIFACT_SCHEMA = "entropy-risk-gate-artifact-v3"
+TOKEN_ENTROPY_RISK_ARTIFACT_SCHEMA = "token-entropy-risk-gate-artifact-v3.4"
 RISK_ELIGIBLE_EXPERIENCE_TYPES = frozenset({
     "answer_correctness",
     "format_compliance",
@@ -142,6 +143,149 @@ def entropy_transition_label(
     return "recovery" if next_entropy <= low_threshold else "persistence"
 
 
+def stable_low_recovery_offset(
+    entropies: Sequence[float],
+    *,
+    current_index: int,
+    low_threshold: float,
+    stable_token_count: int,
+    maximum_horizon: int | None = None,
+) -> int | None:
+    """Return the offset where a stable future low-entropy run completes."""
+
+    if (
+        not entropies
+        or current_index < 0
+        or current_index >= len(entropies)
+        or stable_token_count <= 0
+        or not math.isfinite(low_threshold)
+        or (
+            maximum_horizon is not None
+            and maximum_horizon <= 0
+        )
+    ):
+        raise ValueError("Invalid stable-low recovery configuration")
+    values = [float(value) for value in entropies]
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Entropy values must be finite")
+    last_index = len(values) - 1
+    if maximum_horizon is not None:
+        last_index = min(last_index, current_index + maximum_horizon)
+    streak = 0
+    for index in range(current_index + 1, last_index + 1):
+        if values[index] <= low_threshold:
+            streak += 1
+            if streak >= stable_token_count:
+                return index - current_index
+        else:
+            streak = 0
+    return None
+
+
+def token_entropy_transition_label(
+    entropies: Sequence[float],
+    *,
+    current_index: int,
+    high_threshold: float,
+    low_threshold: float,
+    recovery_horizon: int,
+    stable_token_count: int = 2,
+) -> str | None:
+    """Label a high token from its future stable-low recovery behavior.
+
+    Recovery is observable as soon as the stable-low run completes. A token
+    without recovery is persistence only when the whole frozen horizon is
+    available; otherwise it is right-censored and excluded.
+    """
+
+    if (
+        high_threshold < low_threshold
+        or recovery_horizon <= 0
+        or stable_token_count <= 0
+    ):
+        raise ValueError("Invalid token entropy-transition configuration")
+    if current_index < 0 or current_index >= len(entropies):
+        raise ValueError("Token entropy-transition index is out of range")
+    current = float(entropies[current_index])
+    if not all(math.isfinite(value) for value in (
+        current, high_threshold, low_threshold
+    )):
+        raise ValueError("Token entropy-transition values must be finite")
+    if current < high_threshold:
+        return None
+    recovery = stable_low_recovery_offset(
+        entropies,
+        current_index=current_index,
+        low_threshold=low_threshold,
+        stable_token_count=stable_token_count,
+        maximum_horizon=recovery_horizon,
+    )
+    if recovery is not None:
+        return "recovery"
+    if len(entropies) - current_index - 1 < recovery_horizon:
+        return None
+    return "persistence"
+
+
+def select_recovery_horizon(
+    entropy_sequences: Sequence[Sequence[float]],
+    *,
+    high_threshold: float,
+    low_threshold: float,
+    stable_token_count: int = 2,
+    quantile: float = 0.75,
+    maximum_horizon: int = 32,
+) -> dict[str, Any]:
+    """Choose an answer-blind horizon from recovered train burst lengths."""
+
+    if (
+        not entropy_sequences
+        or stable_token_count <= 0
+        or maximum_horizon < stable_token_count
+        or not 0.0 <= quantile <= 1.0
+        or not all(math.isfinite(value) for value in (
+            high_threshold, low_threshold
+        ))
+        or high_threshold < low_threshold
+    ):
+        raise ValueError("Recovery-horizon selection needs token sequences")
+    offsets: list[int] = []
+    high_event_count = 0
+    for sequence in entropy_sequences:
+        values = [float(value) for value in sequence]
+        for index, entropy in enumerate(values):
+            if entropy < high_threshold:
+                continue
+            high_event_count += 1
+            offset = stable_low_recovery_offset(
+                values,
+                current_index=index,
+                low_threshold=low_threshold,
+                stable_token_count=stable_token_count,
+            )
+            if offset is not None:
+                offsets.append(offset)
+    if not offsets:
+        raise ValueError("No recovered high-entropy bursts define a horizon")
+    raw = int(math.ceil(entropy_quantile(offsets, quantile)))
+    horizon = min(maximum_horizon, max(stable_token_count, raw))
+    return {
+        "recovery_horizon": horizon,
+        "selection_quantile": float(quantile),
+        "maximum_horizon": maximum_horizon,
+        "stable_low_token_count": stable_token_count,
+        "train_high_event_count": high_event_count,
+        "recovered_event_count": len(offsets),
+        "recovered_offset_summary": {
+            "min": min(offsets),
+            "median": entropy_quantile(offsets, 0.5),
+            "p75": entropy_quantile(offsets, 0.75),
+            "p95": entropy_quantile(offsets, 0.95),
+            "max": max(offsets),
+        },
+    }
+
+
 def deterministic_train_partition(
     identifier: str, *, seed: int, train_fraction: float
 ) -> bool:
@@ -216,3 +360,26 @@ def binary_average_precision(
             result += (group_positives / positives) * precision
         index = end
     return result
+
+
+def binary_balanced_accuracy(
+    labels: Sequence[int | bool],
+    predictions: Sequence[int | bool],
+) -> float:
+    """Return the mean of positive recall and negative recall."""
+
+    if len(labels) != len(predictions) or not labels:
+        raise ValueError("labels and predictions must be non-empty and aligned")
+    pairs = [
+        (bool(label), bool(prediction))
+        for label, prediction in zip(labels, predictions)
+    ]
+    positives = sum(label for label, _ in pairs)
+    negatives = len(pairs) - positives
+    if positives == 0 or negatives == 0:
+        raise ValueError("Balanced accuracy requires both labels")
+    true_positives = sum(label and prediction for label, prediction in pairs)
+    true_negatives = sum(
+        not label and not prediction for label, prediction in pairs
+    )
+    return 0.5 * (true_positives / positives + true_negatives / negatives)

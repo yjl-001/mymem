@@ -102,6 +102,22 @@ def summarize_v3_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 int(value["memory_attention_step_count"])
                 for value in attempt_values
             ),
+            "gate_observation_count": sum(
+                int(value.get("gate_observation_count", 0))
+                for value in attempt_values
+            ),
+            "joint_trigger_qualified_count": sum(
+                int(value.get("joint_trigger_qualified_count", 0))
+                for value in attempt_values
+            ),
+            "native_gate_observation_count": sum(
+                int(value.get("native_gate_observation_count", 0))
+                for value in attempt_values
+            ),
+            "memory_conditioned_gate_observation_count": sum(
+                int(value.get("memory_conditioned_gate_observation_count", 0))
+                for value in attempt_values
+            ),
         },
         "metric_contract": {
             "task_metric": "strict_official_gsm8k_first_boxed",

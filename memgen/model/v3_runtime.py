@@ -12,6 +12,8 @@ import torch
 
 from memgen.experience.phase1 import canonical_json_sha256
 from memgen.experience.v3 import (
+    V34_GENERATION_RESULT_SCHEMA,
+    V34_SYSTEM_PROFILE_SCHEMA,
     V3_GENERATION_RESULT_SCHEMA,
     EmbeddingRetrievalDecision,
     ExperienceMemoryV3Profile,
@@ -48,6 +50,7 @@ class EntropyHysteresisConfig:
     low_entropy_threshold: float
     risk_threshold: float
     risk_role: str = "diagnostic_only"
+    rearm_low_entropy_token_count: int = 1
 
     def __post_init__(self) -> None:
         if self.layer_number != 24 or self.sink_token_count < 0:
@@ -60,15 +63,17 @@ class EntropyHysteresisConfig:
             raise ValueError("V3 hysteresis thresholds must be finite")
         if self.low_entropy_threshold > self.high_entropy_threshold:
             raise ValueError("V3 low entropy threshold exceeds the high threshold")
-        if self.risk_role != "diagnostic_only":
-            raise ValueError("V3 risk score must remain diagnostic-only")
+        if self.risk_role not in {"diagnostic_only", "online_joint_control"}:
+            raise ValueError("Unexpected V3 risk-control role")
+        if self.rearm_low_entropy_token_count <= 0:
+            raise ValueError("V3 re-arm token count must be positive")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 class EntropyHysteresisGate:
-    """Reuse the qualified observer/centers but gate only on entropy."""
+    """Qualified entropy hysteresis with diagnostic or joint risk control."""
 
     def __init__(
         self,
@@ -116,8 +121,56 @@ class EntropyHysteresisGate:
             ),
         )
 
+    @classmethod
+    def from_token_artifact(
+        cls, artifact: Mapping[str, Any]
+    ) -> "EntropyHysteresisGate":
+        from memgen.experience.risk import TOKEN_ENTROPY_RISK_ARTIFACT_SCHEMA
+
+        value = dict(artifact)
+        if (
+            value.get("schema_version") != TOKEN_ENTROPY_RISK_ARTIFACT_SCHEMA
+            or value.get("status") != "passed"
+        ):
+            raise ValueError("V3.4 requires a qualified token-risk artifact")
+        construction = value.get("construction", {})
+        qualification = value.get("qualification", {})
+        if (
+            construction.get("observation_scope")
+            != "every_pre_answer_generated_token"
+            or construction.get("label_policy")
+            != "stable_low_recovery_within_frozen_horizon"
+            or int(construction.get("stable_low_token_count", -1)) != 2
+            or qualification.get("passed") is not True
+        ):
+            raise ValueError("V3.4 token-risk construction did not qualify")
+        diagnostic_gate = EntropyRiskGate.from_artifact(value)
+        low = construction.get("low_entropy_threshold")
+        if not isinstance(low, (int, float)) or isinstance(low, bool):
+            raise ValueError("Token-risk artifact has no frozen low threshold")
+        return cls(
+            diagnostic_gate=diagnostic_gate,
+            config=EntropyHysteresisConfig(
+                layer_number=diagnostic_gate.config.layer_number,
+                sink_token_count=diagnostic_gate.config.sink_token_count,
+                high_entropy_threshold=diagnostic_gate.config.entropy_threshold,
+                low_entropy_threshold=float(low),
+                risk_threshold=diagnostic_gate.config.risk_threshold,
+                risk_role="online_joint_control",
+                rearm_low_entropy_token_count=2,
+            ),
+        )
+
     def probe(self, **kwargs: Any) -> GateProbe:
         return self.diagnostic_gate.probe(**kwargs)
+
+    def trigger_qualified(self, probe: GateProbe) -> bool:
+        if probe.entropy < self.config.high_entropy_threshold:
+            return False
+        return (
+            self.config.risk_role == "diagnostic_only"
+            or probe.risk_score > self.config.risk_threshold
+        )
 
 
 @dataclass(frozen=True)
@@ -138,9 +191,23 @@ class V3BoundaryTrace:
     retrieval_attempt_count_after: int
     active_memory_id_before: str | None
     active_memory_id_after: str | None
+    trace_scope: str
+    vocabulary_entropy: float
+    top1_top2_logit_margin: float
+    low_entropy_streak_before: int
+    low_entropy_streak_after: int
+    joint_trigger_qualified: bool
+    active_memory_conditioned: bool
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        value.update({
+            "generated_observation_index": self.generated_boundary_index,
+            "observation_token_id": self.boundary_token_id,
+            "observation_token_text": self.boundary_token_text,
+            "affects_generated_token_index": self.generated_boundary_index + 1,
+        })
+        return value
 
 
 @dataclass(frozen=True)
@@ -164,9 +231,15 @@ class V3RetrievalAttemptTrace:
     activation_first_step_logits_kl: float | None
     activation_first_step_top1_changed: bool | None
     activation_baseline_first_token_id: int | None
+    affects_generated_token_index: int
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
+        value.update({
+            "generated_observation_index": self.generated_boundary_index,
+            "observation_token_id": self.boundary_token_id,
+            "observation_token_text": self.boundary_token_text,
+        })
         value["retrieval_decision"] = self.retrieval_decision.to_dict()
         return value
 
@@ -178,6 +251,7 @@ class V3MemoryTransition:
     previous_memory_id: str | None
     next_memory_id: str
     attempt_number: int
+    affects_generated_token_index: int
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -236,6 +310,18 @@ class V3GenerationResult:
             attempt.outcome == "duplicate" for attempt in self.retrieval_attempts
         )
 
+    @property
+    def native_gate_observation_count(self) -> int:
+        return sum(
+            not trace.active_memory_conditioned for trace in self.boundary_traces
+        )
+
+    @property
+    def memory_conditioned_gate_observation_count(self) -> int:
+        return sum(
+            trace.active_memory_conditioned for trace in self.boundary_traces
+        )
+
     def _memory_activation_spans(self) -> list[dict[str, Any]]:
         spans: list[dict[str, Any]] = []
         for item in self.attention_traces:
@@ -271,6 +357,12 @@ class V3GenerationResult:
                 list(self.completion_token_ids)
             ),
             "generated_token_count": self.generated_token_count,
+            "gate_trace_storage_field": "boundary_traces",
+            "gate_trace_scope": (
+                self.boundary_traces[0].trace_scope
+                if self.boundary_traces
+                else None
+            ),
             "boundary_traces": [trace.to_dict() for trace in self.boundary_traces],
             "retrieval_attempts": [
                 attempt.to_dict() for attempt in self.retrieval_attempts
@@ -289,6 +381,17 @@ class V3GenerationResult:
                 "replacement_count": self.replacement_count,
                 "duplicate_count": self.duplicate_count,
                 "memory_attention_step_count": len(self.attention_traces),
+                "gate_observation_count": len(self.boundary_traces),
+                "joint_trigger_qualified_count": sum(
+                    trace.joint_trigger_qualified
+                    for trace in self.boundary_traces
+                ),
+                "native_gate_observation_count": (
+                    self.native_gate_observation_count
+                ),
+                "memory_conditioned_gate_observation_count": (
+                    self.memory_conditioned_gate_observation_count
+                ),
             },
         }
 
@@ -316,6 +419,12 @@ class OnlineExperienceMemorySystemV3:
             raise ValueError("V3 online generation needs a positive token budget")
         if gate.config.layer_number != profile.layer_number:
             raise ValueError("V3 gate and profile layers differ")
+        if (
+            gate.config.risk_role != profile.risk_role
+            or gate.config.rearm_low_entropy_token_count
+            != profile.rearm_low_entropy_token_count
+        ):
+            raise ValueError("V3 gate and profile control policies differ")
         if query_encoder.layer_number != profile.layer_number:
             raise ValueError("V3 query encoder and profile layers differ")
         if query_encoder.query_pooling != profile.query_pooling:
@@ -353,6 +462,54 @@ class OnlineExperienceMemorySystemV3:
     def _is_delimiter(self, token_id: int) -> bool:
         text = self.tokenizer.decode([int(token_id)], skip_special_tokens=False)
         return text.rstrip(" \t").endswith((",", ".", "\n"))
+
+    def _should_observe(self, *, generation_step: int, state: str, token_id: int) -> bool:
+        if generation_step <= 0 or state == "CLOSED":
+            return False
+        if self.profile.schema_version == V34_SYSTEM_PROFILE_SCHEMA:
+            return True
+        return self._is_delimiter(token_id)
+
+    @staticmethod
+    def _logit_diagnostics(logits: torch.Tensor) -> tuple[float, float]:
+        values = logits[0, -1, :].detach().float()
+        log_probabilities = torch.log_softmax(values, dim=-1)
+        probabilities = log_probabilities.exp()
+        vocabulary_entropy = float(
+            (-(probabilities * log_probabilities).sum()).item()
+        )
+        top2 = torch.topk(values, k=2).values
+        margin = float((top2[0] - top2[1]).item())
+        if not math.isfinite(vocabulary_entropy) or not math.isfinite(margin):
+            raise RuntimeError("V3 logit diagnostics are non-finite")
+        return vocabulary_entropy, margin
+
+    @staticmethod
+    def _cache_sequence_length(cache: Any) -> int | None:
+        if cache is None:
+            return 0
+        getter = getattr(cache, "get_seq_length", None)
+        if callable(getter):
+            return int(getter())
+        try:
+            return int(cache[0][0].shape[-2])
+        except (IndexError, KeyError, TypeError, AttributeError):
+            return None
+
+    @classmethod
+    def _restore_cache_length(cls, cache: Any, *, expected_length: int) -> Any:
+        """Rollback a mutable live cache after a counterfactual probe."""
+
+        actual = cls._cache_sequence_length(cache)
+        if actual == expected_length:
+            return cache
+        crop = getattr(cache, "crop", None)
+        if actual is None or actual < expected_length or not callable(crop):
+            raise RuntimeError("Unable to restore V3.4 live cache after probing")
+        crop(expected_length)
+        if cls._cache_sequence_length(cache) != expected_length:
+            raise RuntimeError("V3.4 live cache rollback length drifted")
+        return cache
 
     def _load_selected_memory(
         self, decision: EmbeddingRetrievalDecision
@@ -435,6 +592,7 @@ class OnlineExperienceMemorySystemV3:
         attention_traces: list[V3AttentionStepTrace] = []
         query_embeddings: list[torch.Tensor] = []
         answer_marker_seen = False
+        low_entropy_streak = 0
         self.controller.deactivate()
         self.controller.clear_traces()
         try:
@@ -450,28 +608,43 @@ class OnlineExperienceMemorySystemV3:
 
                 trace_start = len(self.controller.traces)
                 probe: GateProbe | None = None
-                if (
-                    generation_step > 0
-                    and state != "CLOSED"
-                    and self._is_delimiter(ids[-1])
+                if self._should_observe(
+                    generation_step=generation_step,
+                    state=state,
+                    token_id=int(ids[-1]),
                 ):
+                    past_length_before_probe: int | None = None
+                    if self.profile.schema_version == V34_SYSTEM_PROFILE_SCHEMA:
+                        past_length_before_probe = self._cache_sequence_length(past)
+                        if past_length_before_probe is None:
+                            raise RuntimeError(
+                                "Unable to audit V3.4 native cache length"
+                            )
                     probe = self.gate.probe(
                         model=self.model,
                         boundary_token=full[:, -1:],
                         attention_mask=attention_mask,
                         past_key_values=past,
+                        clone_past_key_values=(
+                            self.profile.schema_version
+                            != V34_SYSTEM_PROFILE_SCHEMA
+                        ),
                     )
                     state_before = state
                     attempts_before = attempt_count
                     memory_before = (
                         current_memory.memory_id if current_memory is not None else None
                     )
+                    low_streak_before = low_entropy_streak
                     action = "observed"
                     output = probe.output
+                    vocabulary_entropy, logit_margin = self._logit_diagnostics(
+                        probe.output.logits
+                    )
+                    joint_trigger_qualified = self.gate.trigger_qualified(probe)
 
-                    if state == "ARMED" and (
-                        probe.entropy >= self.gate.config.high_entropy_threshold
-                    ):
+                    if state == "ARMED" and joint_trigger_qualified:
+                        low_entropy_streak = 0
                         attempt_started = time.perf_counter()
                         attempt_count += 1
                         encoding_started = time.perf_counter()
@@ -511,11 +684,22 @@ class OnlineExperienceMemorySystemV3:
                             # occurs, so retain only the new-memory actual-path trace.
                             self.controller.truncate_traces(trace_start)
                             self.controller.activate(next_memory)
+                            treatment_past = (
+                                self._restore_cache_length(
+                                    past,
+                                    expected_length=int(
+                                        past_length_before_probe
+                                    ),
+                                )
+                                if self.profile.schema_version
+                                == V34_SYSTEM_PROFILE_SCHEMA
+                                else clone_cache(past)
+                            )
                             activation_started = time.perf_counter()
                             treatment = self.model(
                                 input_ids=full[:, -1:],
                                 attention_mask=attention_mask,
-                                past_key_values=clone_cache(past),
+                                past_key_values=treatment_past,
                                 use_cache=True,
                                 return_dict=True,
                             )
@@ -549,6 +733,9 @@ class OnlineExperienceMemorySystemV3:
                                 previous_memory_id=memory_before,
                                 next_memory_id=next_memory.memory_id,
                                 attempt_number=attempt_count,
+                                affects_generated_token_index=(
+                                    len(ids) - prompt_length
+                                ),
                             ))
                             current_memory = next_memory
                         state = (
@@ -598,17 +785,31 @@ class OnlineExperienceMemorySystemV3:
                             activation_first_step_logits_kl=activation_kl,
                             activation_first_step_top1_changed=top1_changed,
                             activation_baseline_first_token_id=baseline_first_token,
+                            affects_generated_token_index=(
+                                len(ids) - prompt_length
+                            ),
                         ))
                     elif state == "DISARMED" and (
                         probe.entropy <= self.gate.config.low_entropy_threshold
                     ):
-                        state = "ARMED"
-                        action = "rearmed"
+                        low_entropy_streak += 1
+                        if (
+                            low_entropy_streak
+                            >= self.gate.config.rearm_low_entropy_token_count
+                        ):
+                            state = "ARMED"
+                            action = "rearmed"
+                            low_entropy_streak = 0
+                        else:
+                            action = "observed_disarmed_low_streak"
                     elif state == "DISARMED":
+                        low_entropy_streak = 0
                         action = "observed_disarmed"
                     elif state == "EXHAUSTED":
+                        low_entropy_streak = 0
                         action = "observed_exhausted"
                     else:
+                        low_entropy_streak = 0
                         action = "observed_armed_below_high"
 
                     boundary_traces.append(V3BoundaryTrace(
@@ -638,6 +839,18 @@ class OnlineExperienceMemorySystemV3:
                             if current_memory is not None
                             else None
                         ),
+                        trace_scope=(
+                            "every_pre_answer_generated_token"
+                            if self.profile.schema_version
+                            == V34_SYSTEM_PROFILE_SCHEMA
+                            else "trigger_boundary_only"
+                        ),
+                        vocabulary_entropy=vocabulary_entropy,
+                        top1_top2_logit_margin=logit_margin,
+                        low_entropy_streak_before=low_streak_before,
+                        low_entropy_streak_after=low_entropy_streak,
+                        joint_trigger_qualified=joint_trigger_qualified,
+                        active_memory_conditioned=memory_before is not None,
                     ))
                 else:
                     kwargs: dict[str, Any] = {
@@ -681,4 +894,9 @@ class OnlineExperienceMemorySystemV3:
             ),
             answer_marker_seen=answer_marker_seen,
             query_embeddings=tuple(query_embeddings),
+            schema_version=(
+                V34_GENERATION_RESULT_SCHEMA
+                if self.profile.schema_version == V34_SYSTEM_PROFILE_SCHEMA
+                else V3_GENERATION_RESULT_SCHEMA
+            ),
         )

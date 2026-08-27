@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from memgen.experience.phase1 import canonical_json_sha256
 from memgen.experience.v3 import (
+    V34_GENERATION_RESULT_SCHEMA,
     V3_QUERY_POOLING_BOUNDARY_LAST,
     V3_QUERY_POOLING_METHODS,
     V3_QUERY_POOLING_PRE_BOUNDARY,
@@ -37,6 +38,10 @@ from memgen.experience.v3 import (
 EVALUATION_PROFILE_SCHEMA = "experience-memory-v3-evaluation-profile-v1"
 EVALUATION_ROW_SCHEMA = "experience-memory-v3-evaluation-row-v1"
 GENERATION_RESULT_SCHEMA = "experience-memory-v3-generation-result-v1"
+GENERATION_RESULT_SCHEMAS = frozenset({
+    GENERATION_RESULT_SCHEMA,
+    V34_GENERATION_RESULT_SCHEMA,
+})
 ANALYSIS_REPORT_SCHEMA = "experience-memory-v3-analysis-report-v1"
 
 
@@ -278,6 +283,7 @@ def extract_sample(
     row: Mapping[str, Any],
     *,
     expected_profile_sha256: str,
+    expected_risk_role: str,
     audit: IntegrityAudit,
     streaming: StreamingDiagnostics,
     validate_hash: bool,
@@ -350,7 +356,7 @@ def extract_sample(
     runtime = v3.get("runtime_trace", {})
     diagnostics = v3.get("online_diagnostics", {})
     audit.check(
-        runtime.get("schema_version") == GENERATION_RESULT_SCHEMA,
+        runtime.get("schema_version") in GENERATION_RESULT_SCHEMAS,
         "runtime_trace_schema_matches",
         sample_id,
     )
@@ -716,8 +722,8 @@ def extract_sample(
     )
     for boundary in boundaries:
         audit.check(
-            boundary.get("risk_role") == "diagnostic_only",
-            "risk_role_is_diagnostic_only",
+            boundary.get("risk_role") == expected_risk_role,
+            "risk_role_matches_system_profile",
             sample_id,
         )
         audit.check(
@@ -728,6 +734,88 @@ def extract_sample(
             "boundary_entropy_and_risk_are_finite",
             sample_id,
         )
+        if expected_risk_role == "online_joint_control":
+            audit.check(
+                boundary.get("trace_scope")
+                == "every_pre_answer_generated_token"
+                and math.isfinite(
+                    float(boundary.get("vocabulary_entropy", float("nan")))
+                )
+                and math.isfinite(
+                    float(
+                        boundary.get(
+                            "top1_top2_logit_margin", float("nan")
+                        )
+                    )
+                ),
+                "continuous_token_diagnostics_are_complete",
+                sample_id,
+            )
+    if expected_risk_role == "online_joint_control":
+        audit.check(
+            [
+                int(item.get("generated_observation_index", -1))
+                for item in boundaries
+            ]
+            == list(range(len(boundaries))),
+            "continuous_gate_observation_indices_are_contiguous",
+            sample_id,
+        )
+        conditioned_count = sum(
+            item.get("active_memory_conditioned") is True
+            for item in boundaries
+        )
+        qualified_count = sum(
+            item.get("joint_trigger_qualified") is True
+            for item in boundaries
+        )
+        audit.check(
+            int(diagnostics.get("gate_observation_count", -1))
+            == len(boundaries)
+            and int(
+                diagnostics.get(
+                    "memory_conditioned_gate_observation_count", -1
+                )
+            )
+            == conditioned_count
+            and int(
+                diagnostics.get("native_gate_observation_count", -1)
+            )
+            == len(boundaries) - conditioned_count
+            and int(
+                diagnostics.get("joint_trigger_qualified_count", -1)
+            )
+            == qualified_count,
+            "continuous_gate_diagnostic_counts_match",
+            sample_id,
+        )
+        for item in boundaries:
+            action = str(item.get("action", ""))
+            if action == "rearmed":
+                audit.check(
+                    int(item.get("low_entropy_streak_before", -1)) == 1
+                    and int(item.get("low_entropy_streak_after", -1)) == 0
+                    and item.get("state_before") == "DISARMED"
+                    and item.get("state_after") == "ARMED"
+                    and float(item.get("entropy", float("inf")))
+                    <= float(item.get("low_entropy_threshold", float("-inf"))),
+                    "continuous_rearm_requires_second_low_token",
+                    sample_id,
+                )
+            if action == "retrieval_attempt":
+                audit.check(
+                    item.get("joint_trigger_qualified") is True
+                    and float(item.get("entropy", float("-inf")))
+                    >= float(item.get("high_entropy_threshold", float("inf")))
+                    and float(
+                        item.get("persistence_risk_score", float("-inf"))
+                    )
+                    > float(
+                        item.get("persistence_risk_threshold", float("inf"))
+                    ),
+                    "continuous_attempt_requires_joint_entropy_risk",
+                    sample_id,
+                )
     first_trigger_entropy = None
     first_trigger_boundary_index = None
     if attempts:
@@ -1406,6 +1494,11 @@ def main() -> None:
         raise ValueError("Invalid analysis limits")
     profile = load_run_profile(args.run_profile)
     expected_profile_sha256 = str(profile["profile_sha256"])
+    expected_risk_role = str(
+        profile.get("system_profile", {}).get(
+            "risk_role", "diagnostic_only"
+        )
+    )
     expected_count = int(profile.get("selected_sample_count", -1))
     audit = IntegrityAudit()
     streaming = StreamingDiagnostics()
@@ -1424,6 +1517,7 @@ def main() -> None:
             sample = extract_sample(
                 row,
                 expected_profile_sha256=expected_profile_sha256,
+                expected_risk_role=expected_risk_role,
                 audit=audit,
                 streaming=streaming,
                 validate_hash=not args.skip_row_hash_validation,

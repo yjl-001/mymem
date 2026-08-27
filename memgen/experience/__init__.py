@@ -13,6 +13,7 @@ from memgen.experience.phase1 import (
 from memgen.experience.risk import (
     RISK_ELIGIBLE_EXPERIENCE_TYPES,
     ENTROPY_RISK_ARTIFACT_SCHEMA,
+    TOKEN_ENTROPY_RISK_ARTIFACT_SCHEMA,
     approved_experiences,
 )
 from memgen.experience.memory import (
@@ -55,6 +56,9 @@ from memgen.experience.system import (
     SemanticRetrievalDecision,
 )
 from memgen.experience.v3 import (
+    V34_GENERATION_RESULT_SCHEMA,
+    V34_QUERY_POOLING_CURRENT_TOKEN,
+    V34_SYSTEM_PROFILE_SCHEMA,
     V3_GENERATION_RESULT_SCHEMA,
     V3_OFFLINE_REPORT_SCHEMA,
     V3_RETRIEVAL_DECISION_SCHEMA,
@@ -75,6 +79,7 @@ __all__ = [
     "write_jsonl",
     "RISK_ELIGIBLE_EXPERIENCE_TYPES",
     "ENTROPY_RISK_ARTIFACT_SCHEMA",
+    "TOKEN_ENTROPY_RISK_ARTIFACT_SCHEMA",
     "approved_experiences",
     "ApprovedMemorySourceSelector",
     "MemoryArtifactAuditor",
@@ -108,6 +113,9 @@ __all__ = [
     "SemanticMemoryRetriever",
     "SemanticRetrievalDecision",
     "V3_GENERATION_RESULT_SCHEMA",
+    "V34_GENERATION_RESULT_SCHEMA",
+    "V34_QUERY_POOLING_CURRENT_TOKEN",
+    "V34_SYSTEM_PROFILE_SCHEMA",
     "V3_OFFLINE_REPORT_SCHEMA",
     "V3_RETRIEVAL_DECISION_SCHEMA",
     "V3_SYSTEM_PROFILE_SCHEMA",

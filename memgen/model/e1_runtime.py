@@ -224,6 +224,7 @@ class EntropyRiskGate:
         boundary_token: torch.Tensor,
         attention_mask: torch.Tensor,
         past_key_values: Any,
+        clone_past_key_values: bool = True,
     ) -> GateProbe:
         observer = SDPAAttentionEntropyObserver(
             model=model,
@@ -235,7 +236,11 @@ class EntropyRiskGate:
                     input_ids=boundary_token,
                     attention_mask=attention_mask,
                     output_hidden_states=True,
-                    past_key_values=clone_cache(past_key_values),
+                    past_key_values=(
+                        clone_cache(past_key_values)
+                        if clone_past_key_values
+                        else past_key_values
+                    ),
                     use_cache=True,
                     return_dict=True,
                 )

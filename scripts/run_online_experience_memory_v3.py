@@ -25,9 +25,13 @@ from memgen.experience.phase1 import (
     iter_jsonl,
     text_sha256,
 )
-from memgen.experience.risk import ENTROPY_RISK_ARTIFACT_SCHEMA
+from memgen.experience.risk import (
+    ENTROPY_RISK_ARTIFACT_SCHEMA,
+    TOKEN_ENTROPY_RISK_ARTIFACT_SCHEMA,
+)
 from memgen.experience.v3 import (
     ExperienceMemoryV3Profile,
+    V34_QUERY_POOLING_CURRENT_TOKEN,
     V3_QUERY_POOLING_BOUNDARY_LAST,
     V3_QUERY_POOLING_METHODS,
     V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
@@ -54,6 +58,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v3-offline-report", type=Path, required=True)
     parser.add_argument("--e0-final-report", type=Path, required=True)
     parser.add_argument("--risk-artifact", type=Path, required=True)
+    parser.add_argument(
+        "--system-version", choices=("v3", "v3.4"), default="v3"
+    )
     parser.add_argument("--selector-calibration", type=Path)
     parser.add_argument(
         "--retrieval-embedding-transform",
@@ -66,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--query-pooling",
         choices=tuple(sorted(V3_QUERY_POOLING_METHODS)),
-        default=V3_QUERY_POOLING_BOUNDARY_LAST,
+        default=None,
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
@@ -93,6 +100,17 @@ def write_json(path: Path, value: Any) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.query_pooling is None:
+        args.query_pooling = (
+            V34_QUERY_POOLING_CURRENT_TOKEN
+            if args.system_version == "v3.4"
+            else V3_QUERY_POOLING_BOUNDARY_LAST
+        )
+    if (
+        args.system_version == "v3.4"
+        and args.query_pooling != V34_QUERY_POOLING_CURRENT_TOKEN
+    ):
+        raise ValueError("V3.4 requires current-generated-token query pooling")
     if args.max_new_tokens <= 0:
         raise ValueError("V3 max-new-tokens must be positive")
 
@@ -121,6 +139,22 @@ def main() -> None:
             raise ValueError(
                 "V3 selector calibration uses a different retrieval key bank"
             )
+        calibration_risk_sha256 = selector_calibration.get("source", {}).get(
+            "risk_artifact_sha256"
+        )
+        if (
+            args.system_version == "v3.4"
+            and calibration_risk_sha256 != file_sha256(args.risk_artifact)
+        ):
+            raise ValueError(
+                "V3.4 selector calibration uses a different token-risk artifact"
+            )
+        if selector_calibration.get("source", {}).get(
+            "system_version", "v3"
+        ) != args.system_version:
+            raise ValueError(
+                "Selector calibration uses a different system version"
+            )
         calibration_transform = selector_calibration.get("source", {}).get(
             "retrieval_embedding_transform",
             V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
@@ -135,20 +169,38 @@ def main() -> None:
             raise ValueError(
                 "Selector calibration uses a different query pooling policy"
             )
-        profile = ExperienceMemoryV3Profile(
-            query_pooling=args.query_pooling,
-            retrieval_embedding_transform=args.retrieval_embedding_transform,
-            retrieval_abstention_policy="top1_top2_margin",
-            retrieval_min_top1_top2_margin=float(
+        profile_kwargs = {
+            "retrieval_embedding_transform": (
+                args.retrieval_embedding_transform
+            ),
+            "retrieval_abstention_policy": "top1_top2_margin",
+            "retrieval_min_top1_top2_margin": float(
                 selector_calibration["calibration"][
                     "minimum_top1_top2_margin"
                 ]
             ),
+        }
+        profile = (
+            ExperienceMemoryV3Profile.continuous_token_joint(**profile_kwargs)
+            if args.system_version == "v3.4"
+            else ExperienceMemoryV3Profile(
+                query_pooling=args.query_pooling, **profile_kwargs
+            )
         )
     else:
-        profile = ExperienceMemoryV3Profile(
-            query_pooling=args.query_pooling,
-            retrieval_embedding_transform=args.retrieval_embedding_transform
+        profile = (
+            ExperienceMemoryV3Profile.continuous_token_joint(
+                retrieval_embedding_transform=(
+                    args.retrieval_embedding_transform
+                )
+            )
+            if args.system_version == "v3.4"
+            else ExperienceMemoryV3Profile(
+                query_pooling=args.query_pooling,
+                retrieval_embedding_transform=(
+                    args.retrieval_embedding_transform
+                ),
+            )
         )
     e0_report = load_formal_e0_report(args.e0_final_report)
     authenticate_e0_inputs(
@@ -180,22 +232,37 @@ def main() -> None:
     risk_artifact = torch.load(
         args.risk_artifact, map_location="cpu", weights_only=False
     )
-    if risk_artifact.get("schema_version") != ENTROPY_RISK_ARTIFACT_SCHEMA:
-        raise ValueError("V3 requires the canonical SDPA entropy-risk artifact")
+    expected_risk_schema = (
+        TOKEN_ENTROPY_RISK_ARTIFACT_SCHEMA
+        if args.system_version == "v3.4"
+        else ENTROPY_RISK_ARTIFACT_SCHEMA
+    )
+    if risk_artifact.get("schema_version") != expected_risk_schema:
+        raise ValueError(
+            f"{args.system_version} requires its canonical risk artifact"
+        )
     if risk_artifact.get("prompt_contract") != GSM8K_PROMPT_CONTRACT.metadata(
         chat_template=CONVERSATION_TEMPLATE
     ):
         raise ValueError("V3 risk artifact uses a different prompt contract")
     heldout = risk_artifact.get("risk_gate", {}).get("heldout_diagnostic", {})
-    if float(heldout.get("heldout_roc_auc", 0.0)) < float(
-        heldout.get("minimum_heldout_roc_auc", 1.0)
+    if (
+        float(heldout.get("heldout_roc_auc", 0.0))
+        < float(heldout.get("minimum_heldout_roc_auc", 1.0))
+        or args.system_version == "v3.4"
+        and float(heldout.get("heldout_balanced_accuracy_at_zero", 0.0))
+        < float(heldout.get("minimum_heldout_balanced_accuracy", 1.0))
     ):
         raise ValueError("V3 risk artifact did not pass held-out diagnostics")
     risk_reasoner = risk_artifact.get("reasoner", {})
     for field_name in ("model_name", "model_revision", "tokenizer_revision"):
         if risk_reasoner.get(field_name) != reasoner.get(field_name):
             raise ValueError("V3 risk and memory reasoner provenance differs")
-    gate = EntropyHysteresisGate.from_artifact(risk_artifact)
+    gate = (
+        EntropyHysteresisGate.from_token_artifact(risk_artifact)
+        if args.system_version == "v3.4"
+        else EntropyHysteresisGate.from_artifact(risk_artifact)
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(
         reasoner["model_name"], revision=reasoner["tokenizer_revision"]
@@ -319,6 +386,7 @@ def main() -> None:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "completed",
         "answer_or_reward_used": False,
+        "system_version": args.system_version,
         "question_sha256": text_sha256(args.question),
         "prompt_contract": GSM8K_PROMPT_CONTRACT.metadata(
             chat_template=CONVERSATION_TEMPLATE
@@ -350,7 +418,13 @@ def main() -> None:
         "risk_diagnostic_qualification": {
             "heldout_roc_auc": heldout.get("heldout_roc_auc"),
             "minimum_heldout_roc_auc": heldout.get("minimum_heldout_roc_auc"),
-            "online_control_role": "diagnostic_only",
+            "heldout_balanced_accuracy_at_zero": heldout.get(
+                "heldout_balanced_accuracy_at_zero"
+            ),
+            "minimum_heldout_balanced_accuracy": heldout.get(
+                "minimum_heldout_balanced_accuracy"
+            ),
+            "online_control_role": profile.risk_role,
         },
         "completion": completion,
         "runtime_seconds": runtime_seconds,

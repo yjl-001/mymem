@@ -269,6 +269,13 @@ def main() -> None:
             "run_profile_file_sha256": file_sha256(args.run_profile),
             "results_file_sha256": file_sha256(args.results),
             "retrieval_key_manifest_sha256": key_manifest_sha256,
+            "risk_artifact_sha256": profile.get("inputs", {}).get(
+                "risk_artifact_sha256"
+            ),
+            "system_version": profile.get("system_version", "v3"),
+            "system_profile_schema": profile.get("system_profile", {}).get(
+                "schema_version"
+            ),
             "retrieval_embedding_transform": retrieval_transform,
             "query_pooling": query_pooling,
             "completed_sample_count": row_count,
@@ -300,6 +307,8 @@ def main() -> None:
             "task_accuracy_not_used": True,
             "answer_or_reward_not_used": True,
             "retrieval_key_manifest_is_bound": True,
+            "risk_artifact_is_bound": True,
+            "system_profile_is_bound": True,
             "retrieval_embedding_transform_is_bound": True,
             "query_pooling_is_bound": True,
             "threshold_is_finite_and_nonnegative": True,

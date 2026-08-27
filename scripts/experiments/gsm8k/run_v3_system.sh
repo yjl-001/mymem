@@ -6,6 +6,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 STAGE="all"
+SYSTEM_VERSION="v3"
 LOGICAL_SPLIT="calibration-val"
 OFFSET=0
 LIMIT=8
@@ -13,11 +14,12 @@ PARITY_SAMPLES=8
 RUN_DIR=""
 SELECTOR_CALIBRATION=""
 RETRIEVAL_EMBEDDING_TRANSFORM="none"
-QUERY_POOLING="last_valid_token"
+QUERY_POOLING=""
 POSITIONAL=()
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --stage) STAGE="$2"; shift 2 ;;
+    --system-version) SYSTEM_VERSION="$2"; shift 2 ;;
     --logical-split) LOGICAL_SPLIT="$2"; shift 2 ;;
     --offset) OFFSET="$2"; shift 2 ;;
     --limit) LIMIT="$2"; shift 2 ;;
@@ -32,8 +34,19 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 if [[ "${#POSITIONAL[@]}" -ne 4 ]]; then
-  echo "Usage: $0 [--stage offline|eval|all] [--logical-split SPLIT] [--limit N] [--run-dir DIR] [--selector-calibration FILE] [--retrieval-embedding-transform TRANSFORM] [--query-pooling POOLING] PHASE1_DIR E0_DIR RISK_ARTIFACT OUTPUT_ROOT" >&2
+  echo "Usage: $0 [--stage offline|eval|all] [--system-version v3|v3.4] [--logical-split SPLIT] [--limit N] [--run-dir DIR] [--selector-calibration FILE] [--retrieval-embedding-transform TRANSFORM] [--query-pooling POOLING] PHASE1_DIR E0_DIR RISK_ARTIFACT OUTPUT_ROOT" >&2
   exit 2
+fi
+if [[ "$SYSTEM_VERSION" != "v3" && "$SYSTEM_VERSION" != "v3.4" ]]; then
+  echo "--system-version must be v3 or v3.4" >&2
+  exit 2
+fi
+if [[ -z "$QUERY_POOLING" ]]; then
+  if [[ "$SYSTEM_VERSION" == "v3.4" ]]; then
+    QUERY_POOLING="current_generated_token"
+  else
+    QUERY_POOLING="last_valid_token"
+  fi
 fi
 if [[ "$STAGE" != "offline" && "$STAGE" != "eval" && "$STAGE" != "all" ]]; then
   echo "--stage must be offline, eval, or all" >&2
@@ -47,8 +60,16 @@ if [[ "$RETRIEVAL_EMBEDDING_TRANSFORM" != "none" && "$RETRIEVAL_EMBEDDING_TRANSF
   echo "Unexpected --retrieval-embedding-transform" >&2
   exit 2
 fi
-if [[ "$QUERY_POOLING" != "last_valid_token" && "$QUERY_POOLING" != "last_token_before_trigger_boundary" ]]; then
+if [[ "$QUERY_POOLING" != "last_valid_token" && "$QUERY_POOLING" != "last_token_before_trigger_boundary" && "$QUERY_POOLING" != "current_generated_token" ]]; then
   echo "Unexpected --query-pooling" >&2
+  exit 2
+fi
+if [[ "$SYSTEM_VERSION" == "v3.4" && "$QUERY_POOLING" != "current_generated_token" ]]; then
+  echo "V3.4 requires --query-pooling current_generated_token" >&2
+  exit 2
+fi
+if [[ "$SYSTEM_VERSION" == "v3" && "$QUERY_POOLING" == "current_generated_token" ]]; then
+  echo "current_generated_token pooling requires --system-version v3.4" >&2
   exit 2
 fi
 for VALUE in "$OFFSET" "$LIMIT" "$PARITY_SAMPLES"; do
@@ -107,6 +128,7 @@ if [[ "$STAGE" == "eval" || "$STAGE" == "all" ]]; then
     SELECTOR_ARGS=(--selector-calibration "$SELECTOR_CALIBRATION")
   fi
   python scripts/evaluate_v3_experience_memory.py \
+    --system-version "$SYSTEM_VERSION" \
     --split-manifest "$SPLIT_MANIFEST" \
     --logical-split "$LOGICAL_SPLIT" \
     --memory-records "$MEMORY_RECORDS" \

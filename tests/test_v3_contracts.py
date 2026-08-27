@@ -7,8 +7,11 @@ import unittest
 from memgen.experience.phase1 import canonical_json_sha256
 from memgen.experience.v3 import (
     ExperienceMemoryV3Profile,
+    V34_QUERY_POOLING_CURRENT_TOKEN,
+    V34_SYSTEM_PROFILE_SCHEMA,
     V3_QUERY_POOLING_PRE_BOUNDARY,
     V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
+    query_embedding_token_index,
 )
 from memgen.experience.v3_artifacts import validate_cross_bank_metadata
 from memgen.experience.v3_eval import summarize_v3_rows
@@ -87,6 +90,40 @@ class V3PureContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different KV payload"):
             validate_cross_bank_metadata(
                 records=(record,), side_manifest=side, key_manifest=key
+            )
+
+    def test_v34_profile_freezes_continuous_joint_gate(self) -> None:
+        profile = ExperienceMemoryV3Profile.continuous_token_joint()
+        self.assertEqual(profile.schema_version, V34_SYSTEM_PROFILE_SCHEMA)
+        self.assertEqual(profile.query_pooling, V34_QUERY_POOLING_CURRENT_TOKEN)
+        self.assertEqual(profile.risk_role, "online_joint_control")
+        self.assertEqual(
+            profile.boundary_policy, "none_pre_answer_every_generated_token"
+        )
+        self.assertEqual(profile.rearm_low_entropy_token_count, 2)
+        self.assertEqual(
+            query_embedding_token_index(
+                token_count=7, pooling=V34_QUERY_POOLING_CURRENT_TOKEN
+            ),
+            6,
+        )
+        self.assertEqual(
+            ExperienceMemoryV3Profile.from_dict(profile.to_dict()), profile
+        )
+        with self.assertRaisesRegex(ValueError, "query_pooling"):
+            ExperienceMemoryV3Profile(
+                schema_version=V34_SYSTEM_PROFILE_SCHEMA,
+                gate_policy="continuous_token_entropy_risk_hysteresis",
+                risk_role="online_joint_control",
+                boundary_policy="none_pre_answer_every_generated_token",
+                rearm_policy=(
+                    "two_consecutive_low_entropy_tokens_rearm_without_trigger"
+                ),
+                rearm_low_entropy_token_count=2,
+            )
+        with self.assertRaisesRegex(ValueError, "V3.4 profile schema"):
+            ExperienceMemoryV3Profile(
+                query_pooling=V34_QUERY_POOLING_CURRENT_TOKEN
             )
 
     def test_summary_has_only_strict_format_and_token_task_metrics(self) -> None:
@@ -475,6 +512,7 @@ class V3RuntimeStateMachineTests(unittest.TestCase):
                 low_entropy_threshold=0.5,
                 risk_threshold=0.0,
                 risk_role="diagnostic_only",
+                rearm_low_entropy_token_count=1,
             )
 
             def __init__(self):
@@ -501,6 +539,9 @@ class V3RuntimeStateMachineTests(unittest.TestCase):
                         },
                     ),
                 )
+
+            def trigger_qualified(self, probe):
+                return probe.entropy >= self.config.high_entropy_threshold
 
         class FakeQueryEncoder:
             layer_number = 24

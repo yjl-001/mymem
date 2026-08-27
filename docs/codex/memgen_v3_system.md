@@ -338,6 +338,67 @@ runner 优先复用完整的 V3.1 boundary-last margin dev 结果；若不存在
 activation/replacement/duplicate/abstain/re-arm、first-attempt concentration/margin 以及 boundary-token
 strata；其中句号 `.` stratum 必须单独检查。runner 不自动运行 final-test。
 
+### V3.4 continuous token entropy-risk gate
+
+V3.3 将 first-attempt top-1 share 从 `0.4673` 降到 `0.2243`，但 matched dev strict 仍为
+`-0.2114%`，说明仅移动 boundary 内的 pooling 位置没有带来任务收益。V3.4 因此不再把语言学
+boundary 当作 gate 的候选集合，而是直接检验 entropy 与 layer-24 hidden state 能否在逐 token
+尺度识别 persistence。
+
+V3.4 使用独立 schema，不能把 V3.1--V3.3 的 boundary risk artifact 或 selector threshold 当作兼容
+输入。冻结语义如下：
+
+- 对每个答案标记前的已生成 token `t` 观测 final-layer sink-masked attention entropy `A_t`，并用
+  layer-24 hidden state 计算
+  `R_t = cos(h_t, persistence) - cos(h_t, recovery)`；不检查逗号、句号或换行。
+- 仅当 `ARMED && A_t >= high && R_t > risk_threshold` 时发起 retrieval attempt。当前 token 不回滚；
+  检索或替换的 memory 从 `t+1` 开始影响生成。
+- attempt 后进入 `DISARMED`；必须连续两个 token 满足 `A <= low` 才 re-arm。第二个低熵 token 只完成
+  re-arm，禁止在同一个 token 立即触发。
+- attempt 上限仍为 3；activation 后的新 memory 替换旧 memory；duplicate 和 margin abstention 均消耗
+  attempt 并保留当前 memory。
+- query 仍是 question + 从首个生成 token 到 `t` 的 full partial CoT；layer-24 pooling 固定为
+  `current_generated_token`。retrieval key bank、compiled side-KV bank、注入 layer 和 memory strength
+  均不改变。
+
+离线 compiler 在完整 experience 级别做固定 train/holdout 切分。high/low entropy threshold 只用
+bank-train 的全部 pre-answer token；recovery horizon `H` 从 bank-train 高熵 burst 到“连续两个低熵
+token”的恢复距离 p75 冻结（最大 32）。高熵 token 在 `H` 内出现稳定低熵段标为 recovery；完整观察
+`H` 后仍未恢复标为 persistence；尾部不能完成判断时 right-censor。layer-24 prototype 只由 train
+事件拟合，holdout 必须同时满足：
+
+- train/holdout 的 recovery、persistence 各至少 40 个事件；
+- ROC AUC 不低于 boundary artifact `0.8026 - 0.03 = 0.7726`；
+- zero-threshold balanced accuracy 不低于 `0.7180 - 0.03 = 0.6880`。
+
+同一次离线 pass 还记录 vocabulary entropy 与 raw top1-top2 logit margin，但二者只作为诊断，不参与
+V3.4 trigger。运行：
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_4_token_risk_gate.sh \
+  "$PHASE1_DIR" "$OUTPUT_ROOT/v3_4_token_risk"
+```
+
+在线阶段压缩为两次验证。第一次在 calibration-val 上跑 64 题、关闭 selector；该日志同时用于验证
+current-token pooling/top-1、报告 hubness，并 answer-blind 地按 first-attempt margin 保留最高 50%。
+第二次直接跑完整 473 题 matched dev，与已有 V3.1 boundary-last margin 结果逐题比较。每个 gate token
+记录 attention entropy、risk、vocabulary entropy、logit margin、low streak、active memory before/after
+和 `t+1` effect index；报告另外分开统计 native 与 memory-conditioned risk 分布，避免把 treated-state
+risk drift 误解为因果效果。
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_4_continuous_gate_experiment.sh \
+  "$PHASE1_DIR" \
+  "$E0_DIR" \
+  "$OUTPUT_ROOT/v3_4_token_risk/token-entropy-risk-gate-v3.4.pt" \
+  "$OUTPUT_ROOT"
+```
+
+matched dev 的冻结 go/no-go 条件为 strict point delta 至少 `0`、strict bootstrap 95% CI 下界至少
+`-1.5%`、format point delta 至少 `-0.5%`。runner 默认在 dev 后停止；人工检查通过后可用同一命令
+追加 `--run-final`，此时才运行 1319 题 final-test。official test 已被复用，因此即使运行也只能解释为
+descriptive evaluation，不能作为 independent confirmation。
+
 ### Injection layer
 
 当前 V3 只在 layer 24 注入，不做 layer search、multi-layer 或候选层双路编译。等 V3 全流程和全量
