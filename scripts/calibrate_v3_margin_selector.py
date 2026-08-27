@@ -18,6 +18,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from memgen.experience.phase1 import canonical_json_sha256, file_sha256
+from memgen.experience.v3 import (
+    V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+    V3_RETRIEVAL_EMBEDDING_TRANSFORMS,
+)
 from memgen.experience.v3_selector import (
     V3_MARGIN_SELECTOR_CALIBRATION_SCHEMA,
     V3_MARGIN_SELECTOR_POLICY,
@@ -86,10 +90,15 @@ def load_profile(path: Path) -> dict[str, Any]:
     ):
         raise ValueError("Invalid V3 calibration run profile")
     system = value.get("system_profile", {})
+    retrieval_transform = system.get(
+        "retrieval_embedding_transform",
+        V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+    )
     if (
         value.get("logical_split") != "calibration-val"
         or system.get("retrieval_abstention_policy") != "disabled"
         or system.get("retrieval_min_top1_top2_margin") not in {None, ""}
+        or retrieval_transform not in V3_RETRIEVAL_EMBEDDING_TRANSFORMS
     ):
         raise ValueError(
             "Selector calibration requires an abstention-disabled calibration-val run"
@@ -173,10 +182,12 @@ def markdown_report(value: Mapping[str, Any]) -> str:
     calibration = value["calibration"]
     concentration = value["first_attempt_selection_concentration"]
     lines = [
-        "# MemGen V3.1 margin selector calibration",
+        "# MemGen V3 margin selector calibration",
         "",
         f"- Status: `{value['status']}`",
         f"- Source split: `{value['source']['logical_split']}`",
+        f"- Retrieval embedding transform: "
+        f"`{value['source']['retrieval_embedding_transform']}`",
         f"- First-attempt sample count: {calibration['sample_count']}",
         f"- Minimum top1-top2 margin: `{calibration['minimum_top1_top2_margin']}`",
         f"- Target retained fraction: {calibration['target_retained_fraction']}",
@@ -204,6 +215,10 @@ def main() -> None:
     key_manifest = load_key_manifest(
         args.retrieval_key_manifest,
         expected_sha256=key_manifest_sha256,
+    )
+    retrieval_transform = profile.get("system_profile", {}).get(
+        "retrieval_embedding_transform",
+        V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
     )
     margins, memory_ids, row_count = collect_first_attempts(
         args.results,
@@ -244,6 +259,7 @@ def main() -> None:
             "run_profile_file_sha256": file_sha256(args.run_profile),
             "results_file_sha256": file_sha256(args.results),
             "retrieval_key_manifest_sha256": key_manifest_sha256,
+            "retrieval_embedding_transform": retrieval_transform,
             "completed_sample_count": row_count,
         },
         "calibration": {
@@ -273,6 +289,7 @@ def main() -> None:
             "task_accuracy_not_used": True,
             "answer_or_reward_not_used": True,
             "retrieval_key_manifest_is_bound": True,
+            "retrieval_embedding_transform_is_bound": True,
             "threshold_is_finite_and_nonnegative": True,
         },
     }
@@ -281,7 +298,7 @@ def main() -> None:
     markdown_path = args.output.with_suffix(".md")
     markdown_path.write_text(markdown_report(artifact), encoding="utf-8")
     print(
-        f"[v3.1-calibration] first_attempts={len(margins)} "
+        f"[v3-calibration] first_attempts={len(margins)} "
         f"threshold={threshold['threshold']:.9g} "
         f"retained={threshold['actual_retained_fraction']:.4f} "
         f"output={args.output}",

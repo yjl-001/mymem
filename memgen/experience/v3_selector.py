@@ -142,7 +142,7 @@ def load_margin_selector_calibration(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     expected = value.get("artifact_sha256")
     if expected != calibration_artifact_sha256(value):
-        raise ValueError("V3.1 selector calibration hash mismatch")
+        raise ValueError("V3 selector calibration hash mismatch")
     requirements = value.get("requirements", {})
     calibration = value.get("calibration", {})
     source = value.get("source", {})
@@ -160,5 +160,5 @@ def load_margin_selector_calibration(path: Path) -> dict[str, Any]:
         or not math.isfinite(float(threshold))
         or float(threshold) < 0.0
     ):
-        raise ValueError("V3.1 selector calibration did not pass qualification")
+        raise ValueError("V3 selector calibration did not pass qualification")
     return value

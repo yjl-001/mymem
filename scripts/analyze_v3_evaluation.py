@@ -484,12 +484,36 @@ def extract_sample(
             "retrieval_method_is_exact_cosine",
             sample_id,
         )
+        embedding_transform = query.get("embedding_transform", "none")
+        audit.check(
+            embedding_transform
+            in {"none", "key_bank_centroid_center_l2"},
+            "retrieval_embedding_transform_is_known",
+            sample_id,
+        )
         query_norm = _finite_or_none(query.get("query_embedding_norm"))
         audit.check(
             query_norm is not None and math.isclose(query_norm, 1.0, abs_tol=1e-5),
             "query_embedding_is_unit_norm",
             sample_id,
         )
+        search_query_norm = _finite_or_none(
+            query.get("search_query_embedding_norm", query_norm)
+        )
+        audit.check(
+            search_query_norm is not None
+            and math.isclose(search_query_norm, 1.0, abs_tol=1e-5),
+            "search_query_embedding_is_unit_norm",
+            sample_id,
+        )
+        if embedding_transform == "key_bank_centroid_center_l2":
+            audit.check(
+                bool(query.get("raw_key_centroid_sha256"))
+                and bool(query.get("search_key_embeddings_sha256"))
+                and bool(query.get("search_query_embedding_sha256")),
+                "centered_retrieval_artifacts_are_identified",
+                sample_id,
+            )
         selected_id = attempt.get("selected_memory_id")
         scores = [float(hit.get("score", float("nan"))) for hit in hits]
         empty_bank_abstain = (

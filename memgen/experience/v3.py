@@ -13,6 +13,14 @@ V3_SYSTEM_PROFILE_SCHEMA = "experience-memory-system-profile-v3"
 V3_RETRIEVAL_DECISION_SCHEMA = "embedding-memory-retrieval-decision-v1"
 V3_OFFLINE_REPORT_SCHEMA = "experience-memory-v3-offline-report-v1"
 V3_GENERATION_RESULT_SCHEMA = "experience-memory-v3-generation-result-v1"
+V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE = "none"
+V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED = (
+    "key_bank_centroid_center_l2"
+)
+V3_RETRIEVAL_EMBEDDING_TRANSFORMS = frozenset({
+    V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+    V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
+})
 
 
 @dataclass(frozen=True)
@@ -25,6 +33,9 @@ class ExperienceMemoryV3Profile:
     query_pooling: str = "last_valid_token"
     query_normalization: str = "l2"
     retrieval_method: str = "exact_cosine"
+    retrieval_embedding_transform: str = (
+        V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE
+    )
     retrieval_abstention_policy: str = "disabled"
     retrieval_min_top1_top2_margin: float | None = None
     retrieval_top_k: int = 2
@@ -68,6 +79,10 @@ class ExperienceMemoryV3Profile:
         for field_name, expected_value in expected.items():
             if getattr(self, field_name) != expected_value:
                 raise ValueError(f"Unexpected V3 {field_name}")
+        if self.retrieval_embedding_transform not in (
+            V3_RETRIEVAL_EMBEDDING_TRANSFORMS
+        ):
+            raise ValueError("Unexpected V3 retrieval_embedding_transform")
         if self.retrieval_abstention_policy == "disabled":
             if self.retrieval_min_top1_top2_margin is not None:
                 raise ValueError(

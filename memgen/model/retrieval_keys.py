@@ -16,7 +16,13 @@ import torch.nn.functional as F
 from memgen.experience.e1 import MemoryChoice
 from memgen.experience.memory import MemoryRecord
 from memgen.experience.phase1 import canonical_json_sha256, file_sha256, text_sha256
-from memgen.experience.v3 import EmbeddingRetrievalDecision, ExperienceMemoryV3Profile
+from memgen.experience.v3 import (
+    EmbeddingRetrievalDecision,
+    ExperienceMemoryV3Profile,
+    V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
+    V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+    V3_RETRIEVAL_EMBEDDING_TRANSFORMS,
+)
 from memgen.model.side_kv import DecoderLayerResolver, SIDE_KV_ATTENTION_BACKEND
 
 
@@ -32,6 +38,84 @@ def tensor_sha256(value: torch.Tensor) -> str:
     digest.update(canonical_json_sha256(list(normalized.shape)).encode("ascii"))
     digest.update(normalized.numpy().tobytes(order="C"))
     return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class RetrievalEmbeddingSpace:
+    """Deterministic search space derived from one authenticated raw key bank."""
+
+    transform: str
+    raw_key_centroid: torch.Tensor
+    search_key_embeddings: torch.Tensor
+
+    @classmethod
+    def from_key_embeddings(
+        cls, embeddings: torch.Tensor, *, transform: str
+    ) -> "RetrievalEmbeddingSpace":
+        if transform not in V3_RETRIEVAL_EMBEDDING_TRANSFORMS:
+            raise ValueError("Unexpected V3 retrieval embedding transform")
+        raw = embeddings.detach().float().cpu()
+        if raw.ndim != 2 or raw.shape[0] == 0 or raw.shape[1] == 0:
+            raise ValueError("V3 retrieval key space must be a non-empty matrix")
+        if not torch.isfinite(raw).all():
+            raise ValueError("V3 retrieval key space contains non-finite values")
+        raw_norms = raw.norm(dim=-1)
+        if not torch.allclose(
+            raw_norms, torch.ones_like(raw_norms), atol=1e-5, rtol=0.0
+        ):
+            raise ValueError("V3 raw retrieval keys must be unit normalized")
+        centroid = raw.mean(dim=0)
+        if transform == V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE:
+            search = raw.clone()
+        elif transform == V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED:
+            centered = raw - centroid.unsqueeze(0)
+            centered_norms = centered.norm(dim=-1)
+            if bool((centered_norms <= 0.0).any().item()):
+                raise ValueError("A centered V3 retrieval key has zero norm")
+            search = F.normalize(centered, dim=-1)
+        else:  # pragma: no cover - guarded by the supported-transform check.
+            raise AssertionError("Unreachable V3 retrieval embedding transform")
+        if not torch.isfinite(search).all():
+            raise ValueError("V3 transformed retrieval keys are non-finite")
+        return cls(
+            transform=transform,
+            raw_key_centroid=centroid.contiguous(),
+            search_key_embeddings=search.contiguous(),
+        )
+
+    def transform_query(self, query_embedding: torch.Tensor) -> torch.Tensor:
+        raw = query_embedding.detach().float().cpu().reshape(-1)
+        if raw.shape != self.raw_key_centroid.shape:
+            raise ValueError("V3 query and key embedding widths differ")
+        if not torch.isfinite(raw).all() or float(raw.norm().item()) <= 0.0:
+            raise ValueError("V3 query embedding is invalid")
+        raw = F.normalize(raw, dim=0)
+        if self.transform == V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE:
+            return raw
+        centered = raw - self.raw_key_centroid
+        if not torch.isfinite(centered).all() or float(centered.norm().item()) <= 0.0:
+            raise ValueError("Centered V3 query embedding is invalid")
+        return F.normalize(centered, dim=0)
+
+    def audit_dict(self) -> dict[str, Any]:
+        return {
+            "transform": self.transform,
+            "raw_key_centroid_sha256": tensor_sha256(
+                self.raw_key_centroid
+            ),
+            "raw_key_centroid_norm": float(
+                self.raw_key_centroid.norm().item()
+            ),
+            "search_key_embeddings_sha256": tensor_sha256(
+                self.search_key_embeddings
+            ),
+            "search_key_embedding_norm_min": float(
+                self.search_key_embeddings.norm(dim=-1).min().item()
+            ),
+            "search_key_embedding_norm_max": float(
+                self.search_key_embeddings.norm(dim=-1).max().item()
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -360,6 +444,15 @@ class EmbeddingMemoryRetriever:
             str(memory_id): int(count)
             for memory_id, count in kv_valid_slot_counts.items()
         }
+        self.embedding_space = RetrievalEmbeddingSpace.from_key_embeddings(
+            key_bank.embeddings,
+            transform=profile.retrieval_embedding_transform,
+        )
+        self.embedding_space_audit = self.embedding_space.audit_dict()
+        self.search_key_embedding_sha256 = tuple(
+            tensor_sha256(embedding)
+            for embedding in self.embedding_space.search_key_embeddings
+        )
         key_ids = set(key_bank.entry_by_id)
         if set(self.record_by_id) != key_ids or set(self.kv_valid_slot_counts) != key_ids:
             raise ValueError("V3 text, embedding, and side-KV banks cover different IDs")
@@ -383,18 +476,28 @@ class EmbeddingMemoryRetriever:
         query_token_ids: Sequence[int],
         prompt_token_count: int,
     ) -> EmbeddingRetrievalDecision:
-        query = query_embedding.detach().float().cpu().reshape(-1)
-        if query.shape[0] != self.key_bank.embeddings.shape[1]:
-            raise ValueError("V3 query and key embedding widths differ")
-        if not torch.isfinite(query).all() or float(query.norm().item()) <= 0.0:
+        raw_query = query_embedding.detach().float().cpu().reshape(-1)
+        if (
+            not torch.isfinite(raw_query).all()
+            or float(raw_query.norm().item()) <= 0.0
+        ):
             raise ValueError("V3 query embedding is invalid")
-        query = F.normalize(query, dim=0)
-        scores = torch.mv(self.key_bank.embeddings, query)
+        search_query = self.embedding_space.transform_query(raw_query)
+        raw_query = F.normalize(raw_query, dim=0)
+        scores = torch.mv(
+            self.embedding_space.search_key_embeddings, search_query
+        )
         top_k = min(self.profile.retrieval_top_k, int(scores.numel()))
         if top_k == 0:
             return EmbeddingRetrievalDecision(
                 status="empty_bank",
-                query=self._query_audit(query, query_token_ids, prompt_token_count, ()),
+                query=self._query_audit(
+                    raw_query,
+                    search_query,
+                    query_token_ids,
+                    prompt_token_count,
+                    (),
+                ),
                 hits=(),
                 matched_memory=None,
             )
@@ -414,12 +517,19 @@ class EmbeddingMemoryRetriever:
                 "score": float(scores[index].item()),
                 "rank": rank,
                 "key_embedding_sha256": str(entry["key_embedding_sha256"]),
+                "search_key_embedding_sha256": (
+                    self.search_key_embedding_sha256[int(index)]
+                ),
             })
         top = hits[0]
         memory_id = str(top["memory_id"])
         record = self.record_by_id[memory_id]
         query_audit = self._query_audit(
-            query, query_token_ids, prompt_token_count, hits
+            raw_query,
+            search_query,
+            query_token_ids,
+            prompt_token_count,
+            hits,
         )
         if (
             self.profile.retrieval_abstention_policy == "top1_top2_margin"
@@ -448,7 +558,8 @@ class EmbeddingMemoryRetriever:
 
     def _query_audit(
         self,
-        query: torch.Tensor,
+        raw_query: torch.Tensor,
+        search_query: torch.Tensor,
         token_ids: Sequence[int],
         prompt_token_count: int,
         hits: Sequence[Mapping[str, Any]],
@@ -461,6 +572,9 @@ class EmbeddingMemoryRetriever:
             "encoder_state": self.profile.query_encoder_state,
             "pooling": self.profile.query_pooling,
             "normalization": self.profile.query_normalization,
+            "embedding_transform": (
+                self.profile.retrieval_embedding_transform
+            ),
             "abstention_policy": self.profile.retrieval_abstention_policy,
             "minimum_top1_top2_margin": (
                 self.profile.retrieval_min_top1_top2_margin
@@ -469,8 +583,11 @@ class EmbeddingMemoryRetriever:
             "prompt_token_count": prompt_token_count,
             "partial_cot_token_count": len(token_ids) - prompt_token_count,
             "query_token_ids_sha256": canonical_json_sha256(list(token_ids)),
-            "query_embedding_sha256": tensor_sha256(query),
-            "query_embedding_norm": float(query.norm().item()),
+            "query_embedding_sha256": tensor_sha256(raw_query),
+            "query_embedding_norm": float(raw_query.norm().item()),
+            "search_query_embedding_sha256": tensor_sha256(search_query),
+            "search_query_embedding_norm": float(search_query.norm().item()),
+            **self.embedding_space_audit,
             "top_k_requested": self.profile.retrieval_top_k,
             "top1_score": top1,
             "top2_score": top2,

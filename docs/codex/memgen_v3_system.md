@@ -221,6 +221,54 @@ bash scripts/experiments/gsm8k/run_v3_1_selector_experiment.sh \
 runner 只运行 calibration-val 与 dev-test，并分别生成 key audit、selector calibration、两条件分析及
 matched comparison Markdown。
 
+### V3.2 centered-retrieval 实验
+
+V3.1 证明 margin abstention 可以过滤大量低置信检索，但 calibration-val 的 first-memory top-1
+share 和 selection Gini 仍显示严重的在线 query→key hubness。V3.2 因此只改变检索表示空间：
+
+```text
+raw keys K                         raw online query q
+    │                                    │
+    ├─ centroid c = mean(K)              │
+    │                                    │
+    └─ normalize(K - c)                  └─ normalize(q - c)
+                    \                      /
+                     exact cosine top-2
+```
+
+centroid 只从已认证的原始 unit key bank 计算。keys 与在线 question + full partial-CoT query 使用同一
+centroid；KV、MemoryRecord 和原始 key bank 均不重编译。layer-24、last-token pooling、entropy
+re-arm、三次 attempt、replacement、memory score bias 和 side-KV 注入全部冻结。
+
+centered calibration 必须重新运行 abstention-disabled calibration-val，因为 centered margin 与 V3.1
+raw margin 不在同一数值空间。随后仍按首次 attempt、answer-blind、50% retention 冻结新阈值。正式
+任务比较只运行 matched dev-test：
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_2_centered_retrieval_experiment.sh \
+  --calibration-limit 0 \
+  --dev-limit 0 \
+  --target-retained-fraction 0.5 \
+  --v31-dev-dir "$V31_DEV_DIR" \
+  --v31-selector-calibration "$V31_SELECTOR_ARTIFACT" \
+  "$PHASE1_DIR" "$E0_DIR" "$RISK_ARTIFACT" "$OUTPUT_ROOT"
+```
+
+该 runner 复用完整 V3.1 raw-margin dev 结果，生成：
+
+- raw 与 centered key-key geometry audit；
+- centered calibration-val 无 abstention 轨迹；
+- transform-bound centered margin calibration；
+- answer-blind calibration stop gate：top-1 share 与 Gini 必须同时低于 V3.1，否则停止且不跑 dev；
+- centered-margin dev-test 结果与完整分析；
+- V3.2 minus V3.1 的 matched comparison，包括 calibration top-1 share/Gini、strict、format、token、
+  mechanism 和 dominant memory payload。
+
+首要判据是 centered calibration 的 top-1 share 与 Gini 是否同时下降。任务层面报告 paired strict
+delta、bootstrap CI 和 McNemar p；不能只看点估计。V3.2 本轮不运行或重用 final-test 来选择方案。
+如果 hubness 明显下降但 dev strict 没有改善，下一瓶颈转向 memory/KV 语义；如果 hubness 不下降，
+下一步研究 query/key pooling 或文本构造，而不是 injection layer。
+
 ### Injection layer
 
 当前 V3 只在 layer 24 注入，不做 layer search、multi-layer 或候选层双路编译。等 V3 全流程和全量

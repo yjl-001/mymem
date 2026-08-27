@@ -33,7 +33,11 @@ from memgen.experience.phase1 import (
     text_sha256,
 )
 from memgen.experience.risk import ENTROPY_RISK_ARTIFACT_SCHEMA
-from memgen.experience.v3 import ExperienceMemoryV3Profile
+from memgen.experience.v3 import (
+    ExperienceMemoryV3Profile,
+    V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
+    V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+)
 from memgen.experience.v3_selector import load_margin_selector_calibration
 from memgen.experience.v3_artifacts import (
     authenticate_e0_inputs,
@@ -64,6 +68,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--e0-final-report", type=Path, required=True)
     parser.add_argument("--risk-artifact", type=Path, required=True)
     parser.add_argument("--selector-calibration", type=Path)
+    parser.add_argument(
+        "--retrieval-embedding-transform",
+        choices=(
+            V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+            V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
+        ),
+        default=V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 evaluates the slice remainder")
@@ -341,9 +353,18 @@ def main() -> None:
         )
         if expected_key_sha256 != file_sha256(args.retrieval_key_manifest):
             raise ValueError(
-                "V3.1 selector calibration uses a different retrieval key bank"
+                "V3 selector calibration uses a different retrieval key bank"
+            )
+        calibration_transform = selector_calibration.get("source", {}).get(
+            "retrieval_embedding_transform",
+            V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+        )
+        if calibration_transform != args.retrieval_embedding_transform:
+            raise ValueError(
+                "Selector calibration uses a different retrieval embedding transform"
             )
         profile = ExperienceMemoryV3Profile(
+            retrieval_embedding_transform=args.retrieval_embedding_transform,
             retrieval_abstention_policy="top1_top2_margin",
             retrieval_min_top1_top2_margin=float(
                 selector_calibration["calibration"][
@@ -352,7 +373,9 @@ def main() -> None:
             ),
         )
     else:
-        profile = ExperienceMemoryV3Profile()
+        profile = ExperienceMemoryV3Profile(
+            retrieval_embedding_transform=args.retrieval_embedding_transform
+        )
     e0_report = load_formal_e0_report(args.e0_final_report)
     authenticate_e0_inputs(
         e0_report=e0_report,
@@ -490,7 +513,10 @@ def main() -> None:
         "reused_official_test_descriptive_evaluation"
         if args.logical_split == "final-test"
         else (
-            "answer_blind_margin_selector_validation"
+            "answer_blind_centered_retrieval_validation"
+            if profile.retrieval_embedding_transform
+            == V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED
+            else "answer_blind_margin_selector_validation"
             if selector_calibration is not None
             else "system_validation"
         )
@@ -510,6 +536,7 @@ def main() -> None:
         "reasoner": reasoner | {"runtime_dtype": args.dtype},
         "prompt_contract": expected_prompt_contract,
         "system_profile": profile.to_dict(),
+        "retrieval_embedding_space": retriever.embedding_space_audit,
         "selector_calibration": (
             {
                 "schema_version": selector_calibration.get("schema_version"),
@@ -524,6 +551,11 @@ def main() -> None:
                 ),
                 "answer_or_reward_used": selector_calibration.get(
                     "answer_or_reward_used"
+                ),
+                "first_attempt_selection_concentration": (
+                    selector_calibration.get(
+                        "first_attempt_selection_concentration"
+                    )
                 ),
             }
             if selector_calibration is not None
@@ -559,6 +591,9 @@ def main() -> None:
             "append_flush_fsync_per_sample": True,
             "resume_requires_profile_hash": True,
             "query_embeddings_sidecar": args.save_query_embeddings,
+            "query_embedding_sidecar_representation": (
+                "raw_unit_before_retrieval_embedding_transform"
+            ),
             "full_logits_saved": False,
             "full_hidden_states_saved": False,
         },
@@ -709,6 +744,9 @@ def main() -> None:
                                 "experience-memory-v3-query-embeddings-v1"
                             ),
                             "sample_id": sample_id,
+                            "representation": (
+                                "raw_unit_before_retrieval_embedding_transform"
+                            ),
                         },
                     )
                     query_sidecar = {

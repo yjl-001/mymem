@@ -212,6 +212,10 @@ class V3SelectorTests(unittest.TestCase):
             self.assertEqual(
                 artifact["calibration"]["minimum_top1_top2_margin"], 0.4
             )
+            self.assertEqual(
+                artifact["source"]["retrieval_embedding_transform"],
+                "none",
+            )
             self.assertFalse(artifact["task_accuracy_used"])
             self.assertTrue(output_path.with_suffix(".md").is_file())
 

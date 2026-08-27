@@ -24,6 +24,10 @@ from memgen.experience.phase1 import (
     file_sha256,
     iter_jsonl,
 )
+from memgen.experience.v3 import (
+    V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
+    V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+)
 from memgen.experience.v3_selector import (
     numeric_summary,
     selection_concentration,
@@ -39,6 +43,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-records", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument(
+        "--retrieval-embedding-transform",
+        choices=(
+            V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+            V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
+        ),
+        default=V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+    )
     return parser.parse_args()
 
 
@@ -77,6 +89,10 @@ def markdown_report(value: Mapping[str, Any]) -> str:
         f"- Status: `{value['status']}`",
         f"- Memory count: {geometry['memory_count']}",
         f"- Hidden width: {geometry['hidden_width']}",
+        f"- Retrieval embedding transform: "
+        f"`{value['retrieval_embedding_space']['transform']}`",
+        f"- Raw key centroid norm: "
+        f"{value['retrieval_embedding_space']['raw_key_centroid_norm']}",
         f"- Mean-key norm (anisotropy): {geometry['mean_key_vector_norm']}",
         f"- Pairwise cosine mean / median / p95: "
         f"{geometry['off_diagonal_cosine']['mean']} / "
@@ -119,7 +135,10 @@ def main() -> None:
 
     import torch
 
-    from memgen.model.retrieval_keys import RetrievalKeyBankLoader
+    from memgen.model.retrieval_keys import (
+        RetrievalEmbeddingSpace,
+        RetrievalKeyBankLoader,
+    )
 
     records = tuple(
         MemoryRecord.from_dict(value) for value in iter_jsonl(args.memory_records)
@@ -136,7 +155,11 @@ def main() -> None:
         if entry.get("payload_hash") != record.payload_hash:
             raise ValueError("Retrieval key payload hash differs from MemoryRecord")
 
-    embeddings = bank.embeddings.float()
+    embedding_space = RetrievalEmbeddingSpace.from_key_embeddings(
+        bank.embeddings,
+        transform=args.retrieval_embedding_transform,
+    )
+    embeddings = embedding_space.search_key_embeddings
     similarities = embeddings @ embeddings.transpose(0, 1)
     count = int(embeddings.shape[0])
     diagonal_mask = torch.eye(count, dtype=torch.bool)
@@ -192,6 +215,7 @@ def main() -> None:
         "status": "passed",
         "task_accuracy_used": False,
         "answer_or_reward_used": False,
+        "retrieval_embedding_space": embedding_space.audit_dict(),
         "implementation": {
             "files_sha256": {
                 "memgen/experience/v3_selector.py": file_sha256(
@@ -244,6 +268,7 @@ def main() -> None:
             "embeddings_are_finite_unit_norm": True,
             "task_accuracy_not_used": True,
             "answer_or_reward_not_used": True,
+            "retrieval_embedding_transform_is_explicit": True,
         },
     }
     report["report_sha256"] = canonical_json_sha256({

@@ -12,6 +12,7 @@ LIMIT=8
 PARITY_SAMPLES=8
 RUN_DIR=""
 SELECTOR_CALIBRATION=""
+RETRIEVAL_EMBEDDING_TRANSFORM="none"
 POSITIONAL=()
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -22,13 +23,14 @@ while [[ "$#" -gt 0 ]]; do
     --parity-samples) PARITY_SAMPLES="$2"; shift 2 ;;
     --run-dir) RUN_DIR="$2"; shift 2 ;;
     --selector-calibration) SELECTOR_CALIBRATION="$2"; shift 2 ;;
+    --retrieval-embedding-transform) RETRIEVAL_EMBEDDING_TRANSFORM="$2"; shift 2 ;;
     -*) echo "Unknown option: $1" >&2; exit 2 ;;
     *) POSITIONAL+=("$1"); shift ;;
   esac
 done
 
 if [[ "${#POSITIONAL[@]}" -ne 4 ]]; then
-  echo "Usage: $0 [--stage offline|eval|all] [--logical-split SPLIT] [--limit N] [--run-dir DIR] [--selector-calibration FILE] PHASE1_DIR E0_DIR RISK_ARTIFACT OUTPUT_ROOT" >&2
+  echo "Usage: $0 [--stage offline|eval|all] [--logical-split SPLIT] [--limit N] [--run-dir DIR] [--selector-calibration FILE] [--retrieval-embedding-transform TRANSFORM] PHASE1_DIR E0_DIR RISK_ARTIFACT OUTPUT_ROOT" >&2
   exit 2
 fi
 if [[ "$STAGE" != "offline" && "$STAGE" != "eval" && "$STAGE" != "all" ]]; then
@@ -37,6 +39,10 @@ if [[ "$STAGE" != "offline" && "$STAGE" != "eval" && "$STAGE" != "all" ]]; then
 fi
 if [[ "$LOGICAL_SPLIT" != "calibration-val" && "$LOGICAL_SPLIT" != "dev-test" && "$LOGICAL_SPLIT" != "final-test" ]]; then
   echo "Unexpected --logical-split" >&2
+  exit 2
+fi
+if [[ "$RETRIEVAL_EMBEDDING_TRANSFORM" != "none" && "$RETRIEVAL_EMBEDDING_TRANSFORM" != "key_bank_centroid_center_l2" ]]; then
+  echo "Unexpected --retrieval-embedding-transform" >&2
   exit 2
 fi
 for VALUE in "$OFFSET" "$LIMIT" "$PARITY_SAMPLES"; do
@@ -103,6 +109,7 @@ if [[ "$STAGE" == "eval" || "$STAGE" == "all" ]]; then
     --v3-offline-report "$V3_BANK_DIR/v3_offline_report.json" \
     --e0-final-report "$E0_FINAL_REPORT" \
     --risk-artifact "$RISK_ARTIFACT" \
+    --retrieval-embedding-transform "$RETRIEVAL_EMBEDDING_TRANSFORM" \
     "${SELECTOR_ARGS[@]}" \
     --output-dir "$RUN_DIR" \
     --offset "$OFFSET" \

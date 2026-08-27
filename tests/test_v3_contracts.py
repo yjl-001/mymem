@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import unittest
 
 from memgen.experience.phase1 import canonical_json_sha256
-from memgen.experience.v3 import ExperienceMemoryV3Profile
+from memgen.experience.v3 import (
+    ExperienceMemoryV3Profile,
+    V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
+)
 from memgen.experience.v3_artifacts import validate_cross_bank_metadata
 from memgen.experience.v3_eval import summarize_v3_rows
 
@@ -18,8 +21,15 @@ class V3PureContractTests(unittest.TestCase):
         self.assertEqual(profile.max_retrieval_attempts, 3)
         self.assertEqual(profile.replacement_policy, "replace_current_memory")
         self.assertEqual(profile.risk_role, "diagnostic_only")
+        self.assertEqual(profile.retrieval_embedding_transform, "none")
         with self.assertRaisesRegex(ValueError, "layer 24"):
             ExperienceMemoryV3Profile(layer_number=23)
+        with self.assertRaisesRegex(
+            ValueError, "retrieval_embedding_transform"
+        ):
+            ExperienceMemoryV3Profile(
+                retrieval_embedding_transform="unsupported"
+            )
 
     def test_cross_bank_validation_binds_embedding_key_to_kv_value(self) -> None:
         record = SimpleNamespace(
@@ -118,6 +128,76 @@ except ModuleNotFoundError:
 
 @unittest.skipIf(torch is None, "Torch is required for the V3 state-machine test")
 class V3RuntimeStateMachineTests(unittest.TestCase):
+    def test_centered_retrieval_uses_one_shared_key_bank_centroid(self) -> None:
+        from memgen.model.retrieval_keys import EmbeddingMemoryRetriever
+
+        profile = ExperienceMemoryV3Profile(
+            retrieval_embedding_transform=(
+                V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED
+            )
+        )
+        records = tuple(
+            SimpleNamespace(
+                memory_id=f"memory-{suffix}",
+                payload_hash=f"payload-{suffix}",
+                token_count=2,
+            )
+            for suffix in ("a", "b", "c")
+        )
+        entries = tuple({
+            "index": index,
+            "memory_id": record.memory_id,
+            "payload_hash": record.payload_hash,
+            "payload_token_count": record.token_count,
+            "key_embedding_sha256": f"key-{index}",
+        } for index, record in enumerate(records))
+        key_bank = SimpleNamespace(
+            embeddings=torch.tensor([
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [-1.0, 0.0],
+            ]),
+            entries=entries,
+            entry_by_id={entry["memory_id"]: entry for entry in entries},
+        )
+        retriever = EmbeddingMemoryRetriever(
+            key_bank=key_bank,
+            records=records,
+            kv_valid_slot_counts={record.memory_id: 2 for record in records},
+            profile=profile,
+        )
+        expected_centroid = torch.tensor([0.0, 1.0 / 3.0])
+        self.assertTrue(torch.allclose(
+            retriever.embedding_space.raw_key_centroid,
+            expected_centroid,
+        ))
+        expected_query = torch.nn.functional.normalize(
+            torch.tensor([1.0, 0.0]) - expected_centroid,
+            dim=0,
+        )
+        decision = retriever.retrieve(
+            query_embedding=torch.tensor([1.0, 0.0]),
+            query_token_ids=(10, 11, 12),
+            prompt_token_count=2,
+        )
+        self.assertEqual(decision.matched_memory.memory_id, "memory-a")
+        self.assertEqual(
+            decision.query["embedding_transform"],
+            V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
+        )
+        self.assertEqual(
+            decision.query["raw_key_centroid_sha256"],
+            retriever.embedding_space_audit["raw_key_centroid_sha256"],
+        )
+        self.assertAlmostEqual(
+            decision.query["search_query_embedding_norm"], 1.0, places=6
+        )
+        from memgen.model.retrieval_keys import tensor_sha256
+        self.assertEqual(
+            decision.query["search_query_embedding_sha256"],
+            tensor_sha256(expected_query),
+        )
+
     def test_exact_cosine_uses_bank_order_as_stable_tie_breaker(self) -> None:
         from memgen.model.retrieval_keys import EmbeddingMemoryRetriever
 
