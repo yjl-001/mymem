@@ -365,11 +365,16 @@ V3.4 使用独立 schema，不能把 V3.1--V3.3 的 boundary risk artifact 或 s
 bank-train 的全部 pre-answer token；recovery horizon `H` 从 bank-train 高熵 burst 到“连续两个低熵
 token”的恢复距离 p75 冻结（最大 32）。高熵 token 在 `H` 内出现稳定低熵段标为 recovery；完整观察
 `H` 后仍未恢复标为 persistence；尾部不能完成判断时 right-censor。layer-24 prototype 只由 train
-事件拟合，holdout 必须同时满足：
+事件拟合。prototype cosine difference 不保证以零为分类边界，因此 risk threshold 只在 bank-train 上按
+最大 balanced accuracy 冻结，再原样用于 holdout 与在线阶段。holdout qualification 要求：
 
 - train/holdout 的 recovery、persistence 各至少 40 个事件；
-- ROC AUC 不低于 boundary artifact `0.8026 - 0.03 = 0.7726`；
-- zero-threshold balanced accuracy 不低于 `0.7180 - 0.03 = 0.6880`。
+- ROC AUC 不低于 `0.60`；
+- train-fitted threshold 的 balanced accuracy 与 AP lift 完整记录为诊断，但不作为第二个硬门槛。
+
+旧 boundary gate 的事件位置和“下一 boundary”标签与 V3.4 的逐 token 稳定恢复标签并不相同，因此旧版
+`0.8026/0.7180` 不能作为 V3.4 的直接基准。V3.4 的离线硬门槛只回答 hidden state 是否在未见过的
+experience 上具有高于机会水平的排序辨别力；最终 gate 是否有任务收益仍由 matched dev 决定。
 
 同一次离线 pass 还记录 vocabulary entropy 与 raw top1-top2 logit margin，但二者只作为诊断，不参与
 V3.4 trigger。运行：

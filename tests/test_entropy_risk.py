@@ -12,6 +12,7 @@ from memgen.experience.risk import (
     deterministic_train_partition,
     entropy_quantile,
     entropy_transition_label,
+    select_balanced_accuracy_threshold,
     select_recovery_horizon,
     stable_low_recovery_offset,
     token_entropy_transition_label,
@@ -175,6 +176,15 @@ class EntropyRiskContractTests(unittest.TestCase):
             ),
             "persistence",
         )
+
+    def test_risk_threshold_is_calibrated_from_shifted_train_scores(self) -> None:
+        result = select_balanced_accuracy_threshold(
+            [False, False, True, True],
+            [-0.9, -0.8, -0.3, -0.2],
+        )
+        self.assertEqual(result["threshold"], -0.8)
+        self.assertEqual(result["balanced_accuracy"], 1.0)
+        self.assertEqual(result["predicted_persistence_fraction"], 0.5)
 
     def test_recovery_horizon_is_train_sequence_derived_and_capped(self) -> None:
         result = select_recovery_horizon(

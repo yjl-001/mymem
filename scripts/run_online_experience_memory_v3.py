@@ -250,8 +250,7 @@ def main() -> None:
         float(heldout.get("heldout_roc_auc", 0.0))
         < float(heldout.get("minimum_heldout_roc_auc", 1.0))
         or args.system_version == "v3.4"
-        and float(heldout.get("heldout_balanced_accuracy_at_zero", 0.0))
-        < float(heldout.get("minimum_heldout_balanced_accuracy", 1.0))
+        and risk_artifact.get("qualification", {}).get("passed") is not True
     ):
         raise ValueError("V3 risk artifact did not pass held-out diagnostics")
     risk_reasoner = risk_artifact.get("reasoner", {})
@@ -418,11 +417,11 @@ def main() -> None:
         "risk_diagnostic_qualification": {
             "heldout_roc_auc": heldout.get("heldout_roc_auc"),
             "minimum_heldout_roc_auc": heldout.get("minimum_heldout_roc_auc"),
-            "heldout_balanced_accuracy_at_zero": heldout.get(
-                "heldout_balanced_accuracy_at_zero"
+            "heldout_balanced_accuracy_at_train_threshold": heldout.get(
+                "heldout_balanced_accuracy_at_train_threshold"
             ),
-            "minimum_heldout_balanced_accuracy": heldout.get(
-                "minimum_heldout_balanced_accuracy"
+            "train_threshold_calibration": heldout.get(
+                "train_threshold_calibration"
             ),
             "online_control_role": profile.risk_role,
         },

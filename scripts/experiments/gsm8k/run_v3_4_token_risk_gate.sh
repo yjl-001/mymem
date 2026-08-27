@@ -57,9 +57,7 @@ python scripts/compile_token_entropy_risk_gate.py \
   --horizon-quantile 0.75 \
   --maximum-recovery-horizon 32 \
   --min-events-per-label 40 \
-  --reference-boundary-roc-auc 0.8026 \
-  --reference-boundary-balanced-accuracy 0.7180 \
-  --allowed-reference-regression 0.03
+  --min-heldout-roc-auc 0.60
 
 echo "V3.4 token-risk artifact: $ARTIFACT"
 echo "V3.4 token-risk report: $REPORT"

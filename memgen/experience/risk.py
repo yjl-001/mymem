@@ -383,3 +383,51 @@ def binary_balanced_accuracy(
         not label and not prediction for label, prediction in pairs
     )
     return 0.5 * (true_positives / positives + true_negatives / negatives)
+
+
+def select_balanced_accuracy_threshold(
+    labels: Sequence[int | bool], scores: Sequence[float]
+) -> dict[str, float | int]:
+    """Fit a deterministic ``score > threshold`` rule on one partition.
+
+    Prototype cosine differences are not guaranteed to be centered at zero.
+    The caller must therefore fit this threshold on the training partition and
+    only carry the frozen value into held-out evaluation.
+    """
+
+    if len(labels) != len(scores) or not labels:
+        raise ValueError("labels and scores must be non-empty and aligned")
+    normalized_scores = [float(score) for score in scores]
+    if not all(math.isfinite(score) for score in normalized_scores):
+        raise ValueError("scores must be finite")
+    normalized_labels = [bool(label) for label in labels]
+    positives = sum(normalized_labels)
+    if positives == 0 or positives == len(normalized_labels):
+        raise ValueError("threshold calibration requires both labels")
+
+    minimum = min(normalized_scores)
+    candidates = set(normalized_scores)
+    candidates.add(0.0)
+    candidates.add(math.nextafter(minimum, -math.inf))
+    ranked: list[tuple[float, float]] = []
+    for threshold in candidates:
+        accuracy = binary_balanced_accuracy(
+            normalized_labels,
+            [score > threshold for score in normalized_scores],
+        )
+        ranked.append((accuracy, threshold))
+
+    # Prefer the most accurate rule, then the least shifted score origin, then
+    # the more conservative (higher) threshold. All tie breaks are train-only.
+    accuracy, threshold = max(
+        ranked,
+        key=lambda item: (item[0], -abs(item[1]), item[1]),
+    )
+    return {
+        "threshold": threshold,
+        "balanced_accuracy": accuracy,
+        "predicted_persistence_fraction": sum(
+            score > threshold for score in normalized_scores
+        ) / len(normalized_scores),
+        "candidate_count": len(candidates),
+    }
