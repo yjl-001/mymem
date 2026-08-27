@@ -19,9 +19,12 @@ from memgen.experience.phase1 import canonical_json_sha256, file_sha256, text_sh
 from memgen.experience.v3 import (
     EmbeddingRetrievalDecision,
     ExperienceMemoryV3Profile,
+    V3_QUERY_POOLING_BOUNDARY_LAST,
+    V3_QUERY_POOLING_METHODS,
     V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
     V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
     V3_RETRIEVAL_EMBEDDING_TRANSFORMS,
+    query_embedding_token_index,
 )
 from memgen.model.side_kv import DecoderLayerResolver, SIDE_KV_ATTENTION_BACKEND
 
@@ -291,8 +294,30 @@ def encode_last_layer_token(
 ) -> torch.Tensor:
     """Pure-prefix re-encode and return a normalized layer state."""
 
+    return encode_layer_token(
+        model=model,
+        token_ids=token_ids,
+        layer_number=layer_number,
+        token_index=len(token_ids) - 1,
+        device=device,
+    )
+
+
+@torch.inference_mode()
+def encode_layer_token(
+    *,
+    model: Any,
+    token_ids: Sequence[int],
+    layer_number: int,
+    token_index: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Pure-prefix re-encode and normalize one layer-state position."""
+
     if not token_ids:
         raise ValueError("V3 query encoding requires a non-empty token sequence")
+    if token_index < 0 or token_index >= len(token_ids):
+        raise ValueError("V3 query token index is outside the full prefix")
     inputs = torch.tensor([list(token_ids)], dtype=torch.long, device=device)
     output = model(
         input_ids=inputs,
@@ -304,7 +329,7 @@ def encode_last_layer_token(
     hidden_states = output.hidden_states
     if hidden_states is None or layer_number >= len(hidden_states):
         raise RuntimeError("Requested V3 retrieval hidden-state layer is unavailable")
-    vector = hidden_states[layer_number][0, -1, :].detach().float()
+    vector = hidden_states[layer_number][0, token_index, :].detach().float()
     if not torch.isfinite(vector).all() or float(vector.norm().item()) <= 0.0:
         raise RuntimeError("V3 retrieval encoder produced an invalid vector")
     return F.normalize(vector, dim=0)
@@ -313,19 +338,33 @@ def encode_last_layer_token(
 class FullPrefixQueryEncoder:
     """Encode question + every generated partial-CoT token from scratch."""
 
-    def __init__(self, *, model: Any, device: str, layer_number: int = 24):
+    def __init__(
+        self,
+        *,
+        model: Any,
+        device: str,
+        layer_number: int = 24,
+        query_pooling: str = V3_QUERY_POOLING_BOUNDARY_LAST,
+    ):
         if layer_number != 24:
             raise ValueError("The current V3 query encoder is frozen to layer 24")
+        if query_pooling not in V3_QUERY_POOLING_METHODS:
+            raise ValueError("Unexpected V3 query_pooling")
         self.model = model
         self.device = device
         self.layer_number = layer_number
+        self.query_pooling = query_pooling
 
     @torch.inference_mode()
     def encode(self, token_ids: Sequence[int]) -> torch.Tensor:
-        return encode_last_layer_token(
+        token_index = query_embedding_token_index(
+            token_count=len(token_ids), pooling=self.query_pooling
+        )
+        return encode_layer_token(
             model=self.model,
             token_ids=token_ids,
             layer_number=self.layer_number,
+            token_index=token_index,
             device=self.device,
         )
 
@@ -566,6 +605,10 @@ class EmbeddingMemoryRetriever:
     ) -> dict[str, Any]:
         top1 = float(hits[0]["score"]) if hits else None
         top2 = float(hits[1]["score"]) if len(hits) > 1 else None
+        embedding_token_index = query_embedding_token_index(
+            token_count=len(token_ids), pooling=self.profile.query_pooling
+        )
+        boundary_token_index = len(token_ids) - 1
         return {
             "method": self.profile.retrieval_method,
             "context": self.profile.query_context,
@@ -583,6 +626,17 @@ class EmbeddingMemoryRetriever:
             "prompt_token_count": prompt_token_count,
             "partial_cot_token_count": len(token_ids) - prompt_token_count,
             "query_token_ids_sha256": canonical_json_sha256(list(token_ids)),
+            "encoded_full_prefix_token_count": len(token_ids),
+            "query_embedding_token_index": embedding_token_index,
+            "query_embedding_token_id": int(token_ids[embedding_token_index]),
+            "query_embedding_causal_context_token_count": (
+                embedding_token_index + 1
+            ),
+            "trigger_boundary_token_index": boundary_token_index,
+            "trigger_boundary_token_id": int(token_ids[boundary_token_index]),
+            "trigger_boundary_excluded_from_pooling": (
+                embedding_token_index != boundary_token_index
+            ),
             "query_embedding_sha256": tensor_sha256(raw_query),
             "query_embedding_norm": float(raw_query.norm().item()),
             "search_query_embedding_sha256": tensor_sha256(search_query),

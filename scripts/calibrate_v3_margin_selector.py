@@ -19,6 +19,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from memgen.experience.phase1 import canonical_json_sha256, file_sha256
 from memgen.experience.v3 import (
+    V3_QUERY_POOLING_BOUNDARY_LAST,
+    V3_QUERY_POOLING_METHODS,
     V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
     V3_RETRIEVAL_EMBEDDING_TRANSFORMS,
 )
@@ -94,11 +96,15 @@ def load_profile(path: Path) -> dict[str, Any]:
         "retrieval_embedding_transform",
         V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
     )
+    query_pooling = system.get(
+        "query_pooling", V3_QUERY_POOLING_BOUNDARY_LAST
+    )
     if (
         value.get("logical_split") != "calibration-val"
         or system.get("retrieval_abstention_policy") != "disabled"
         or system.get("retrieval_min_top1_top2_margin") not in {None, ""}
         or retrieval_transform not in V3_RETRIEVAL_EMBEDDING_TRANSFORMS
+        or query_pooling not in V3_QUERY_POOLING_METHODS
     ):
         raise ValueError(
             "Selector calibration requires an abstention-disabled calibration-val run"
@@ -188,6 +194,7 @@ def markdown_report(value: Mapping[str, Any]) -> str:
         f"- Source split: `{value['source']['logical_split']}`",
         f"- Retrieval embedding transform: "
         f"`{value['source']['retrieval_embedding_transform']}`",
+        f"- Query pooling: `{value['source']['query_pooling']}`",
         f"- First-attempt sample count: {calibration['sample_count']}",
         f"- Minimum top1-top2 margin: `{calibration['minimum_top1_top2_margin']}`",
         f"- Target retained fraction: {calibration['target_retained_fraction']}",
@@ -219,6 +226,9 @@ def main() -> None:
     retrieval_transform = profile.get("system_profile", {}).get(
         "retrieval_embedding_transform",
         V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+    )
+    query_pooling = profile.get("system_profile", {}).get(
+        "query_pooling", V3_QUERY_POOLING_BOUNDARY_LAST
     )
     margins, memory_ids, row_count = collect_first_attempts(
         args.results,
@@ -260,6 +270,7 @@ def main() -> None:
             "results_file_sha256": file_sha256(args.results),
             "retrieval_key_manifest_sha256": key_manifest_sha256,
             "retrieval_embedding_transform": retrieval_transform,
+            "query_pooling": query_pooling,
             "completed_sample_count": row_count,
         },
         "calibration": {
@@ -290,6 +301,7 @@ def main() -> None:
             "answer_or_reward_not_used": True,
             "retrieval_key_manifest_is_bound": True,
             "retrieval_embedding_transform_is_bound": True,
+            "query_pooling_is_bound": True,
             "threshold_is_finite_and_nonnegative": True,
         },
     }

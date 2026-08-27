@@ -7,6 +7,7 @@ import unittest
 from memgen.experience.phase1 import canonical_json_sha256
 from memgen.experience.v3 import (
     ExperienceMemoryV3Profile,
+    V3_QUERY_POOLING_PRE_BOUNDARY,
     V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
 )
 from memgen.experience.v3_artifacts import validate_cross_bank_metadata
@@ -21,7 +22,14 @@ class V3PureContractTests(unittest.TestCase):
         self.assertEqual(profile.max_retrieval_attempts, 3)
         self.assertEqual(profile.replacement_policy, "replace_current_memory")
         self.assertEqual(profile.risk_role, "diagnostic_only")
+        self.assertEqual(profile.query_pooling, "last_valid_token")
         self.assertEqual(profile.retrieval_embedding_transform, "none")
+        self.assertEqual(
+            ExperienceMemoryV3Profile(
+                query_pooling=V3_QUERY_POOLING_PRE_BOUNDARY
+            ).query_pooling,
+            V3_QUERY_POOLING_PRE_BOUNDARY,
+        )
         with self.assertRaisesRegex(ValueError, "layer 24"):
             ExperienceMemoryV3Profile(layer_number=23)
         with self.assertRaisesRegex(
@@ -30,6 +38,8 @@ class V3PureContractTests(unittest.TestCase):
             ExperienceMemoryV3Profile(
                 retrieval_embedding_transform="unsupported"
             )
+        with self.assertRaisesRegex(ValueError, "query_pooling"):
+            ExperienceMemoryV3Profile(query_pooling="unsupported")
 
     def test_cross_bank_validation_binds_embedding_key_to_kv_value(self) -> None:
         record = SimpleNamespace(
@@ -128,6 +138,37 @@ except ModuleNotFoundError:
 
 @unittest.skipIf(torch is None, "Torch is required for the V3 state-machine test")
 class V3RuntimeStateMachineTests(unittest.TestCase):
+    def test_full_prefix_encoder_selects_pre_boundary_layer_state(self) -> None:
+        from memgen.model.retrieval_keys import FullPrefixQueryEncoder
+
+        class FakeModel:
+            def __init__(self):
+                self.seen = []
+
+            def __call__(self, *, input_ids, **kwargs):
+                del kwargs
+                self.seen.append(tuple(int(value) for value in input_ids[0]))
+                length = int(input_ids.shape[-1])
+                states = torch.tensor(
+                    [[[float(index + 1), 1.0] for index in range(length)]]
+                )
+                return SimpleNamespace(hidden_states=tuple(
+                    states for _ in range(25)
+                ))
+
+        model = FakeModel()
+        encoder = FullPrefixQueryEncoder(
+            model=model,
+            device="cpu",
+            query_pooling=V3_QUERY_POOLING_PRE_BOUNDARY,
+        )
+        actual = encoder.encode((10, 11, 12, 13))
+        expected = torch.nn.functional.normalize(
+            torch.tensor([3.0, 1.0]), dim=0
+        )
+        self.assertTrue(torch.allclose(actual, expected))
+        self.assertEqual(model.seen, [(10, 11, 12, 13)])
+
     def test_centered_retrieval_uses_one_shared_key_bank_centroid(self) -> None:
         from memgen.model.retrieval_keys import EmbeddingMemoryRetriever
 
@@ -238,6 +279,51 @@ class V3RuntimeStateMachineTests(unittest.TestCase):
             ["memory-a", "memory-b"],
         )
         self.assertEqual(decision.matched_memory.memory_id, "memory-a")
+
+    def test_pre_boundary_retrieval_audits_selected_query_position(self) -> None:
+        from memgen.model.retrieval_keys import EmbeddingMemoryRetriever
+
+        profile = ExperienceMemoryV3Profile(
+            query_pooling=V3_QUERY_POOLING_PRE_BOUNDARY
+        )
+        records = tuple(
+            SimpleNamespace(
+                memory_id=f"memory-{suffix}",
+                payload_hash=f"payload-{suffix}",
+                token_count=2,
+            )
+            for suffix in ("a", "b")
+        )
+        entries = tuple({
+            "index": index,
+            "memory_id": record.memory_id,
+            "payload_hash": record.payload_hash,
+            "payload_token_count": record.token_count,
+            "key_embedding_sha256": f"key-{index}",
+        } for index, record in enumerate(records))
+        key_bank = SimpleNamespace(
+            embeddings=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            entries=entries,
+            entry_by_id={entry["memory_id"]: entry for entry in entries},
+        )
+        retriever = EmbeddingMemoryRetriever(
+            key_bank=key_bank,
+            records=records,
+            kv_valid_slot_counts={"memory-a": 2, "memory-b": 2},
+            profile=profile,
+        )
+        decision = retriever.retrieve(
+            query_embedding=torch.tensor([1.0, 0.0]),
+            query_token_ids=(10, 11, 12, 13),
+            prompt_token_count=2,
+        )
+        query = decision.query
+        self.assertEqual(query["query_token_count"], 4)
+        self.assertEqual(query["query_embedding_token_index"], 2)
+        self.assertEqual(query["query_embedding_token_id"], 12)
+        self.assertEqual(query["trigger_boundary_token_index"], 3)
+        self.assertEqual(query["trigger_boundary_token_id"], 13)
+        self.assertTrue(query["trigger_boundary_excluded_from_pooling"])
 
     def test_margin_selector_abstains_but_retains_top2_diagnostics(self) -> None:
         from memgen.model.retrieval_keys import EmbeddingMemoryRetriever
@@ -418,6 +504,7 @@ class V3RuntimeStateMachineTests(unittest.TestCase):
 
         class FakeQueryEncoder:
             layer_number = 24
+            query_pooling = profile.query_pooling
 
             def __init__(self):
                 self.calls = []
@@ -454,6 +541,7 @@ class V3RuntimeStateMachineTests(unittest.TestCase):
                         "partial_cot_token_count": (
                             len(query_token_ids) - prompt_token_count
                         ),
+                        "query_embedding_token_id": query_token_ids[-1],
                     },
                     hits=({"memory_id": memory_id},),
                     matched_memory=choice,

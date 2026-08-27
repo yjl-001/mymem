@@ -124,6 +124,7 @@ class EntropyHysteresisGate:
 class V3BoundaryTrace:
     generated_boundary_index: int
     boundary_token_id: int
+    boundary_token_text: str
     state_before: str
     state_after: str
     entropy: float
@@ -147,6 +148,9 @@ class V3RetrievalAttemptTrace:
     attempt_number: int
     generated_boundary_index: int
     boundary_token_id: int
+    boundary_token_text: str
+    query_embedding_token_id: int
+    query_embedding_token_text: str
     outcome: str
     previous_memory_id: str | None
     selected_memory_id: str | None
@@ -314,6 +318,8 @@ class OnlineExperienceMemorySystemV3:
             raise ValueError("V3 gate and profile layers differ")
         if query_encoder.layer_number != profile.layer_number:
             raise ValueError("V3 query encoder and profile layers differ")
+        if query_encoder.query_pooling != profile.query_pooling:
+            raise ValueError("V3 query encoder and profile pooling differ")
         if controller.layer_number != profile.layer_number:
             raise ValueError("V3 side-KV controller and profile layers differ")
         if retriever.profile != profile:
@@ -555,6 +561,22 @@ class OnlineExperienceMemorySystemV3:
                             attempt_number=attempt_count,
                             generated_boundary_index=len(ids) - prompt_length - 1,
                             boundary_token_id=int(ids[-1]),
+                            boundary_token_text=self.tokenizer.decode(
+                                [int(ids[-1])], skip_special_tokens=False
+                            ),
+                            query_embedding_token_id=int(
+                                decision.query["query_embedding_token_id"]
+                            ),
+                            query_embedding_token_text=self.tokenizer.decode(
+                                [
+                                    int(
+                                        decision.query[
+                                            "query_embedding_token_id"
+                                        ]
+                                    )
+                                ],
+                                skip_special_tokens=False,
+                            ),
                             outcome=outcome,
                             previous_memory_id=memory_before,
                             selected_memory_id=selected_id,
@@ -592,6 +614,9 @@ class OnlineExperienceMemorySystemV3:
                     boundary_traces.append(V3BoundaryTrace(
                         generated_boundary_index=len(ids) - prompt_length - 1,
                         boundary_token_id=int(ids[-1]),
+                        boundary_token_text=self.tokenizer.decode(
+                            [int(ids[-1])], skip_special_tokens=False
+                        ),
                         state_before=state_before,
                         state_after=state,
                         entropy=probe.entropy,

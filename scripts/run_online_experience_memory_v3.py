@@ -28,10 +28,15 @@ from memgen.experience.phase1 import (
 from memgen.experience.risk import ENTROPY_RISK_ARTIFACT_SCHEMA
 from memgen.experience.v3 import (
     ExperienceMemoryV3Profile,
+    V3_QUERY_POOLING_BOUNDARY_LAST,
+    V3_QUERY_POOLING_METHODS,
     V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
     V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
 )
-from memgen.experience.v3_selector import load_margin_selector_calibration
+from memgen.experience.v3_selector import (
+    load_margin_selector_calibration,
+    selector_calibration_query_pooling,
+)
 from memgen.experience.v3_artifacts import (
     authenticate_e0_inputs,
     load_formal_e0_report,
@@ -57,6 +62,11 @@ def parse_args() -> argparse.Namespace:
             V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
         ),
         default=V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
+    )
+    parser.add_argument(
+        "--query-pooling",
+        choices=tuple(sorted(V3_QUERY_POOLING_METHODS)),
+        default=V3_QUERY_POOLING_BOUNDARY_LAST,
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
@@ -119,7 +129,14 @@ def main() -> None:
             raise ValueError(
                 "Selector calibration uses a different retrieval embedding transform"
             )
+        if selector_calibration_query_pooling(
+            selector_calibration
+        ) != args.query_pooling:
+            raise ValueError(
+                "Selector calibration uses a different query pooling policy"
+            )
         profile = ExperienceMemoryV3Profile(
+            query_pooling=args.query_pooling,
             retrieval_embedding_transform=args.retrieval_embedding_transform,
             retrieval_abstention_policy="top1_top2_margin",
             retrieval_min_top1_top2_margin=float(
@@ -130,6 +147,7 @@ def main() -> None:
         )
     else:
         profile = ExperienceMemoryV3Profile(
+            query_pooling=args.query_pooling,
             retrieval_embedding_transform=args.retrieval_embedding_transform
         )
     e0_report = load_formal_e0_report(args.e0_final_report)
@@ -248,7 +266,10 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         gate=gate,
         query_encoder=FullPrefixQueryEncoder(
-            model=model, device=args.device, layer_number=profile.layer_number
+            model=model,
+            device=args.device,
+            layer_number=profile.layer_number,
+            query_pooling=profile.query_pooling,
         ),
         retriever=retriever,
         loader=side_loader,

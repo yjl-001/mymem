@@ -11,7 +11,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from memgen.experience.v3 import ExperienceMemoryV3Profile
+from memgen.experience.v3 import (
+    ExperienceMemoryV3Profile,
+    V3_QUERY_POOLING_BOUNDARY_LAST,
+)
 from memgen.experience.v3_selector import (
     V3_MARGIN_SELECTOR_CALIBRATION_SCHEMA,
     V3_MARGIN_SELECTOR_POLICY,
@@ -19,6 +22,7 @@ from memgen.experience.v3_selector import (
     load_margin_selector_calibration,
     retained_margin_threshold,
     selection_concentration,
+    selector_calibration_query_pooling,
 )
 from memgen.experience.phase1 import canonical_json_sha256, file_sha256
 
@@ -109,6 +113,10 @@ class V3SelectorTests(unittest.TestCase):
             loaded = load_margin_selector_calibration(path)
             self.assertEqual(
                 loaded["calibration"]["minimum_top1_top2_margin"], 0.004
+            )
+            self.assertEqual(
+                selector_calibration_query_pooling(loaded),
+                V3_QUERY_POOLING_BOUNDARY_LAST,
             )
             artifact["calibration"]["minimum_top1_top2_margin"] = 0.005
             path.write_text(json.dumps(artifact), encoding="utf-8")
@@ -215,6 +223,9 @@ class V3SelectorTests(unittest.TestCase):
             self.assertEqual(
                 artifact["source"]["retrieval_embedding_transform"],
                 "none",
+            )
+            self.assertEqual(
+                artifact["source"]["query_pooling"], "last_valid_token"
             )
             self.assertFalse(artifact["task_accuracy_used"])
             self.assertTrue(output_path.with_suffix(".md").is_file())

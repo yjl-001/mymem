@@ -26,6 +26,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from memgen.experience.phase1 import canonical_json_sha256
+from memgen.experience.v3 import (
+    V3_QUERY_POOLING_BOUNDARY_LAST,
+    V3_QUERY_POOLING_METHODS,
+    V3_QUERY_POOLING_PRE_BOUNDARY,
+    query_embedding_token_index,
+)
 
 
 EVALUATION_PROFILE_SCHEMA = "experience-memory-v3-evaluation-profile-v1"
@@ -479,6 +485,54 @@ def extract_sample(
             "query_encoder_is_pure_prefix",
             sample_id,
         )
+        query_pooling = str(
+            query.get("pooling", V3_QUERY_POOLING_BOUNDARY_LAST)
+        )
+        audit.check(
+            query_pooling in V3_QUERY_POOLING_METHODS,
+            "query_pooling_is_known",
+            sample_id,
+        )
+        if query_pooling in V3_QUERY_POOLING_METHODS:
+            expected_embedding_index = query_embedding_token_index(
+                token_count=query_count, pooling=query_pooling
+            )
+            has_position_audit = query.get(
+                "query_embedding_token_index"
+            ) is not None
+            audit.check(
+                has_position_audit
+                or query_pooling == V3_QUERY_POOLING_BOUNDARY_LAST,
+                "pre_boundary_query_has_position_audit",
+                sample_id,
+            )
+            if has_position_audit:
+                boundary_token_id = int(attempt.get("boundary_token_id", -1))
+                audit.check(
+                    int(query.get("encoded_full_prefix_token_count", -1))
+                    == query_count
+                    and int(query.get("query_embedding_token_index", -1))
+                    == expected_embedding_index
+                    and int(query.get("query_embedding_causal_context_token_count", -1))
+                    == expected_embedding_index + 1
+                    and int(query.get("trigger_boundary_token_index", -1))
+                    == query_count - 1
+                    and int(query.get("trigger_boundary_token_id", -1))
+                    == boundary_token_id
+                    and bool(
+                        query.get("trigger_boundary_excluded_from_pooling")
+                    )
+                    is (query_pooling == V3_QUERY_POOLING_PRE_BOUNDARY),
+                    "query_pooling_position_audit_is_consistent",
+                    sample_id,
+                )
+                if attempt.get("query_embedding_token_id") is not None:
+                    audit.check(
+                        int(attempt["query_embedding_token_id"])
+                        == int(query["query_embedding_token_id"]),
+                        "attempt_query_token_matches_decision",
+                        sample_id,
+                    )
         audit.check(
             query.get("method") == "exact_cosine",
             "retrieval_method_is_exact_cosine",

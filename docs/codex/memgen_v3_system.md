@@ -303,6 +303,41 @@ Gini、更低 top-1 share、更多 selected memory 排序。
 该 runner 不接受 logical split，不运行 dev-test 或 final-test；只有 audit 推荐候选后才另行实现在线
 pooling、冻结 50% margin 并运行一次 matched dev-test。
 
+### V3.3 pre-boundary 在线验证
+
+pooling audit 的 161 个 key、418 个 query 和原 V3.1 top-1 均全量复现。唯一通过 geometry gate 的
+`key_last__query_pre_boundary` 将 top-1 share 从 `0.4569` 降到 `0.2679`、selected memories 从
+23 增到 27、normalized entropy 从 `0.4078` 增到 `0.4542`，因此进入一次 matched dev-test。
+
+在线 profile 现在显式区分两种 query pooling：
+
+- `last_valid_token`：V3.1 boundary-last 基线；旧 selector artifact 未记录 pooling 时只能解释为该模式；
+- `last_token_before_trigger_boundary`：V3.3 候选。reasoner 仍重编码 question + full partial CoT 的完整
+  token 序列，但在 layer 24 读取 boundary 前一个位置的 hidden state。
+
+每次 retrieval attempt 同时保存 boundary token/id/text、被选作 query 的 token/id/text、完整 prefix
+hash、query embedding hash、top-2、margin 和 memory transition。V3.3 selector artifact 同时绑定 raw
+retrieval transform 与 pre-boundary pooling，因此 V3.1 margin threshold 无法误用于 V3.3。
+
+为避免重复运行 1000 条 calibration generation，50% retention threshold 直接从已经通过认证的 418 条
+`pooling_audit_samples.jsonl` pre-boundary margin 构建。builder 会重新验证 report/sample hash、候选资格、
+逐样本 top-2、聚合 concentration 和 key-bank hash；任何不一致都会在 dev-test 前停止。
+
+运行：
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_3_pre_boundary_experiment.sh \
+  --dev-limit 0 \
+  --target-retained-fraction 0.5 \
+  "$PHASE1_DIR" "$E0_DIR" "$RISK_ARTIFACT" "$OUTPUT_ROOT"
+```
+
+runner 优先复用完整的 V3.1 boundary-last margin dev 结果；若不存在，则用当前代码和原 V3.1 selector
+补跑 matched baseline。随后只新增一次 V3.3 pre-boundary margin dev 运行，并生成两份完整 analysis 与
+`dev_query_pooling_comparison.md`。比较报告包含 paired strict/format、bootstrap CI、McNemar、token delta、
+activation/replacement/duplicate/abstain/re-arm、first-attempt concentration/margin 以及 boundary-token
+strata；其中句号 `.` stratum 必须单独检查。runner 不自动运行 final-test。
+
 ### Injection layer
 
 当前 V3 只在 layer 24 注入，不做 layer search、multi-layer 或候选层双路编译。等 V3 全流程和全量

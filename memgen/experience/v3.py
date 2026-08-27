@@ -21,6 +21,24 @@ V3_RETRIEVAL_EMBEDDING_TRANSFORMS = frozenset({
     V3_RETRIEVAL_EMBEDDING_TRANSFORM_NONE,
     V3_RETRIEVAL_EMBEDDING_TRANSFORM_CENTERED,
 })
+V3_QUERY_POOLING_BOUNDARY_LAST = "last_valid_token"
+V3_QUERY_POOLING_PRE_BOUNDARY = "last_token_before_trigger_boundary"
+V3_QUERY_POOLING_METHODS = frozenset({
+    V3_QUERY_POOLING_BOUNDARY_LAST,
+    V3_QUERY_POOLING_PRE_BOUNDARY,
+})
+
+
+def query_embedding_token_index(*, token_count: int, pooling: str) -> int:
+    """Resolve the full-prefix token selected by a V3 query-pooling policy."""
+
+    if pooling not in V3_QUERY_POOLING_METHODS:
+        raise ValueError("Unexpected V3 query_pooling")
+    offset = -1 if pooling == V3_QUERY_POOLING_BOUNDARY_LAST else -2
+    index = token_count + offset
+    if index < 0 or index >= token_count:
+        raise ValueError("V3 query prefix is too short for its pooling policy")
+    return index
 
 
 @dataclass(frozen=True)
@@ -30,7 +48,7 @@ class ExperienceMemoryV3Profile:
     layer_number: int = 24
     query_context: str = "question_plus_full_partial_cot"
     query_encoder_state: str = "pure_prefix_reencode_side_kv_disabled"
-    query_pooling: str = "last_valid_token"
+    query_pooling: str = V3_QUERY_POOLING_BOUNDARY_LAST
     query_normalization: str = "l2"
     retrieval_method: str = "exact_cosine"
     retrieval_embedding_transform: str = (
@@ -62,7 +80,6 @@ class ExperienceMemoryV3Profile:
         expected = {
             "query_context": "question_plus_full_partial_cot",
             "query_encoder_state": "pure_prefix_reencode_side_kv_disabled",
-            "query_pooling": "last_valid_token",
             "query_normalization": "l2",
             "retrieval_method": "exact_cosine",
             "gate_policy": "entropy_hysteresis_rearm",
@@ -79,6 +96,8 @@ class ExperienceMemoryV3Profile:
         for field_name, expected_value in expected.items():
             if getattr(self, field_name) != expected_value:
                 raise ValueError(f"Unexpected V3 {field_name}")
+        if self.query_pooling not in V3_QUERY_POOLING_METHODS:
+            raise ValueError("Unexpected V3 query_pooling")
         if self.retrieval_embedding_transform not in (
             V3_RETRIEVAL_EMBEDDING_TRANSFORMS
         ):

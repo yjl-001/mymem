@@ -13,6 +13,7 @@ PARITY_SAMPLES=8
 RUN_DIR=""
 SELECTOR_CALIBRATION=""
 RETRIEVAL_EMBEDDING_TRANSFORM="none"
+QUERY_POOLING="last_valid_token"
 POSITIONAL=()
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -24,13 +25,14 @@ while [[ "$#" -gt 0 ]]; do
     --run-dir) RUN_DIR="$2"; shift 2 ;;
     --selector-calibration) SELECTOR_CALIBRATION="$2"; shift 2 ;;
     --retrieval-embedding-transform) RETRIEVAL_EMBEDDING_TRANSFORM="$2"; shift 2 ;;
+    --query-pooling) QUERY_POOLING="$2"; shift 2 ;;
     -*) echo "Unknown option: $1" >&2; exit 2 ;;
     *) POSITIONAL+=("$1"); shift ;;
   esac
 done
 
 if [[ "${#POSITIONAL[@]}" -ne 4 ]]; then
-  echo "Usage: $0 [--stage offline|eval|all] [--logical-split SPLIT] [--limit N] [--run-dir DIR] [--selector-calibration FILE] [--retrieval-embedding-transform TRANSFORM] PHASE1_DIR E0_DIR RISK_ARTIFACT OUTPUT_ROOT" >&2
+  echo "Usage: $0 [--stage offline|eval|all] [--logical-split SPLIT] [--limit N] [--run-dir DIR] [--selector-calibration FILE] [--retrieval-embedding-transform TRANSFORM] [--query-pooling POOLING] PHASE1_DIR E0_DIR RISK_ARTIFACT OUTPUT_ROOT" >&2
   exit 2
 fi
 if [[ "$STAGE" != "offline" && "$STAGE" != "eval" && "$STAGE" != "all" ]]; then
@@ -43,6 +45,10 @@ if [[ "$LOGICAL_SPLIT" != "calibration-val" && "$LOGICAL_SPLIT" != "dev-test" &&
 fi
 if [[ "$RETRIEVAL_EMBEDDING_TRANSFORM" != "none" && "$RETRIEVAL_EMBEDDING_TRANSFORM" != "key_bank_centroid_center_l2" ]]; then
   echo "Unexpected --retrieval-embedding-transform" >&2
+  exit 2
+fi
+if [[ "$QUERY_POOLING" != "last_valid_token" && "$QUERY_POOLING" != "last_token_before_trigger_boundary" ]]; then
+  echo "Unexpected --query-pooling" >&2
   exit 2
 fi
 for VALUE in "$OFFSET" "$LIMIT" "$PARITY_SAMPLES"; do
@@ -110,6 +116,7 @@ if [[ "$STAGE" == "eval" || "$STAGE" == "all" ]]; then
     --e0-final-report "$E0_FINAL_REPORT" \
     --risk-artifact "$RISK_ARTIFACT" \
     --retrieval-embedding-transform "$RETRIEVAL_EMBEDDING_TRANSFORM" \
+    --query-pooling "$QUERY_POOLING" \
     "${SELECTOR_ARGS[@]}" \
     --output-dir "$RUN_DIR" \
     --offset "$OFFSET" \

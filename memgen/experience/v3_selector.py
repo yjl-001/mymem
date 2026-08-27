@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from memgen.experience.phase1 import canonical_json_sha256
+from memgen.experience.v3 import (
+    V3_QUERY_POOLING_BOUNDARY_LAST,
+    V3_QUERY_POOLING_METHODS,
+)
 
 
 V3_MARGIN_SELECTOR_CALIBRATION_SCHEMA = (
@@ -138,6 +142,19 @@ def calibration_artifact_sha256(value: Mapping[str, Any]) -> str:
     })
 
 
+def selector_calibration_query_pooling(value: Mapping[str, Any]) -> str:
+    """Resolve pooling, treating pre-V3.3 artifacts as boundary-last only."""
+
+    pooling = str(
+        value.get("source", {}).get(
+            "query_pooling", V3_QUERY_POOLING_BOUNDARY_LAST
+        )
+    )
+    if pooling not in V3_QUERY_POOLING_METHODS:
+        raise ValueError("Unexpected selector-calibration query pooling")
+    return pooling
+
+
 def load_margin_selector_calibration(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     expected = value.get("artifact_sha256")
@@ -147,6 +164,7 @@ def load_margin_selector_calibration(path: Path) -> dict[str, Any]:
     calibration = value.get("calibration", {})
     source = value.get("source", {})
     threshold = calibration.get("minimum_top1_top2_margin")
+    query_pooling = selector_calibration_query_pooling(value)
     if (
         value.get("schema_version") != V3_MARGIN_SELECTOR_CALIBRATION_SCHEMA
         or value.get("status") != "passed"
@@ -159,6 +177,7 @@ def load_margin_selector_calibration(path: Path) -> dict[str, Any]:
         or threshold is None
         or not math.isfinite(float(threshold))
         or float(threshold) < 0.0
+        or query_pooling not in V3_QUERY_POOLING_METHODS
     ):
         raise ValueError("V3 selector calibration did not pass qualification")
     return value
