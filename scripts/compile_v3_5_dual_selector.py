@@ -286,6 +286,7 @@ def main() -> None:
         DualRetrievalKeyCompiler,
         DualRetrievalKeyCompilerConfig,
         QuestionOnlyEncoder,
+        V35_DYNAMIC_DECISION_SANITIZATION_POLICY,
         validate_v35_split_manifest,
     )
 
@@ -479,6 +480,7 @@ def main() -> None:
         for value in applicability_artifact.get("requirements", {}).values()
     )
     reproduction = dual_loader.manifest["applicability_reproduction_audit"]
+    source_join = dual_loader.manifest["source_join"]
     requirements = {
         "formal_e0_side_kv_qualification_reused": True,
         "formal_v3_offline_key_qualification_reused": True,
@@ -497,6 +499,14 @@ def main() -> None:
             and reproduction.get("exact_reproduction_count") == len(records)
         ),
         "dynamic_text_excludes_verification_reference_and_avoid": True,
+        "dynamic_decision_answer_format_policy_authenticated": (
+            source_join.get("dynamic_decision_sanitization_policy")
+            == V35_DYNAMIC_DECISION_SANITIZATION_POLICY
+            and source_join.get(
+                "dynamic_decision_prohibited_boilerplate_absent"
+            )
+            is True
+        ),
         "record_key_value_ids_and_order_aligned": (
             dual_loader.manifest["record_order_sha256"]
             == alignment["record_order_sha256"]
@@ -527,9 +537,15 @@ def main() -> None:
             "attention_implementation": "sdpa",
             "dtype": "bfloat16",
             "applicability_key_source": "sanitized_fields.when_facing",
-            "dynamic_key_source": (
-                "when_facing_plus_sanitized_transferable_decision_only"
-            ),
+            "dynamic_key_source": dual_loader.manifest["compiler"][
+                "dynamic_key_source"
+            ],
+            "dynamic_when_facing_policy": source_join[
+                "dynamic_when_facing_policy"
+            ],
+            "dynamic_decision_sanitization_policy": source_join[
+                "dynamic_decision_sanitization_policy"
+            ],
             "source_question_query": "context.strip_question_only",
             "retrieval_method": "exact_cosine",
         },
