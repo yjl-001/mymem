@@ -519,6 +519,35 @@ re-arm violations 全为零，以及 calibration task-blind；任务条件以 V3
 CI lower 和 format delta 为主。无论结果是否通过，`qualified_for_final_test` 都保持 `false`，runner 不含
 final-test 执行路径。
 
+#### Dynamic source-state alignment diagnostic
+
+当 static applicability qualification 未通过或需要单独检查第二层 dynamic rerank 时，使用独立诊断：
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_5_dynamic_source_alignment_audit.sh \
+  "$PHASE1_DIR" \
+  "$E0_DIR" \
+  "$OUTPUT_ROOT/v3_4_token_risk/token-entropy-risk-gate-v3.4.pt" \
+  "$OUTPUT_ROOT"
+```
+
+该 audit 明确绕过 static shortlist，直接在全部 161 条已认证 dynamic keys 上检索；它不会改变或绕过
+V3.5 offline `not_qualified` 状态。每条 memory 通过 `source_experience_id` 找回同题的 verified-success
+`trajectory` 与 verified-failure `reference_trajectory`，沿用 GSM8K prompt contract、完整 partial CoT、
+layer-24 `current_generated_token` pooling、L2 与 side-KV disabled 合同。两条 source trajectory 的每个
+pre-answer token 都产生 own-memory rank curve；primary 位置固定为 failure/reference trajectory 上冻结
+V3.4 entropy+risk gate 的第一次 counterfactual joint-qualified event，不允许按 retrieval score 事后挑位置。
+
+报告包含 reference/target first-gate Recall@1/5/10/32、MRR、rank 分布、attempt 2/3、全 token macro
+coverage、own-key cosine 与 best-other gap、target/reference 配对 rank 差、top-1 hubness、稳定
+tie-break top hits，以及保持完整 score geometry 的 query→own-memory ID 置换 null。正式 anchor 另做
+independent exact full-prefix re-encode，并把 query embeddings 写入认证的
+safetensors sidecar。整个诊断不运行生成、不加载 side-KV，也不把任务 accuracy、answer 或 reward 用于
+query ranking、threshold 或结果位置选择；它只复用 bank 已认证的 success/failure source 角色，不产生
+新的 selector threshold。低 source-state recall 可以否定当前 abstract dynamic key 与 runtime prefix 的
+基本对齐；高 recall 只表示必要的 in-source sanity check 通过，不能证明跨题泛化或任务收益。若 target
+明显强而 reference 弱，应解释为 confirmation retrieval，而不是 corrective retrieval。
+
 ### Injection layer
 
 当前 V3 只在 layer 24 注入，不做 layer search、multi-layer 或候选层双路编译。等 V3 全流程和全量
