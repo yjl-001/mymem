@@ -571,6 +571,31 @@ full-bank Gini、pairwise raw→candidate rank delta、key-key cosine geometry�
 并提高 holdout source rank，说明公共 embedding component 遮蔽了仍可利用的相对信号；若 centering 与
 固定 PC1 removal 都无效，则优先判定 abstract last-token key 与 runtime current-token query 仍存在语义错位。
 
+#### Dynamic key-component diagnostic
+
+当固定 centroid/PC1 对照不能缓解 hubness 时，不继续搜索更多 PC，而是把 dual bank 中已经一一对齐的
+applicability 与 dynamic key 做组成分解：
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_5_dynamic_key_component_audit.sh \
+  "$PHASE1_DIR" \
+  "$E0_DIR" \
+  "$OUTPUT_ROOT"
+```
+
+该 audit 认证并复用 source-state 的 exact first-gate query sidecar、dual key bank 和上一步 hubness report，
+不重新运行 reasoner。三个变体固定为原始 applicability key、当前完整 dynamic key，以及逐 memory 的
+`L2(dynamic_key - applicability_key)`。最后一个量只表示“追加 `Prefer` 文本后 encoder 表示发生的方向”，
+不是单独编码的 decision key；三者都使用完全相同、未经新变换的 runtime query，并在全部 bank 上做 exact
+cosine，因而没有 query label 拟合、阈值搜索或 winner selection。
+
+报告对三种 key component 分别给出 reference/target rank、score gap、permutation null、hub concentration、
+full-bank Gini、所有成对 rank delta、key-key geometry、applicability/dynamic 逐条 cosine 与 residual norm，
+并恢复每个变体两侧 top hub 的文本。解释合同固定如下：若 applicability 与 dynamic 同样弱且 residual 也弱，
+说明 `Prefer` 信息对当前 runtime query 不可读，应转向 query/pooling 设计；若 applicability 明显更强，说明
+追加 decision 干扰了表示；若 residual 明显强于两个完整 key，说明 decision 方向存在但被基础场景表示掩盖，
+下一步才有理由设计独立的 decision/action 检索通道。无论哪种结果，本诊断都不改变正式 V3.5 qualification。
+
 ### Injection layer
 
 当前 V3 只在 layer 24 注入，不做 layer search、multi-layer 或候选层双路编译。等 V3 全流程和全量
