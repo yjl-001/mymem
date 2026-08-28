@@ -548,6 +548,29 @@ query ranking、threshold 或结果位置选择；它只复用 bank 已认证的
 基本对齐；高 recall 只表示必要的 in-source sanity check 通过，不能证明跨题泛化或任务收益。若 target
 明显强而 reference 弱，应解释为 confirmation retrieval，而不是 corrective retrieval。
 
+#### Dynamic hubness decomposition diagnostic
+
+当 source-state audit 显示 own-memory rank 仅弱于随机但 top-1 被少数 memory 集中占据时，复用已经
+认证的 first-gate exact query sidecar，运行固定的 key-only geometry 对照：
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_5_dynamic_hubness_audit.sh \
+  "$PHASE1_DIR" \
+  "$E0_DIR" \
+  "$OUTPUT_ROOT"
+```
+
+该 audit 不再运行 reasoner forward 或 generation，只比较三个预注册变体：原始 cosine、同时从 key/query
+减去 dynamic-key centroid 后重新 L2 normalize，以及在 centered residual 上额外移除由 dynamic keys
+拟合的唯一 PC1。Centroid、PC1 都只从已认证 dynamic keys 拟合，不使用 query label、answer、reward、
+accuracy 或 task outcome；PC 数固定为 1，不搜索变体、不选择 winner，也不修改正式 V3.5 qualification。
+
+报告分别给出 reference/target first-gate 的 rank、score gap、permutation null、top-1/top-2 concentration、
+full-bank Gini、pairwise raw→candidate rank delta、key-key cosine geometry，并恢复每个变体两侧 top hub 的
+`when_facing`、compiled `transferable_decision` 和完整 dynamic key 文本。若 centering 同时降低 hub share
+并提高 holdout source rank，说明公共 embedding component 遮蔽了仍可利用的相对信号；若 centering 与
+固定 PC1 removal 都无效，则优先判定 abstract last-token key 与 runtime current-token query 仍存在语义错位。
+
 ### Injection layer
 
 当前 V3 只在 layer 24 注入，不做 layer search、multi-layer 或候选层双路编译。等 V3 全流程和全量
