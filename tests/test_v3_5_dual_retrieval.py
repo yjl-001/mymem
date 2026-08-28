@@ -1197,6 +1197,17 @@ class V35ApplicabilityRetrieverTests(unittest.TestCase):
 
 
 class V35DualCompilerScriptTests(unittest.TestCase):
+    def test_compiler_imports_repository_text_hash_helper(self) -> None:
+        tree = ast.parse(COMPILE_SCRIPT.read_text(encoding="utf-8"))
+        phase1_imports = {
+            alias.name
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "memgen.experience.phase1"
+            for alias in node.names
+        }
+        self.assertIn("text_sha256", phase1_imports)
+
     def test_cli_exposes_all_authenticated_inputs_and_separate_calibration_output(self) -> None:
         result = subprocess.run(
             [sys.executable, str(COMPILE_SCRIPT), "--help"],

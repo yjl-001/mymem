@@ -18,7 +18,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from memgen.experience.memory import MemoryRecord
-from memgen.experience.phase1 import canonical_json_sha256, file_sha256, iter_jsonl
+from memgen.experience.phase1 import (
+    canonical_json_sha256,
+    file_sha256,
+    iter_jsonl,
+    text_sha256,
+)
 from memgen.experience.v3_5_selector import (
     V35_APPLICABILITY_CALIBRATION_SCHEMA,
     calibrate_applicability_selector,
