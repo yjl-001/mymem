@@ -132,7 +132,14 @@ class V35SourceStructureTests(unittest.TestCase):
         )
         join_source = ast.get_source_segment(source, join_sources) or ""
         self.assertIn("sanitize_v35_dynamic_decision_text", join_source)
-        self.assertNotIn("when_facing\",\n                text=", join_source)
+        validator_calls = [
+            node
+            for node in ast.walk(join_sources)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "validate_v35_dynamic_text_component"
+        ]
+        self.assertEqual(validator_calls, [])
 
 
 class FixtureTokenizer:
