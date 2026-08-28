@@ -67,10 +67,16 @@ V35_STATIC_SHORTLIST_SCHEMA = "experience-memory-v3.5-static-shortlist-v1"
 
 V35_APPLICABILITY_KEY_SOURCE = "sanitized_fields.when_facing"
 V35_DYNAMIC_KEY_SOURCE = (
-    "sanitized_fields.when_facing_plus_sanitized_"
+    "sanitized_fields.when_facing_plus_v35_canonicalized_sanitized_"
     "bank.target.transferable_decision"
 )
 V35_DYNAMIC_DECISION_PATH = "bank.target.transferable_decision"
+V35_DYNAMIC_DECISION_SANITIZATION_POLICY = (
+    "canonicalize_answer_format_vocabulary_v1"
+)
+V35_DYNAMIC_WHEN_FACING_POLICY = (
+    "verbatim_sanitized_fields.when_facing_semantic_answer_language_allowed"
+)
 
 _REQUIRED_PROVENANCE_FIELDS = (
     "memory_records_sha256",
@@ -114,8 +120,36 @@ V35_IMPLEMENTATION_PATHS = (
     "scripts/experiments/gsm8k/run_v3_5_applicability_selector_experiment.sh",
 )
 
+_V35_DYNAMIC_ANSWER_CONTAINER_RE = re.compile(
+    r"\\(?:boxed|fbox)\b",
+    flags=re.IGNORECASE,
+)
+_V35_DYNAMIC_FINAL_ANSWER_RE = re.compile(
+    r"\bfinal(?:[\s-]+(?:boxed|numeric|computed|requested|single|plain|exact|"
+    r"correct|monetary|discounted|known|resulting)){0,3}[\s-]+answer\b",
+    flags=re.IGNORECASE,
+)
+_V35_DYNAMIC_BOXED_ANSWER_RE = re.compile(
+    r"\b(?:first[\s-]+)?boxed"
+    r"(?:[\s-]+(?:final|numeric|computed|requested|single|plain|exact|correct|"
+    r"monetary|discounted|known|resulting)){0,3}"
+    r"[\s-]+answer\b",
+    flags=re.IGNORECASE,
+)
+_V35_DYNAMIC_BOX_VERB_RE = re.compile(
+    r"\bbox(?=\s+(?:the\s+)?(?:final|resulting|computed|requested|numeric|"
+    r"single|plain|exact|correct|monetary|discounted|known|answer|value|"
+    r"result|total|amount|number)\b)",
+    flags=re.IGNORECASE,
+)
+_V35_DYNAMIC_BOXED_WORD_RE = re.compile(r"\bboxed\b", flags=re.IGNORECASE)
 _V35_PROHIBITED_DYNAMIC_BOILERPLATE = re.compile(
-    r"(?:\\(?:boxed|fbox)\b|\bboxed\b|\bfinal(?:[\s-]+)answer\b)",
+    r"(?:\\(?:boxed|fbox)\b|\bboxed\b|"
+    r"\bfinal(?:[\s-]+(?:boxed|numeric|computed|requested|single|plain|exact|"
+    r"correct|monetary|discounted|known|resulting)){0,3}[\s-]+answer\b|"
+    r"\bbox(?=\s+(?:the\s+)?(?:final|resulting|computed|requested|numeric|"
+    r"single|plain|exact|correct|monetary|discounted|known|answer|value|"
+    r"result|total|amount|number)\b))",
     flags=re.IGNORECASE,
 )
 _V35_UNIT_NORM_ATOL = 1e-5
@@ -263,12 +297,66 @@ def canonicalize_v35_query_embedding(
 
 
 def validate_v35_dynamic_text_component(*, owner: str, text: str) -> None:
-    """Reject V3.5-forbidden final-answer/verifier boilerplate verbatim."""
+    """Reject answer-format vocabulary from a compiled V3.5 decision."""
 
     if _V35_PROHIBITED_DYNAMIC_BOILERPLATE.search(text):
         raise ValueError(
             f"V3.5 {owner} contains prohibited final-answer/boxed boilerplate"
         )
+
+
+def _v35_case_aware_replacement(match: re.Match[str], replacement: str) -> str:
+    if match.group(0)[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
+
+
+def sanitize_v35_dynamic_decision_text(*, owner: str, text: str) -> tuple[str, bool]:
+    """Canonicalize only answer-format vocabulary in a dynamic decision.
+
+    The Phase-1/E0 sanitizer intentionally accepts generic phrases such as
+    ``final answer``.  V3.5 keeps that older contract unchanged, then applies
+    this compiler-local pass so useful decision clauses are preserved while
+    boxed/final-answer formatting language cannot dominate the dynamic key.
+    """
+
+    normalized = PayloadSanitizer.normalize_text(text)
+    if not normalized:
+        raise ValueError(f"V3.5 {owner} is empty before answer-format cleanup")
+    if _V35_DYNAMIC_ANSWER_CONTAINER_RE.search(normalized):
+        validate_v35_dynamic_text_component(owner=owner, text=normalized)
+
+    scrubbed = _V35_DYNAMIC_FINAL_ANSWER_RE.sub(
+        lambda match: _v35_case_aware_replacement(match, "requested result"),
+        normalized,
+    )
+    scrubbed = _V35_DYNAMIC_BOXED_ANSWER_RE.sub(
+        lambda match: _v35_case_aware_replacement(match, "requested result"),
+        scrubbed,
+    )
+    scrubbed = _V35_DYNAMIC_BOX_VERB_RE.sub(
+        lambda match: _v35_case_aware_replacement(match, "use"),
+        scrubbed,
+    )
+    scrubbed = _V35_DYNAMIC_BOXED_WORD_RE.sub("", scrubbed)
+    scrubbed = re.sub(
+        r"\bclearly\s+requested result\b",
+        "requested result",
+        scrubbed,
+        flags=re.IGNORECASE,
+    )
+    scrubbed = re.sub(
+        r"\brequested result(?:\s+requested result)+\b",
+        "requested result",
+        scrubbed,
+        flags=re.IGNORECASE,
+    )
+    scrubbed = re.sub(r"\s+([,.;:!?])", r"\1", scrubbed)
+    scrubbed = PayloadSanitizer.normalize_text(scrubbed)
+    if not scrubbed:
+        raise ValueError(f"V3.5 {owner} is empty after answer-format cleanup")
+    validate_v35_dynamic_text_component(owner=owner, text=scrubbed)
+    return scrubbed, scrubbed != normalized
 
 
 def _logical_manifest_sha256(value: Mapping[str, Any]) -> str:
@@ -319,6 +407,10 @@ class DualRetrievalKeyCompilerConfig:
     representation: str = "decoder_layer_output"
     applicability_key_source: str = V35_APPLICABILITY_KEY_SOURCE
     dynamic_key_source: str = V35_DYNAMIC_KEY_SOURCE
+    dynamic_when_facing_policy: str = V35_DYNAMIC_WHEN_FACING_POLICY
+    dynamic_decision_sanitization_policy: str = (
+        V35_DYNAMIC_DECISION_SANITIZATION_POLICY
+    )
     pooling: str = "last_valid_token"
     normalization: str = "l2"
     attention_backend: str = SIDE_KV_ATTENTION_BACKEND
@@ -336,6 +428,13 @@ class DualRetrievalKeyCompilerConfig:
             raise ValueError("V3.5 applicability source must be when_facing")
         if self.dynamic_key_source != V35_DYNAMIC_KEY_SOURCE:
             raise ValueError("V3.5 dynamic key source contract drifted")
+        if self.dynamic_when_facing_policy != V35_DYNAMIC_WHEN_FACING_POLICY:
+            raise ValueError("V3.5 dynamic when_facing policy drifted")
+        if (
+            self.dynamic_decision_sanitization_policy
+            != V35_DYNAMIC_DECISION_SANITIZATION_POLICY
+        ):
+            raise ValueError("V3.5 dynamic decision sanitizer policy drifted")
         if self.pooling != "last_valid_token" or self.normalization != "l2":
             raise ValueError("V3.5 dual keys require last-valid pooling and L2")
         if self.attention_backend != SIDE_KV_ATTENTION_BACKEND:
@@ -384,7 +483,9 @@ class CompiledDualRetrievalKeyBank:
 class _JoinedSource:
     record: MemoryRecord
     source: Phase1MemorySource
+    raw_transferable_decision: str
     transferable_decision: str
+    dynamic_decision_canonicalized: bool
     split_member: Mapping[str, Any]
 
 
@@ -531,6 +632,9 @@ class DualRetrievalKeyCompiler:
                 ),
                 "applicability_embedding_exact_reproduction": True,
                 "dynamic_key_source": self.config.dynamic_key_source,
+                "dynamic_when_facing_text_sha256": text_sha256(
+                    item["applicability_text"]
+                ),
                 "dynamic_key_text_sha256": text_sha256(item["dynamic_text"]),
                 "dynamic_key_token_count": len(item["dynamic_token_ids"]),
                 "dynamic_key_token_ids_sha256": canonical_json_sha256(
@@ -538,6 +642,15 @@ class DualRetrievalKeyCompiler:
                 ),
                 "dynamic_key_embedding_sha256": tensor_sha256(dynamic_embedding),
                 "dynamic_key_embedding_norm": float(dynamic_embedding.norm().item()),
+                "dynamic_decision_raw_sanitized_sha256": text_sha256(
+                    item["raw_transferable_decision"]
+                ),
+                "dynamic_decision_compiled_sha256": text_sha256(
+                    item["transferable_decision"]
+                ),
+                "dynamic_decision_v35_canonicalized": bool(
+                    item["dynamic_decision_canonicalized"]
+                ),
                 "source_record_sha256": record.source_record_sha256,
                 "phase1_provenance_sha256": record.phase1_provenance_sha256,
                 "review_provenance_sha256": record.review_provenance_sha256,
@@ -797,11 +910,7 @@ class DualRetrievalKeyCompiler:
                 ) from exc
             if not decision.strip():
                 raise ValueError(f"{record.memory_id} has an empty dynamic decision")
-            validate_v35_dynamic_text_component(
-                owner=f"{record.memory_id} when_facing",
-                text=str(record.sanitized_fields.get("when_facing", "")),
-            )
-            validate_v35_dynamic_text_component(
+            dynamic_decision, canonicalized = sanitize_v35_dynamic_decision_text(
                 owner=f"{record.memory_id} transferable_decision",
                 text=decision,
             )
@@ -809,7 +918,9 @@ class DualRetrievalKeyCompiler:
                 _JoinedSource(
                     record=record,
                     source=source,
-                    transferable_decision=decision,
+                    raw_transferable_decision=decision,
+                    transferable_decision=dynamic_decision,
+                    dynamic_decision_canonicalized=canonicalized,
                     split_member=split_member,
                 )
             )
@@ -820,6 +931,11 @@ class DualRetrievalKeyCompiler:
             for trace in source_trace
             if trace.status == "rejected_selection"
         )
+        canonicalized_source_ids = [
+            item.record.source_experience_id
+            for item in joined
+            if item.dynamic_decision_canonicalized
+        ]
         audit = {
             "approved_input_count": len(approved_by_id),
             "verified_input_count": len(verified_by_id),
@@ -827,6 +943,17 @@ class DualRetrievalKeyCompiler:
             "selector_rejected_source_count": len(rejected_ids),
             "selected_memory_source_count": len(record_source_ids),
             "unselected_valid_source_count": len(unselected_valid_ids),
+            "dynamic_when_facing_policy": V35_DYNAMIC_WHEN_FACING_POLICY,
+            "dynamic_decision_sanitization_policy": (
+                V35_DYNAMIC_DECISION_SANITIZATION_POLICY
+            ),
+            "dynamic_decision_canonicalized_count": len(
+                canonicalized_source_ids
+            ),
+            "dynamic_decision_canonicalized_source_ids_sha256": (
+                canonical_json_sha256(canonicalized_source_ids)
+            ),
+            "dynamic_decision_prohibited_boilerplate_absent": True,
             "validated_source_ids_sha256": canonical_json_sha256(
                 sorted(valid_source_ids)
             ),
@@ -986,8 +1113,13 @@ class DualRetrievalKeyCompiler:
             f"When facing: {applicability_text}\n"
             f"Prefer: {joined.transferable_decision}"
         )
+        # ``when_facing`` is reproduced verbatim because phrases such as
+        # "final answer is a single numeric value" describe applicability in
+        # real GSM8K records.  Only the separately sourced decision is subject
+        # to V3.5 answer-format canonicalization.
         validate_v35_dynamic_text_component(
-            owner=f"{record.memory_id} dynamic key", text=dynamic_text
+            owner=f"{record.memory_id} transferable_decision",
+            text=joined.transferable_decision,
         )
         applicability_token_ids = [
             int(value)
@@ -1039,6 +1171,11 @@ class DualRetrievalKeyCompiler:
             "applicability_text": applicability_text,
             "applicability_token_ids": applicability_token_ids,
             "reproduced_applicability_embedding": reproduced,
+            "raw_transferable_decision": joined.raw_transferable_decision,
+            "transferable_decision": joined.transferable_decision,
+            "dynamic_decision_canonicalized": (
+                joined.dynamic_decision_canonicalized
+            ),
             "dynamic_text": dynamic_text,
             "dynamic_token_ids": dynamic_token_ids,
             "dynamic_embedding": dynamic_embedding,
@@ -1242,12 +1379,25 @@ class DualRetrievalKeyBankLoader:
             raise ValueError("V3.5 applicability reproduction audit did not pass")
         source_join = self.manifest.get("source_join", {})
         selected_source_hash = canonical_json_sha256(source_ids)
+        canonicalized_count = int(
+            source_join.get("dynamic_decision_canonicalized_count", -1)
+        )
         if (
             source_join.get("policy")
             != "approved_verified_memory_one_to_one_fail_closed"
             or int(source_join.get("joined_record_count", -1)) != len(records)
             or source_join.get("dynamic_decision_path")
             != V35_DYNAMIC_DECISION_PATH
+            or source_join.get("dynamic_when_facing_policy")
+            != V35_DYNAMIC_WHEN_FACING_POLICY
+            or source_join.get("dynamic_decision_sanitization_policy")
+            != V35_DYNAMIC_DECISION_SANITIZATION_POLICY
+            or canonicalized_count < 0
+            or canonicalized_count > len(records)
+            or source_join.get(
+                "dynamic_decision_prohibited_boilerplate_absent"
+            )
+            is not True
             or int(source_join.get("approved_input_count", -1))
             != int(source_join.get("validated_source_count", -2))
             + int(source_join.get("selector_rejected_source_count", -3))
@@ -1266,6 +1416,7 @@ class DualRetrievalKeyBankLoader:
                     "validated_source_ids_sha256",
                     "unselected_valid_source_ids_sha256",
                     "selector_rejected_source_ids_sha256",
+                    "dynamic_decision_canonicalized_source_ids_sha256",
                 )
             )
         ):
@@ -1307,6 +1458,7 @@ class DualRetrievalKeyBankLoader:
                 raise ValueError(f"V3.5 {owner} embeddings are not L2 normalized")
         if self.applicability_embeddings.shape != self.dynamic_embeddings.shape:
             raise ValueError("V3.5 applicability and dynamic tensor shapes differ")
+        canonicalized_source_ids: list[str] = []
         for entry, applicability, dynamic in zip(
             self.entries,
             self.applicability_embeddings,
@@ -1318,8 +1470,11 @@ class DualRetrievalKeyBankLoader:
                 "payload_hash",
                 "applicability_key_text_sha256",
                 "applicability_key_token_ids_sha256",
+                "dynamic_when_facing_text_sha256",
                 "dynamic_key_text_sha256",
                 "dynamic_key_token_ids_sha256",
+                "dynamic_decision_raw_sanitized_sha256",
+                "dynamic_decision_compiled_sha256",
                 "source_record_sha256",
                 "phase1_provenance_sha256",
                 "review_provenance_sha256",
@@ -1334,10 +1489,27 @@ class DualRetrievalKeyBankLoader:
             )
             if any(not str(entry.get(field, "")) for field in required):
                 raise ValueError("V3.5 dual-key record metadata is incomplete")
+            canonicalized = entry.get("dynamic_decision_v35_canonicalized")
+            if not isinstance(canonicalized, bool):
+                raise ValueError("V3.5 dual-key per-record contract drifted")
+            raw_decision_hash = str(
+                entry["dynamic_decision_raw_sanitized_sha256"]
+            )
+            compiled_decision_hash = str(
+                entry["dynamic_decision_compiled_sha256"]
+            )
+            if canonicalized != (raw_decision_hash != compiled_decision_hash):
+                raise ValueError("V3.5 dynamic-decision audit is inconsistent")
+            if canonicalized:
+                canonicalized_source_ids.append(
+                    str(entry["source_experience_id"])
+                )
             if (
                 entry.get("applicability_key_source")
                 != V35_APPLICABILITY_KEY_SOURCE
                 or entry.get("dynamic_key_source") != V35_DYNAMIC_KEY_SOURCE
+                or entry.get("dynamic_when_facing_text_sha256")
+                != entry.get("applicability_key_text_sha256")
                 or int(entry.get("kv_layer", -1)) != 24
                 or int(entry.get("payload_token_count", 0)) <= 0
                 or int(entry.get("kv_valid_slot_count", 0)) <= 0
@@ -1377,6 +1549,16 @@ class DualRetrievalKeyBankLoader:
                     rel_tol=0.0,
                 ):
                     raise ValueError("V3.5 per-record embedding norm mismatch")
+        source_join = self.manifest.get("source_join", {})
+        if (
+            int(source_join.get("dynamic_decision_canonicalized_count", -1))
+            != len(canonicalized_source_ids)
+            or source_join.get(
+                "dynamic_decision_canonicalized_source_ids_sha256"
+            )
+            != canonical_json_sha256(canonicalized_source_ids)
+        ):
+            raise ValueError("V3.5 dynamic-decision aggregate audit drifted")
 
 
 @dataclass(frozen=True)
@@ -2048,11 +2230,14 @@ __all__ = [
     "V35_APPLICABILITY_TENSOR_NAME",
     "V35_DUAL_KEY_MANIFEST_FILE",
     "V35_DUAL_KEY_TENSOR_FILE",
+    "V35_DYNAMIC_DECISION_SANITIZATION_POLICY",
     "V35_DYNAMIC_KEY_SOURCE",
     "V35_DYNAMIC_TENSOR_NAME",
+    "V35_DYNAMIC_WHEN_FACING_POLICY",
     "V35MemoryChoice",
     "V35StaticShortlist",
     "canonicalize_v35_query_embedding",
+    "sanitize_v35_dynamic_decision_text",
     "v35_implementation_files_sha256",
     "validate_v35_dynamic_text_component",
     "validate_v35_split_manifest",

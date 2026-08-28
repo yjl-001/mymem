@@ -50,11 +50,14 @@ BM25，也不把经验文本重新编译为 KV。
 ID/order/payload 对齐，不能只相信已有路径名。
 
 V3.5 另外通过 `source_experience_id` 一一 join Phase-1 approved/verified records，把
-`bank.target.transferable_decision` 单独按 E0 规则清洗，构造唯一允许的 dynamic key 文本：
+`bank.target.transferable_decision` 单独按 E0 规则清洗，再用 V3.5 的确定性
+`canonicalize_answer_format_vocabulary_v1` 规则规范化其中的 boxed/final-answer 输出格式词汇，构造唯一允许的
+dynamic key 文本。该局部规则不改变 E0 sanitizer，也不改写 `when_facing`；真实 GSM8K 记录里
+`when_facing` 对“最终答案类型”的描述仍按原 V3 key 逐字复现：
 
 ```text
 When facing: {sanitized when_facing}
-Prefer: {sanitized transferable_decision}
+Prefer: {V3.5-canonicalized sanitized transferable_decision}
 ```
 
 `verification_rule`、reference、Avoid、generic failure signal 与 final-answer boilerplate 均不得进入 dynamic

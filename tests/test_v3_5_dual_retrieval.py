@@ -6,6 +6,7 @@ import copy
 from dataclasses import asdict, replace
 import json
 from pathlib import Path
+import re
 from types import SimpleNamespace
 import subprocess
 import sys
@@ -42,6 +43,37 @@ COMPILE_SCRIPT = PROJECT_ROOT / "scripts" / "compile_v3_5_dual_selector.py"
 
 
 class V35SourceStructureTests(unittest.TestCase):
+    @staticmethod
+    def _dynamic_text_policy_namespace() -> dict:
+        source_path = PROJECT_ROOT / "memgen" / "model" / "v3_5_retrieval.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        assignments = {
+            "_V35_DYNAMIC_ANSWER_CONTAINER_RE",
+            "_V35_DYNAMIC_FINAL_ANSWER_RE",
+            "_V35_DYNAMIC_BOXED_ANSWER_RE",
+            "_V35_DYNAMIC_BOX_VERB_RE",
+            "_V35_DYNAMIC_BOXED_WORD_RE",
+            "_V35_PROHIBITED_DYNAMIC_BOILERPLATE",
+        }
+        functions = {
+            "_v35_case_aware_replacement",
+            "validate_v35_dynamic_text_component",
+            "sanitize_v35_dynamic_decision_text",
+        }
+        selected = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id in assignments
+                for target in node.targets
+            ):
+                selected.append(node)
+            elif isinstance(node, ast.FunctionDef) and node.name in functions:
+                selected.append(node)
+        namespace = {"re": re, "PayloadSanitizer": PayloadSanitizer}
+        module = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
+        exec(compile(module, str(source_path), "exec"), namespace)
+        return namespace
+
     def test_retriever_has_exactly_one_retrieve_definition(self) -> None:
         source_path = PROJECT_ROOT / "memgen" / "model" / "v3_5_retrieval.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
@@ -58,6 +90,49 @@ class V35SourceStructureTests(unittest.TestCase):
             and node.name == "retrieve"
         ]
         self.assertEqual(len(retrieve_definitions), 1)
+
+    def test_dynamic_decision_cleanup_runs_without_torch(self) -> None:
+        namespace = self._dynamic_text_policy_namespace()
+        sanitize = namespace["sanitize_v35_dynamic_decision_text"]
+        validate = namespace["validate_v35_dynamic_text_component"]
+        cases = {
+            "Compute the total, then present it as the boxed answer.": (
+                "Compute the total, then present it as the requested result."
+            ),
+            "Box the resulting single number as the final numeric answer.": (
+                "Use the resulting single number as the requested result."
+            ),
+            "Present the value in the required boxed format.": (
+                "Present the value in the required format."
+            ),
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                actual, changed = sanitize(owner="fixture", text=raw)
+                self.assertTrue(changed)
+                self.assertEqual(actual, expected)
+                validate(owner="compiled fixture", text=actual)
+        with self.assertRaisesRegex(ValueError, "prohibited"):
+            sanitize(owner="fixture", text=r"Copy the \boxed{} container.")
+
+    def test_when_facing_is_not_rejected_by_decision_only_policy(self) -> None:
+        source_path = PROJECT_ROOT / "memgen" / "model" / "v3_5_retrieval.py"
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        compiler = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "DualRetrievalKeyCompiler"
+        )
+        join_sources = next(
+            node
+            for node in compiler.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_join_sources"
+        )
+        join_source = ast.get_source_segment(source, join_sources) or ""
+        self.assertIn("sanitize_v35_dynamic_decision_text", join_source)
+        self.assertNotIn("when_facing\",\n                text=", join_source)
 
 
 class FixtureTokenizer:
@@ -500,8 +575,27 @@ class V35DualCompilerTests(unittest.TestCase):
                 text_sha256(applicability_text),
             )
             self.assertEqual(entry["dynamic_key_source"], V35_DYNAMIC_KEY_SOURCE)
+            self.assertEqual(
+                entry["dynamic_when_facing_text_sha256"],
+                entry["applicability_key_text_sha256"],
+            )
             self.assertTrue(entry["applicability_embedding_exact_reproduction"])
             self.assertEqual(entry["kv_valid_slot_count"], record.token_count)
+            self.assertEqual(
+                entry["dynamic_decision_raw_sanitized_sha256"],
+                text_sha256(approved["bank"]["target"]["transferable_decision"]),
+            )
+            self.assertEqual(
+                entry["dynamic_decision_compiled_sha256"],
+                entry["dynamic_decision_raw_sanitized_sha256"],
+            )
+            self.assertFalse(entry["dynamic_decision_v35_canonicalized"])
+
+        source_join = compiled.manifest["source_join"]
+        self.assertEqual(source_join["dynamic_decision_canonicalized_count"], 0)
+        self.assertTrue(
+            source_join["dynamic_decision_prohibited_boilerplate_absent"]
+        )
 
         _, manifest_path = compiled.save(self.root / "dual")
         loader = DualRetrievalKeyBankLoader(
@@ -652,16 +746,45 @@ class V35DualCompilerTests(unittest.TestCase):
                 artifact_provenance=self.provenance,
             )
 
-    def test_dynamic_final_answer_boilerplate_is_rejected(self) -> None:
+    def test_dynamic_decision_answer_format_is_canonicalized(self) -> None:
         from memgen.model.v3_5_retrieval import (
+            sanitize_v35_dynamic_decision_text,
             validate_v35_dynamic_text_component,
         )
 
-        for text in ("check the final answer", "FINAL-ANSWER", "boxed", r"\fbox"):
+        for text in (
+            "check the final answer",
+            "FINAL numeric ANSWER",
+            "boxed",
+            "Box the result",
+            r"\fbox",
+        ):
             with self.subTest(text=text), self.assertRaisesRegex(
                 ValueError, "prohibited"
             ):
                 validate_v35_dynamic_text_component(owner="fixture", text=text)
+
+        cases = {
+            "Compute the total, then present it as the boxed answer.": (
+                "Compute the total, then present it as the requested result."
+            ),
+            "Box the resulting single number as the final numeric answer.": (
+                "Use the resulting single number as the requested result."
+            ),
+            "Present the value in the required boxed format.": (
+                "Present the value in the required format."
+            ),
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                actual, changed = sanitize_v35_dynamic_decision_text(
+                    owner="fixture", text=raw
+                )
+                self.assertTrue(changed)
+                self.assertEqual(actual, expected)
+                validate_v35_dynamic_text_component(
+                    owner="compiled fixture", text=actual
+                )
 
         approved = [copy.deepcopy(value) for value in self.approved]
         approved[0]["bank"]["target"]["transferable_decision"] = (
@@ -672,16 +795,67 @@ class V35DualCompilerTests(unittest.TestCase):
             records[0],
             source_record_sha256=canonical_json_sha256(approved[0]),
         )
-        with self.assertRaisesRegex(ValueError, "prohibited"):
-            self._compiler().compile(
-                records=records,
-                approved_records=approved,
-                verified_experiences=self.verified,
-                applicability_key_bank=self.old_loader,
-                side_kv_manifest=self.side_manifest,
-                split_manifest=self.split_manifest,
-                artifact_provenance=self.provenance,
-            )
+        self.tokenizer.calls.clear()
+        compiled = self._compiler().compile(
+            records=records,
+            approved_records=approved,
+            verified_experiences=self.verified,
+            applicability_key_bank=self.old_loader,
+            side_kv_manifest=self.side_manifest,
+            split_manifest=self.split_manifest,
+            artifact_provenance=self.provenance,
+        )
+        dynamic_texts = [
+            text
+            for text, _ in self.tokenizer.calls
+            if text.startswith("When facing:")
+        ]
+        self.assertTrue(dynamic_texts)
+        self.assertIn(
+            "Prefer: Check the requested result before proceeding.",
+            dynamic_texts[0],
+        )
+        entry = compiled.manifest["records"][0]
+        self.assertTrue(entry["dynamic_decision_v35_canonicalized"])
+        self.assertNotEqual(
+            entry["dynamic_decision_raw_sanitized_sha256"],
+            entry["dynamic_decision_compiled_sha256"],
+        )
+        source_join = compiled.manifest["source_join"]
+        self.assertEqual(source_join["dynamic_decision_canonicalized_count"], 1)
+        self.assertEqual(
+            source_join["dynamic_decision_canonicalized_source_ids_sha256"],
+            canonical_json_sha256([records[0].source_experience_id]),
+        )
+
+    def test_semantic_answer_language_in_when_facing_is_preserved(self) -> None:
+        approved = [copy.deepcopy(value) for value in self.approved]
+        approved[0]["bank"]["target"]["situation_signature"] = (
+            "A word problem whose final answer is a single numeric value."
+        )
+        approved[0]["bank"]["target"]["applicability_boundary"] = (
+            "Use this when a boxed format is requested by the task."
+        )
+        approved[0]["bank"]["target"]["transferable_decision"] = (
+            "Compute every quantity, then present the final total as the boxed answer."
+        )
+        built = self.builder.build(approved, self.verified)
+        self.assertEqual(len(built.records), 2)
+        joined, audit = self._compiler()._join_sources(
+            records=built.records,
+            approved_records=approved,
+            verified_experiences=self.verified,
+            split_manifest=self.split_manifest,
+        )
+        when_facing = built.records[0].sanitized_fields["when_facing"]
+        self.assertIn("final answer", when_facing)
+        self.assertIn("boxed format", when_facing)
+        self.assertEqual(
+            joined[0].transferable_decision,
+            "Compute every quantity, then present the final total as the requested result.",
+        )
+        self.assertTrue(joined[0].dynamic_decision_canonicalized)
+        self.assertEqual(audit["dynamic_decision_canonicalized_count"], 1)
 
 
 @unittest.skipIf(torch is None, "Torch is required for V3.5 retrieval tests")
@@ -730,7 +904,9 @@ class V35ApplicabilityRetrieverTests(unittest.TestCase):
             DualRetrievalKeyBankLoader,
             DualRetrievalKeyCompilerConfig,
             V35_APPLICABILITY_KEY_SOURCE,
+            V35_DYNAMIC_DECISION_SANITIZATION_POLICY,
             V35_DYNAMIC_KEY_SOURCE,
+            V35_DYNAMIC_WHEN_FACING_POLICY,
             v35_implementation_files_sha256,
         )
 
@@ -790,11 +966,17 @@ class V35ApplicabilityRetrieverTests(unittest.TestCase):
                 ),
                 "applicability_embedding_exact_reproduction": True,
                 "dynamic_key_source": V35_DYNAMIC_KEY_SOURCE,
+                "dynamic_when_facing_text_sha256": f"text-{memory_id}",
                 "dynamic_key_text_sha256": f"dynamic-text-{memory_id}",
                 "dynamic_key_token_count": 2,
                 "dynamic_key_token_ids_sha256": f"dynamic-tokens-{memory_id}",
                 "dynamic_key_embedding_sha256": tensor_sha256(dynamic[index]),
                 "dynamic_key_embedding_norm": 1.0,
+                "dynamic_decision_raw_sanitized_sha256": (
+                    f"decision-{memory_id}"
+                ),
+                "dynamic_decision_compiled_sha256": f"decision-{memory_id}",
+                "dynamic_decision_v35_canonicalized": False,
                 "source_record_sha256": f"record-{memory_id}",
                 "phase1_provenance_sha256": f"phase1-{memory_id}",
                 "review_provenance_sha256": f"review-{memory_id}",
@@ -837,6 +1019,15 @@ class V35ApplicabilityRetrieverTests(unittest.TestCase):
                 "policy": "approved_verified_memory_one_to_one_fail_closed",
                 "joined_record_count": 3,
                 "dynamic_decision_path": "bank.target.transferable_decision",
+                "dynamic_when_facing_policy": V35_DYNAMIC_WHEN_FACING_POLICY,
+                "dynamic_decision_sanitization_policy": (
+                    V35_DYNAMIC_DECISION_SANITIZATION_POLICY
+                ),
+                "dynamic_decision_canonicalized_count": 0,
+                "dynamic_decision_canonicalized_source_ids_sha256": (
+                    canonical_json_sha256([])
+                ),
+                "dynamic_decision_prohibited_boilerplate_absent": True,
                 "approved_input_count": 3,
                 "verified_input_count": 3,
                 "validated_source_count": 3,
@@ -1138,6 +1329,24 @@ class V35ApplicabilityRetrieverTests(unittest.TestCase):
         })
         self.manifest_path.write_text(json.dumps(value), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "record metadata is incomplete"):
+            DualRetrievalKeyBankLoader(manifest_path=self.manifest_path)
+
+        value = copy.deepcopy(self.loader.manifest)
+        value["records"][0]["dynamic_decision_v35_canonicalized"] = True
+        value["manifest_sha256"] = canonical_json_sha256({
+            key: item for key, item in value.items() if key != "manifest_sha256"
+        })
+        self.manifest_path.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "audit is inconsistent"):
+            DualRetrievalKeyBankLoader(manifest_path=self.manifest_path)
+
+        value = copy.deepcopy(self.loader.manifest)
+        value["source_join"]["dynamic_decision_canonicalized_count"] = 1
+        value["manifest_sha256"] = canonical_json_sha256({
+            key: item for key, item in value.items() if key != "manifest_sha256"
+        })
+        self.manifest_path.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "aggregate audit drifted"):
             DualRetrievalKeyBankLoader(manifest_path=self.manifest_path)
 
         value = copy.deepcopy(self.loader.manifest)

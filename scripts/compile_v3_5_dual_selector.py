@@ -260,9 +260,10 @@ def _offline_markdown(report: Mapping[str, Any]) -> str:
         ),
         "- Task accuracy/answers/rewards used: `false`",
         "",
-        "The dynamic key contains only sanitized `when_facing` plus the "
-        "sanitized Phase-1 `transferable_decision`. The existing side-KV bank "
-        "is referenced and aligned; it is not recompiled.",
+        "The dynamic key contains only verbatim sanitized `when_facing` plus "
+        "the V3.5 answer-format-canonicalized, E0-sanitized Phase-1 "
+        "`transferable_decision`. The existing side-KV bank is referenced and "
+        "aligned; it is not recompiled.",
         "",
         "## Requirements",
         "",
