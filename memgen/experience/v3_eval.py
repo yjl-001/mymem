@@ -29,6 +29,7 @@ def numeric_summary(values: Sequence[float | int]) -> dict[str, Any]:
         "mean": sum(normalized) / len(normalized),
         "median": float(median(normalized)),
         "p95": percentile_linear(normalized, 0.95),
+        "p99": percentile_linear(normalized, 0.99),
         "max": max(values),
     }
 
@@ -97,6 +98,18 @@ def summarize_v3_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             ),
             "abstain_count": sum(
                 int(value["abstain_count"]) for value in attempt_values
+            ),
+            "terminal_abstain_count": sum(
+                int(value.get("terminal_abstain_count", 0))
+                for value in attempt_values
+            ),
+            "clear_on_terminal_abstain_count": sum(
+                int(value.get("clear_on_terminal_abstain_count", 0))
+                for value in attempt_values
+            ),
+            "static_selector_unavailable_count": sum(
+                bool(value.get("static_selector_unavailable", False))
+                for value in attempt_values
             ),
             "memory_attention_step_count": sum(
                 int(value["memory_attention_step_count"])

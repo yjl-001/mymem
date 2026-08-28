@@ -1,141 +1,125 @@
 # MemGen V3：当前系统与执行流程
 
-V3 冻结为 layer-24、embedding key → compiled side-KV value、entropy hysteresis re-arm 的系统。
-V2 工件和入口仍保留用于历史复现，但新的实验必须使用 V3 schema 和脚本。
+V3 系列共同冻结 layer 24、embedding key → compiled side-KV value、最多三次 retrieval attempt、
+replace-current-memory、greedy decoding、bfloat16 与 SDPA。V2 及早期 V3 入口仍保留用于历史复现，
+但当前主线是 V3.4 的逐 token entropy+risk 联合 gate，以及 V3.5 在其上增加的 applicability selector
+与 terminal-abstain 生命周期修复。
+
+| 版本 | gate / query | selector 与 abstain |
+|---|---|---|
+| V3.1--V3.3 | 语言学 boundary；question + full partial CoT | 全库动态检索与 margin 变体；历史实验 |
+| V3.4 | 每个 pre-answer token；entropy 与 layer-24 risk 联合控制；current-token pooling | 全库动态检索；abstain 后已有 memory 继续 active |
+| V3.5 | 完全复用 V3.4 gate 与 current-token full-prefix query | question-only applicability shortlist → shortlist 内 dynamic rerank；abstain terminal 且清除旧 memory |
 
 ## 1. 完整数据流
 
 ```text
 离线阶段
-MemoryRecord
+MemoryRecord + Phase-1 verified source
   ├─ sanitized when_facing
-  │    └─ frozen reasoner layer-24 / last token / L2
-  │          └─ embedding key bank
-  └─ full When facing + Prefer + Avoid
+  │    └─ 复用并逐条复现 V3 layer-24 / last-valid-token / L2 key
+  │          └─ applicability key bank
+  ├─ When facing + sanitized transferable_decision
+  │    └─ frozen reasoner layer-24 / last-valid-token / L2
+  │          └─ dynamic key bank
+  └─ full When facing + Prefer + Avoid（保持原样）
        └─ frozen reasoner layer-24 canonical pre-RoPE
-             └─ side-KV value bank
+             └─ 已有 side-KV value bank；V3.5 不重编译
 
 在线阶段
-question + full generated partial CoT（从首个生成 token 到当前 boundary）
-  └─ side-KV 暂停，pure-prefix 全量重编码
-       └─ exact cosine top-2（top-1 选择，top-2/margin 记录；当前不设 abstain threshold）
-            └─ memory_id 对齐到已编译 side-KV
-                 └─ layer-24 注入；新 memory 替换旧 memory
+question.strip()（无 ChatML / prompt boilerplate）
+  └─ 一次性 pure re-encode → applicability exact cosine → floor → frozen top-k shortlist
+
+每个 pre-answer generated token t
+  └─ entropy >= high 且 layer-24 persistence risk > threshold
+       └─ 暂停 side-KV，重编码 prompt + 从首 token 到 t 的完整 partial CoT
+            └─ 只在 frozen shortlist 的 dynamic keys 中 exact cosine top-2
+                 ├─ margin 通过 → activate / replace / duplicate compiled side-KV
+                 └─ margin 未通过 → terminal abstain；清除 active memory 并 native re-forward
 ```
 
-key 与 value 通过同一个 `memory_id`、`payload_hash` 和固定 record order 绑定。payload 与 provenance
-仍保留用于审计，但线上不再用 BM25 文本匹配，也不在线重新编译 KV。
+embedding 只选择 `memory_id`；value 始终是该 ID 已编译的 side-KV。key 与 value 通过同一个
+`memory_id`、`payload_hash` 和固定 record order 绑定。payload 与 provenance 保留用于审计，线上不用
+BM25，也不把经验文本重新编译为 KV。
 
 ## 2. 离线阶段
 
-V3 不重新生成 Teacher/Pro 经验，也不重新搜索注入层。它复用已经通过 E0 的 161 条
-`MemoryRecord` 和 layer-24 canonical side-KV，只新增一次 retrieval-key 编译与交叉资格校验：
+原始 V3 key bank 精确编码 `MemoryRecord.sanitized_fields["when_facing"].strip()`；它不是
+`sanitized_retrieval_key`，也不含 Prefer 或 Avoid。V3.5 把该 bank 作为 applicability embeddings 复用，
+但必须验证 `key_source`、layer、pooling、normalization、逐 memory embedding hash 以及与 E0 side-KV 的
+ID/order/payload 对齐，不能只相信已有路径名。
 
-1. 验证 `e0_final_report`、records 和 side-KV 是同一套正式 E0 工件。
-2. 只取 `sanitized_fields.when_facing` 作为检索 key 的语义来源。
-3. 用相同冻结 reasoner 在 hidden-state tuple index 24 取 last-valid-token state，转 float32 并 L2
-   normalize。
-4. 保存 `retrieval_key_bank.safetensors` 和带逐条 embedding hash/norm 的 manifest。
-5. 验证 text/key/KV 的 ID、顺序、payload hash、layer、reasoner revision 全部一致，产生一次
-   `v3_offline_report.json`。
+V3.5 另外通过 `source_experience_id` 一一 join Phase-1 approved/verified records，把
+`bank.target.transferable_decision` 单独按 E0 规则清洗，构造唯一允许的 dynamic key 文本：
 
-入口：
-
-```bash
-python scripts/compile_v3_retrieval_keys.py \
-  --memory-records "$E0_DIR/memory_records.v2.jsonl" \
-  --side-kv-manifest "$E0_DIR/side_kv_manifest.json" \
-  --e0-final-report "$E0_DIR/e0_final_report.json" \
-  --output-dir "$V3_BANK_DIR" \
-  --device cuda \
-  --dtype bfloat16
+```text
+When facing: {sanitized when_facing}
+Prefer: {sanitized transferable_decision}
 ```
 
-当前不再做“双路编译”。entropy-risk artifact 也不属于 memory value 编译；它只提供已校准的高/低熵
-阈值和 recovery/persistence 诊断中心。
+`verification_rule`、reference、Avoid、generic failure signal 与 final-answer boilerplate 均不得进入 dynamic
+key。compiler 在 layer 24 取 last-valid-token state 并 L2 normalize，同时 fail closed 验证 Phase-1、E0、
+原 V3 key bank、reasoner/tokenizer revision 和 side-KV provenance。它输出 dual-key tensor/manifest、离线
+报告以及只基于 source-question positive pair 的 applicability calibration。
+
+source pair 按 `memory_id:source_experience_id`、seed `3501`、train fraction `0.8` 做确定性分区。train 上在
+`k=1..min(32, memory_count)` 中冻结达到 own-memory Recall@k ≥ 0.95 的最小 k，并用 own-positive cosine
+的 5th percentile 冻结 inclusive applicability floor；heldout 必须同时满足 Recall@k ≥ 0.95 与 positive
+retention ≥ 0.90。这里的 floor 是 positive-retention floor，不是完整 relevance classifier；整个离线过程
+不读取 task answer、reward 或 accuracy。
+
+V3.4 token-risk artifact 是独立、只读输入：V3.5 原样复用其 high/low entropy、persistence/recovery
+prototype、risk threshold 与 horizon 32，不重新训练或重新标定。
 
 ## 3. 在线阶段
 
-### Trigger 状态机
+### V3.4/V3.5 连续 token gate
 
-初态为 `ARMED`，只检查答案前的 `,`、`.`、换行 boundary：
+gate 初态为 `ARMED`，并观察答案标记前的每个 generated token，不检查逗号、句号或换行：
 
-- `ARMED + entropy >= high`：触发一次 retrieval attempt。
-- 每次 attempt（包括 duplicate 或 abstain）都消耗预算，并进入 `DISARMED`；第三次后进入
-  `EXHAUSTED`。
-- `DISARMED + entropy <= low`：只执行 re-arm。这个低熵 boundary 本身禁止再次触发；必须等待未来的
-  新 high-entropy boundary。
-- 出现 answer marker 或 EOS 后进入 `CLOSED`。
-- persistence-risk score 在每个被检查的 boundary 记录，但不参与 trigger 或 re-arm 判断。
+- 仅 `ARMED && entropy >= high && persistence_risk > risk_threshold` 发起 retrieval attempt。
+- selected 且无 active memory 时 activation；selected 到不同 ID 时 replacement；相同 ID 时 duplicate。
+  duplicate 仍消耗 attempt，并保留当前 memory。
+- 成功 selection 后进入 `DISARMED`；必须连续两个 `entropy <= low` token 才 re-arm。第二个 low token
+  只完成 re-arm，不能在同一 token 触发。
+- 每题最多三次 attempt；第三次后为 `EXHAUSTED`。answer marker 或 EOS 后为 `CLOSED`。
+- static floor 后不足两个候选时，V3.5 从一开始就是 `EXHAUSTED`，不产生 attempt，并要求 native
+  zero-attempt exact parity；不能把单候选 margin 定义为 infinity。
 
-每题最多 3 次 retrieval attempt。首次选中 memory 时激活；后续选中不同 memory 时替换当前
-memory；选中相同 memory 时记为 duplicate，旧 memory 保持激活。系统始终最多只有一个 active
-memory，不累积 K/V。
+V3.5 的任何 dynamic admission failure 都是 terminal abstain：无论是否已有 active memory，立即进入
+`EXHAUSTED`，之后不再 re-arm。已有 memory 时还必须 deactivate 并回滚 counterfactual probe，随后在
+side-KV inactive 状态下用当前 token 做 native re-forward；因此 `t+1` logits/cache 与后续 attention trace
+都不能残留旧 memory。V3.4 的历史语义不变：它的 margin abstain 会消耗 attempt，但保留已有 memory。
 
 ### Cache 与 query 隔离
 
-- 检索 query 是 canonical prompt token IDs 加当前为止全部生成 token IDs，包括当前 delimiter。
-- query encoder 从头重算 prefix，期间 side-KV 强制暂停；因此检索不使用 memory-conditioned query
-  state，也不读取 live cache。
-- 发生替换时，旧 memory 与新 memory 都从“处理当前 boundary 之前”的同一份 native KV cache
-  分支计算。选择新 memory 后只保留新分支。
-- side-KV 始终走 layer-24 side path，不写入 Hugging Face native KV cache；active memory 持续到
-  replacement 或 EOS。
-
-单题入口：
-
-```bash
-python scripts/run_online_experience_memory_v3.py \
-  --question "..." \
-  --memory-records "$E0_DIR/memory_records.v2.jsonl" \
-  --retrieval-key-manifest "$V3_BANK_DIR/retrieval_key_manifest.json" \
-  --side-kv-manifest "$E0_DIR/side_kv_manifest.json" \
-  --v3-offline-report "$V3_BANK_DIR/v3_offline_report.json" \
-  --e0-final-report "$E0_DIR/e0_final_report.json" \
-  --risk-artifact "$RISK_ARTIFACT" \
-  --output "$OUTPUT_JSON" \
-  --device cuda \
-  --dtype bfloat16
-```
+- static query 只编码一次原始 `question.strip()`，不含 system prompt、ChatML、assistant prefix 或已生成
+  token；side-KV 必须 inactive。
+- dynamic query 是 canonical prompt token IDs 加从第一个 generated token 到当前 token 的全部 token IDs；
+  禁止 last-96 截断。query encoder 从头重算 prefix，并用 `controller.suspend_memory()` 隔离 active memory。
+- activation、replacement 和 terminal clear 都从处理当前 observation token 前的 native cache 分支，按审计
+  合同 rollback/re-forward；side-KV 不写入 Hugging Face native cache。
+- 任一时刻最多一个 active memory。V3.5 memory 持续到 replacement、terminal abstain、answer marker
+  或 EOS。
 
 ## 4. 评估与日志
 
-正式比较只有 `vanilla` 和 `v3`。任务汇总只包含：
+任务正式指标只有：
 
-- 严格准确率：仓库官方 GSM8K first-boxed reward。
-- 格式准确率：第一个 boxed answer 存在且可解析。
-- 生成 token：逐题计数（包含首次 EOS），以及 total/mean/median/p95/max 和配对差值。
+- 严格准确率：仓库官方 GSM8K first-boxed reward；
+- 格式准确率：第一个 boxed answer 存在且可解析；
+- 生成 token：逐题计数（包含首次 EOS）以及 total/mean/median/p95/p99/max 和配对差值。
 
-runner 每题 append、flush、`fsync`，并在 resume 时验证 profile 和每行 hash。日志包含：
+`numeric correct but format invalid`、answer-marker suppression、late attempt、memory lifetime 与 token outlier
+只作为描述性诊断，不能成为第三种正式准确率或在线 gate。
 
-- run provenance、工件 hash、reasoner/tokenizer revision、prompt/generation profile；
-- 每个 boundary 的 gate state、entropy、risk、动作和 active memory；
-- 每次 attempt 的完整 query token/hash、embedding hash/norm、top-2 score/margin、latency 和
-  duplicate/replacement/abstain；
-- memory transition/span、逐步 attention mass、native-cache length、替换首步 logits KL；
-- completion/token IDs、严格/格式结果、token 数和 runtime；
-- attempt/re-arm/replacement/duplicate/memory exposure 汇总与 cache integrity。
+evaluator 每题 append、flush、`fsync`，resume 时认证 profile、artifact hashes 与逐行 hash。V3.5 日志除
+completion 和任务指标外，还记录：一次性 static question hashes、pre/post-floor shortlist、每 token 联合 gate
+状态、full-prefix dynamic query hashes、shortlist 内 top-2/margin、selected/duplicate/replacement/terminal
+abstain、clear native re-forward 的 KL/top1/timing、memory transition/span/attention，以及所有 parity、budget、
+re-arm、shortlist、KV 与 stale-attention 完整性计数。默认不保存 full logits 或 hidden states。
 
-默认不保存 full logits 或 hidden states；可用 `--save-query-embeddings` 保存允许的 query embedding
-sidecar。
-
-```bash
-python scripts/evaluate_v3_experience_memory.py \
-  --split-manifest "$PHASE1_DIR/split_manifest.json" \
-  --logical-split calibration-val \
-  --memory-records "$E0_DIR/memory_records.v2.jsonl" \
-  --retrieval-key-manifest "$V3_BANK_DIR/retrieval_key_manifest.json" \
-  --side-kv-manifest "$E0_DIR/side_kv_manifest.json" \
-  --v3-offline-report "$V3_BANK_DIR/v3_offline_report.json" \
-  --e0-final-report "$E0_DIR/e0_final_report.json" \
-  --risk-artifact "$RISK_ARTIFACT" \
-  --output-dir "$RUN_DIR" \
-  --limit 8 \
-  --device cuda \
-  --dtype bfloat16
-```
-
-全量评估结束后，可在不加载模型的 CPU 环境中对逐题日志做配对诊断：
+CPU analyzer 入口保持统一：
 
 ```bash
 python scripts/analyze_v3_evaluation.py \
@@ -145,21 +129,20 @@ python scripts/analyze_v3_evaluation.py \
   --markdown-output "$RUN_DIR/analysis_report.md"
 ```
 
-分析器会复核 profile/逐行/completion hash 与 V3 在线不变量，并输出 strict/format 的配对四格表、
-McNemar 检验、bootstrap 区间、零触发 parity、多次 attempt/replacement 分层、检索分数、KL、
-attention mass、memory ID 和 token 尾部异常。Markdown 是结论摘要，JSON 保留完整诊断与样本 ID；
-其中 memory/相关性/分位数组只作为探索性结果，不作为独立最终确认。
+## 5. V3.5 压缩实验顺序与 final block
 
-## 5. 压缩实验顺序
+V3.5 runner 只执行下面四步，并对每一步的 schema、logical hash、provenance 与 qualification fail closed：
 
-1. 离线只跑一次 key/KV 对齐资格验证。
-2. 在线先跑一次很小的 calibration smoke；需要时再跑一次稍大的 calibration validation。
-3. 日志与 integrity 全部通过后，直接跑 `--logical-split final-test --limit 0` 的 1319 题
-   vanilla-vs-V3 全量比较。
+1. 一次 offline dual-key build/audit，冻结 shortlist k 与 applicability floor。
+2. `calibration-val --limit 64` trace-only；static selector 已冻结，dynamic margin 尚不参与 admission，且
+   calibration profile 明确禁止把任务结果用于 selector 决策。
+3. 只用每题 first attempt 的 shortlist 内 margin，answer-blind 地冻结 50% retention dynamic threshold。
+4. 用最终静态+动态 selector 与 terminal clear 跑完整 `dev-test --limit 0`（当前 473 题），然后 analyze、
+   与兼容的 V3.4/V3.1 baseline 做 matched comparison，并生成 exploratory qualification。
 
-official test 已在先前研究中使用，因此新一轮 `final-test` 必须标为
-`reused_official_test_descriptive_evaluation`，不能宣称为独立最终确认。runner 会把这个限制写进
-profile 和 final report。
+V3.5 dev 已参与研究迭代，只能称为 `exploratory matched dev evaluation`。即使工程门槛全部通过，
+qualification 也只能输出 `qualified_for_user_review=true`、`qualified_for_final_test=false`。runner 没有
+`--run-final` 分支，绝不运行或复用 `final-test`；必须等用户看到 dev 报告后另行明确授权。
 
 ## 6. 最后处理的研究问题
 
@@ -399,10 +382,139 @@ bash scripts/experiments/gsm8k/run_v3_4_continuous_gate_experiment.sh \
   "$OUTPUT_ROOT"
 ```
 
-matched dev 的冻结 go/no-go 条件为 strict point delta 至少 `0`、strict bootstrap 95% CI 下界至少
-`-1.5%`、format point delta 至少 `-0.5%`。runner 默认在 dev 后停止；人工检查通过后可用同一命令
-追加 `--run-final`，此时才运行 1319 题 final-test。official test 已被复用，因此即使运行也只能解释为
-descriptive evaluation，不能作为 independent confirmation。
+V3.4 offline token-risk qualification 已通过，但 matched dev 对 V3.1 的 strict delta 为
+`-0.0105708245`，bootstrap 95% CI 为 `[-0.0232558140, 0.0021141649]`，因此 V3.4 task qualification
+未通过。其 go/no-go 工程阈值仍保留为 strict point delta 至少 `0`、strict bootstrap 95% CI 下界至少
+`-1.5%`、format point delta 至少 `-0.5%`，但 V3.4/V3.5 final-test 当前都被封锁，旧 runner 的
+`--run-final` 不能作为本轮执行指引。
+
+### V3.5 applicability-aware continuous memory
+
+V3.5 是一次 compound revision，同时改变 selector 与 abstain 后的 memory 生命周期：
+
+1. question-only applicability shortlist + shortlist 内 full-prefix dynamic rerank；
+2. terminal abstain；若已有 active memory，则清除旧 memory 并 native re-forward 当前 observation token。
+
+第一轮 matched dev 可以一起验证两项变化，但任何改善都不能严格归因到其中一项。若值得继续，应另做
+selector-only、terminal-clear-only、selector+terminal-clear ablation；不得根据已知 harmed sample ID
+调 threshold，也不得删除或 blacklist `mem-051ae8fcf60f21781c7f145f`。
+
+#### Artifacts 与 fail-closed 绑定
+
+V3.5 使用独立 schema，不让旧 V3.1/V3.4 margin artifact 静默兼容：
+
+- system profile：`experience-memory-system-profile-v3.5`；
+- dual bank：`experience-memory-v3.5-dual-key-bank-v1`；
+- applicability calibration：`experience-memory-v3.5-applicability-calibration-v1`；
+- final selector calibration：`experience-memory-v3.5-selector-calibration-v1`；
+- retrieval decision：`experience-memory-v3.5-retrieval-decision-v1`；
+- generation result：`experience-memory-v3.5-generation-result-v1`。
+
+dual manifest 逐条绑定 applicability/dynamic text、token IDs、embedding hashes、`memory_id`、
+`source_experience_id`、payload hash、KV slot/layer；全局绑定 Phase-1 approved/verified files、MemoryRecord、
+原 V3 applicability bank tensor/manifest/offline report、E0 final report、side-KV manifest、reasoner、tokenizer、
+layer 24、SDPA、dtype 与 ordered-memory hash。loader 必须拒绝 schema、logical hash、provenance、顺序、
+revision 或 task-blind 标志不一致的 artifact。
+
+离线复用还绑定编译时的代码身份，而不只记录可能长期不变的 `compiler_git_revision`：dual manifest 的
+`input_artifacts`、offline report 的 `inputs` 与 applicability calibration 的 `source` 必须包含且一致地绑定
+19 个 V3.5 实现文件的逐文件 SHA、该 map 的 canonical set SHA，以及仅覆盖这些实现路径的 tracked diff
+SHA。runner 每次复用前按 compiler 的同一 scoped-diff 算法重算并逐项比较，同时重算 split manifest 的
+logical SHA、dataset revision、dual manifest/report/calibration logical hash；任一代码或输入漂移都停止。
+
+runner 的输出规格为：
+
+```text
+$OUTPUT_ROOT/v3_5_applicability_selector/
+├── dual_key_bank/
+│   ├── dual_retrieval_key_bank.safetensors
+│   ├── dual_retrieval_key_manifest.json
+│   ├── offline_report.json
+│   └── offline_report.md
+├── applicability_calibration.json
+├── applicability_calibration.md
+├── calibration_trace/
+│   ├── results.jsonl
+│   ├── run_profile.json
+│   ├── run_report.json
+│   └── query_embeddings/                 # 每个有 attempt 的样本一个 safetensors sidecar
+├── selector_calibration.json
+├── selector_calibration.md
+├── dev/
+│   ├── results.jsonl
+│   ├── run_profile.json
+│   ├── run_report.json
+│   ├── analysis_report.json
+│   └── analysis_report.md
+├── dev_v35_minus_v34.json
+├── dev_v35_minus_v34.md
+├── dev_v35_minus_v31.json              # 兼容 baseline 存在时
+├── dev_v35_minus_v31.md                # 兼容 baseline 存在时
+├── dev_qualification.json              # V3.4 comparison 存在时
+└── dev_qualification.md
+```
+
+offline report 与两个 calibration artifact 都必须是 `status=passed`，并显式记录
+`task_accuracy_used=false`、`answer_or_reward_used=false`；否则后续阶段停止。calibration trace 使用独立
+trace-only profile，固定 `calibration-val --limit 64`，只提供 first-attempt shortlist margin。dynamic
+threshold 以 inclusive tie policy 保留约 50%，不能读取 completion correctness、answer 或 reward。Stage B
+显式启用 `--save-query-embeddings`；sidecar representation 固定为
+`dynamic_query_l2_normalized_exact_audit`，逐 attempt 保存 retrieval 真正使用的 L2-normalized float32
+原始 bits。calibrator 必须认证逐行 sidecar 文件 hash、attempt 集合以及 `attempt_01` tensor 的
+embedding hash/norm 与 retrieval decision 一致。正式 473 题 dev 不保存该 sidecar。
+
+#### Static selector、dynamic rerank 与状态机
+
+static query 精确为 `question.strip()`，通过 `tokenizer.encode(..., add_special_tokens=False)` 编码；它不含
+ChatML wrapper 或统一 prompt。全库 applicability cosine 先按 score 降序、再按 `memory_id` 稳定打破
+tie，应用冻结 floor 后保留 top-k。shortlist 对整次 generation 不变，dynamic retrieval 只能返回其中 ID。
+
+dynamic query 仍是 canonical prompt + 当前 token 在内的完整 partial CoT，side-KV 暂停，layer-24
+current-generated-token pooling，L2 normalize。只在 shortlist 的 dynamic embeddings 中计算 exact cosine
+top-2；admission 同时要求 static score ≥ floor、dynamic margin ≥ threshold、ID 属于 shortlist、KV metadata
+完全对齐。V3.5 不增加 dynamic absolute-score gate。
+
+| decision | active memory before | outcome / memory after | gate after |
+|---|---|---|---|
+| selected new ID | none | activated / selected ID | `DISARMED`，第 3 次则 `EXHAUSTED` |
+| selected different ID | old ID | replaced / selected ID | `DISARMED`，第 3 次则 `EXHAUSTED` |
+| selected same ID | same ID | duplicate / same ID；attempt 仍消耗 | `DISARMED`，第 3 次则 `EXHAUSTED` |
+| selector abstain | none | terminal abstain / none | `EXHAUSTED`，永不 re-arm |
+| selector abstain | old ID | terminal abstain + deactivated / none | `EXHAUSTED`，永不 re-arm |
+
+最后一行不能只调用 `controller.deactivate()`：old-memory probe 是 counterfactual，必须截断其 attention
+trace、恢复 probe 前 native cache length、deactivate、清空 `current_memory`，再在 side-KV inactive 状态
+用当前 token forward，并用该 native output 生成 `t+1`。日志用
+`deactivated_on_terminal_abstain` transition、`cleared_memory_id`、`clear_affects_generated_token_index`、
+deactivation KL/top1/timing 和 `actual_path_after_abstain=native` 证明没有 stale-memory effect。
+
+#### 一键 runner 与正常停止点
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_5_applicability_selector_experiment.sh \
+  --v3-bank-dir "$V3_BANK_DIR" \
+  --v34-dev-dir "$V34_DEV_DIR" \
+  --v31-dev-dir "$V31_DEV_DIR" \
+  "$PHASE1_DIR" \
+  "$E0_DIR" \
+  "$TOKEN_RISK_ARTIFACT" \
+  "$OUTPUT_ROOT"
+```
+
+四个 positional 依次是 Phase-1 artifact 目录、E0 artifact 目录、已通过资格验证的 V3.4 token-risk
+artifact、实验输出根目录。三个 optional baseline 目录允许复用原 V3 bank、V3.4 matched dev 和 V3.1
+matched dev；缺少某个 comparison baseline 时只跳过对应 comparison，不伪造报告。已认证的 dual bank、
+calibration trace 与 dev run 会复用，任何已有工件的 schema/provenance/profile 不匹配都会停止。Stage B/C
+复用并非只看文件是否存在：runner 用 evaluator 的同一 logical-hash 实现重算 `profile_sha256`，逐项比对
+当前 git revision、tracked diff 与实现文件集合；再认证 `results.jsonl` 的 row schema/profile hash/row hash、
+唯一且有序的 sample IDs、completion token count/hash，并从这些行重算 summary 与 `run_report.json` 的
+logical hash。代码变化、行篡改、重复/缺失样本或自洽性失败都不能被当作已完成 run 复用。
+
+正常停止点永远是 473 题 exploratory matched dev 的 analysis/comparison/qualification。qualification 的
+硬完整性条件包括 exact zero-attempt/static-unavailable parity、outside-shortlist/KV/stale-attention/budget/
+re-arm violations 全为零，以及 calibration task-blind；任务条件以 V3.5 minus V3.4 的 strict delta、strict
+CI lower 和 format delta 为主。无论结果是否通过，`qualified_for_final_test` 都保持 `false`，runner 不含
+final-test 执行路径。
 
 ### Injection layer
 

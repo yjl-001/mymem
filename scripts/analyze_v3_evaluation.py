@@ -25,22 +25,37 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from memgen.experience.phase1 import canonical_json_sha256
+from memgen.experience.phase1 import canonical_json_sha256, file_sha256
 from memgen.experience.v3 import (
     V34_GENERATION_RESULT_SCHEMA,
+    V34_SYSTEM_PROFILE_SCHEMA,
+    V35_GENERATION_RESULT_SCHEMA,
+    V35_RETRIEVAL_DECISION_SCHEMA,
+    V35_SYSTEM_PROFILE_SCHEMA,
+    V3_GENERATION_RESULT_SCHEMA,
     V3_QUERY_POOLING_BOUNDARY_LAST,
     V3_QUERY_POOLING_METHODS,
     V3_QUERY_POOLING_PRE_BOUNDARY,
+    V3_SYSTEM_PROFILE_SCHEMA,
     query_embedding_token_index,
 )
 
 
 EVALUATION_PROFILE_SCHEMA = "experience-memory-v3-evaluation-profile-v1"
 EVALUATION_ROW_SCHEMA = "experience-memory-v3-evaluation-row-v1"
-GENERATION_RESULT_SCHEMA = "experience-memory-v3-generation-result-v1"
+V35_EVALUATION_PROFILE_SCHEMA = (
+    "experience-memory-v3.5-evaluation-profile-v1"
+)
+V35_EVALUATION_ROW_SCHEMA = "experience-memory-v3.5-evaluation-row-v1"
+EVALUATION_PROFILE_SCHEMAS = frozenset({
+    EVALUATION_PROFILE_SCHEMA,
+    V35_EVALUATION_PROFILE_SCHEMA,
+})
+GENERATION_RESULT_SCHEMA = V3_GENERATION_RESULT_SCHEMA
 GENERATION_RESULT_SCHEMAS = frozenset({
     GENERATION_RESULT_SCHEMA,
     V34_GENERATION_RESULT_SCHEMA,
+    V35_GENERATION_RESULT_SCHEMA,
 })
 ANALYSIS_REPORT_SCHEMA = "experience-memory-v3-analysis-report-v1"
 
@@ -99,7 +114,7 @@ def evaluation_profile_sha256(value: Mapping[str, Any]) -> str:
 
 def load_run_profile(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
-    if value.get("schema_version") != EVALUATION_PROFILE_SCHEMA:
+    if value.get("schema_version") not in EVALUATION_PROFILE_SCHEMAS:
         raise ValueError("Unexpected V3 evaluation profile schema")
     expected = value.get("profile_sha256")
     actual = evaluation_profile_sha256(value)
@@ -211,6 +226,24 @@ class CompactSample:
     query_encoding_seconds: float
     retrieval_seconds: float
     attempt_total_seconds: float
+    static_selector_unavailable: bool = False
+    static_shortlist_size: int = 0
+    static_top1_memory_id: str | None = None
+    first_selected_static_score: float | None = None
+    terminal_abstain_count: int = 0
+    clear_on_terminal_abstain_count: int = 0
+    active_memory_lifetime_tokens: int = 0
+    vanilla_numeric_correct_but_format_invalid: bool = False
+    v3_numeric_correct_but_format_invalid: bool = False
+    vanilla_answer_marker_seen: bool | None = None
+    v3_answer_marker_seen: bool | None = None
+    vanilla_first_answer_marker_token_index: int | None = None
+    v3_first_answer_marker_token_index: int | None = None
+    attempt_to_first_answer_marker_distances: tuple[int, ...] = ()
+    attempts_with_subsequent_answer_marker_count: int = 0
+    late_attempt_within_32_tokens_count: int = 0
+    marker_missing_attempt_count: int = 0
+    marker_not_after_attempt_count: int = 0
 
     @property
     def strict_delta(self) -> int:
@@ -260,6 +293,52 @@ class StreamingDiagnostics:
         self.attention_by_memory_sum: defaultdict[str, float] = defaultdict(float)
         self.cache_parity_checked = 0
         self.cache_parity_failed = 0
+        self.static_top1_memory_counts: Counter[str] = Counter()
+        self.static_shortlist_memory_counts: Counter[str] = Counter()
+
+
+class V35SafetyAudit:
+    """Keep qualification-critical violations explicit and sample-addressable."""
+
+    NAMES = (
+        "selected_outside_shortlist",
+        "stale_attention_after_terminal_clear",
+        "terminal_state_drift",
+        "full_prefix_query",
+        "kv_alignment",
+        "attempt_budget",
+        "rearm",
+    )
+
+    def __init__(self, *, example_limit: int = 200):
+        self.example_limit = example_limit
+        self.sample_ids: dict[str, list[str]] = {
+            name: [] for name in self.NAMES
+        }
+
+    def violation(self, name: str, sample_id: str, condition: bool) -> None:
+        if name not in self.sample_ids:
+            raise ValueError(f"Unknown V3.5 safety violation: {name}")
+        if condition and sample_id not in self.sample_ids[name]:
+            if len(self.sample_ids[name]) < self.example_limit:
+                self.sample_ids[name].append(sample_id)
+
+    def to_dict(self) -> dict[str, Any]:
+        counts = {
+            name: len(self.sample_ids[name]) for name in self.NAMES
+        }
+        return {
+            "passed": not any(counts.values()),
+            "violation_counts": counts,
+            "violations": {
+                name: {
+                    "count": counts[name],
+                    "sample_ids": list(self.sample_ids[name]),
+                }
+                for name in self.NAMES
+            },
+            "qualification_critical": list(self.NAMES),
+        }
 
 
 def _finite_or_none(value: Any) -> float | None:
@@ -279,6 +358,127 @@ def validate_row_hash(row: Mapping[str, Any]) -> bool:
     return expected == actual
 
 
+def _static_shortlist_ids(trace: Mapping[str, Any]) -> list[str]:
+    values = trace.get("shortlist_memory_ids")
+    if isinstance(values, list):
+        return [str(value) for value in values]
+    values = trace.get("post_floor_shortlist", [])
+    if not isinstance(values, list):
+        return []
+    return [
+        str(value.get("memory_id", ""))
+        for value in values
+        if isinstance(value, Mapping)
+    ]
+
+
+def _decision_shortlist_ids(decision: Mapping[str, Any]) -> list[str]:
+    values = decision.get("static_shortlist", [])
+    if not isinstance(values, list):
+        return []
+    return [
+        str(value.get("memory_id", ""))
+        if isinstance(value, Mapping)
+        else str(value)
+        for value in values
+    ]
+
+
+def answer_marker_distance_contract(
+    attempts: Sequence[Mapping[str, Any]],
+    diagnostics: Mapping[str, Any],
+    *,
+    first_marker_token_index: int | None,
+) -> dict[str, Any]:
+    """Recompute the descriptive attempt-to-first-marker diagnostics."""
+
+    expected_rows: list[dict[str, Any]] = []
+    distances: list[int] = []
+    missing_count = 0
+    not_after_count = 0
+    affects_contract_respected = True
+    for ordinal, attempt in enumerate(attempts, start=1):
+        try:
+            observation_raw = attempt.get(
+                "generated_observation_index",
+                attempt.get("generated_boundary_index"),
+            )
+            affects_raw = attempt.get("affects_generated_token_index")
+            if isinstance(observation_raw, bool) or isinstance(affects_raw, bool):
+                raise ValueError
+            observation_index = int(observation_raw)
+            affects_index = int(affects_raw)
+        except (TypeError, ValueError):
+            observation_index = None
+            affects_index = None
+            affects_contract_respected = False
+        if (
+            observation_index is None
+            or observation_index < 0
+            or affects_index != observation_index + 1
+        ):
+            affects_contract_respected = False
+        distance = None
+        if first_marker_token_index is None:
+            missing_count += 1
+        elif affects_index is not None and first_marker_token_index >= affects_index:
+            distance = first_marker_token_index - affects_index
+            distances.append(distance)
+        else:
+            not_after_count += 1
+        expected_rows.append({
+            "attempt_number": int(attempt.get("attempt_number", ordinal)),
+            "generated_observation_index": observation_index,
+            "affects_generated_token_index": affects_index,
+            "first_answer_marker_token_index": first_marker_token_index,
+            "tokens_until_first_answer_marker": distance,
+        })
+    logged_rows = diagnostics.get("answer_marker_attempt_distances")
+    expected_keys = {
+        "attempt_number",
+        "generated_observation_index",
+        "affects_generated_token_index",
+        "first_answer_marker_token_index",
+        "tokens_until_first_answer_marker",
+    }
+    logged_shape_ok = (
+        isinstance(logged_rows, list)
+        and len(logged_rows) == len(expected_rows)
+        and all(
+            isinstance(item, Mapping) and set(item) == expected_keys
+            for item in logged_rows
+        )
+    )
+    late_count = sum(0 <= distance <= 32 for distance in distances)
+    valid = (
+        logged_shape_ok
+        and list(logged_rows) == expected_rows
+        and diagnostics.get("first_answer_marker_token_index")
+        == first_marker_token_index
+        and diagnostics.get("attempt_affects_index_contract_respected")
+        is affects_contract_respected
+        and affects_contract_respected
+        and int(diagnostics.get(
+            "attempts_with_subsequent_answer_marker_count", -1
+        ))
+        == len(distances)
+        and int(diagnostics.get("late_attempt_within_32_tokens_count", -1))
+        == late_count
+    )
+    return {
+        "valid": valid,
+        "distances": tuple(distances),
+        "attempts_with_subsequent_answer_marker_count": len(distances),
+        "late_attempt_within_32_tokens_count": late_count,
+        "marker_missing_attempt_count": missing_count,
+        "marker_not_after_attempt_count": not_after_count,
+    }
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
 def extract_sample(
     row: Mapping[str, Any],
     *,
@@ -287,11 +487,15 @@ def extract_sample(
     audit: IntegrityAudit,
     streaming: StreamingDiagnostics,
     validate_hash: bool,
+    is_v35: bool = False,
+    safety: V35SafetyAudit | None = None,
+    expected_generation_schema: str | None = None,
 ) -> CompactSample:
     sample_id = str(row.get("sample_id", ""))
     audit.check(bool(sample_id), "sample_id_present", sample_id or "<missing>")
     audit.check(
-        row.get("schema_version") == EVALUATION_ROW_SCHEMA,
+        row.get("schema_version")
+        == (V35_EVALUATION_ROW_SCHEMA if is_v35 else EVALUATION_ROW_SCHEMA),
         "row_schema_matches",
         sample_id,
     )
@@ -336,6 +540,46 @@ def extract_sample(
     v3_strict = bool(v3.get("strict_correct"))
     vanilla_format = bool(vanilla.get("format_correct"))
     v3_format = bool(v3.get("format_correct"))
+    vanilla_numeric_format_invalid = bool(
+        vanilla.get("numeric_correct_but_format_invalid", False)
+    )
+    v3_numeric_format_invalid = bool(
+        v3.get("numeric_correct_but_format_invalid", False)
+    )
+    vanilla_marker_seen = _bool_or_none(vanilla.get("answer_marker_seen"))
+    v3_marker_seen = _bool_or_none(v3.get("answer_marker_seen"))
+    vanilla_marker_index_raw = vanilla.get("first_answer_marker_token_index")
+    v3_marker_index_raw = v3.get("first_answer_marker_token_index")
+    vanilla_marker_index = (
+        int(vanilla_marker_index_raw)
+        if isinstance(vanilla_marker_index_raw, int)
+        and not isinstance(vanilla_marker_index_raw, bool)
+        else None
+    )
+    v3_marker_index = (
+        int(v3_marker_index_raw)
+        if isinstance(v3_marker_index_raw, int)
+        and not isinstance(v3_marker_index_raw, bool)
+        else None
+    )
+    if is_v35:
+        audit.check(
+            isinstance(vanilla_marker_seen, bool)
+            and (vanilla_marker_index is not None) is vanilla_marker_seen
+            and (
+                vanilla_marker_index is None
+                or 0 <= vanilla_marker_index < vanilla_tokens
+            ),
+            "v35_vanilla_first_answer_marker_index_is_valid",
+            sample_id,
+        )
+        audit.check(
+            isinstance(v3_marker_seen, bool)
+            and (v3_marker_index is not None) is v3_marker_seen
+            and (v3_marker_index is None or 0 <= v3_marker_index < v3_tokens),
+            "v35_v3_first_answer_marker_index_is_valid",
+            sample_id,
+        )
     audit.check(
         not vanilla_strict or vanilla_format,
         "vanilla_strict_implies_format",
@@ -355,8 +599,19 @@ def extract_sample(
 
     runtime = v3.get("runtime_trace", {})
     diagnostics = v3.get("online_diagnostics", {})
+    if is_v35:
+        audit.check(
+            runtime.get("answer_marker_seen") is v3_marker_seen
+            and diagnostics.get("answer_marker_seen") is v3_marker_seen,
+            "v35_runtime_and_condition_answer_marker_presence_match",
+            sample_id,
+        )
+    if expected_generation_schema is None:
+        expected_generation_schema = (
+            V35_GENERATION_RESULT_SCHEMA if is_v35 else GENERATION_RESULT_SCHEMA
+        )
     audit.check(
-        runtime.get("schema_version") in GENERATION_RESULT_SCHEMAS,
+        runtime.get("schema_version") == expected_generation_schema,
         "runtime_trace_schema_matches",
         sample_id,
     )
@@ -368,7 +623,29 @@ def extract_sample(
     boundaries = list(runtime.get("boundary_traces", []))
     attention = list(runtime.get("attention_traces", []))
     attempt_count = len(attempts)
-    audit.check(attempt_count <= 3, "attempt_budget_at_most_three", sample_id)
+    marker_distance = {
+        "valid": True,
+        "distances": (),
+        "attempts_with_subsequent_answer_marker_count": 0,
+        "late_attempt_within_32_tokens_count": 0,
+        "marker_missing_attempt_count": 0,
+        "marker_not_after_attempt_count": 0,
+    }
+    if is_v35:
+        marker_distance = answer_marker_distance_contract(
+            attempts,
+            diagnostics,
+            first_marker_token_index=v3_marker_index,
+        )
+        audit.check(
+            marker_distance["valid"] is True,
+            "v35_attempt_to_first_answer_marker_distances_match",
+            sample_id,
+        )
+    attempt_budget_ok = attempt_count <= 3
+    audit.check(attempt_budget_ok, "attempt_budget_at_most_three", sample_id)
+    if is_v35 and safety is not None:
+        safety.violation("attempt_budget", sample_id, not attempt_budget_ok)
     audit.check(
         int(diagnostics.get("retrieval_attempt_count", -1)) == attempt_count,
         "attempt_count_matches_diagnostics",
@@ -388,6 +665,12 @@ def extract_sample(
     replacement_count = outcome_counts["replaced"]
     duplicate_count = outcome_counts["duplicate"]
     abstain_count = outcome_counts["abstained"]
+    terminal_abstain_count = sum(
+        item.get("terminal_abstain") is True for item in attempts
+    )
+    clear_on_terminal_abstain_count = sum(
+        item.get("memory_cleared_on_abstain") is True for item in attempts
+    )
     audit.check(
         int(diagnostics.get("activation_count", -1)) == activation_count,
         "activation_count_matches",
@@ -419,6 +702,143 @@ def extract_sample(
             f"online_diagnostic_{diagnostic_name}",
             sample_id,
         )
+    static_trace = runtime.get("static_selector_trace")
+    static_shortlist_ids: list[str] = []
+    static_selector_unavailable = False
+    static_top1_memory_id: str | None = None
+    if is_v35:
+        static_mapping = static_trace if isinstance(static_trace, Mapping) else {}
+        static_query = static_mapping.get("query", {})
+        static_shortlist_ids = _static_shortlist_ids(static_mapping)
+        post_floor = static_mapping.get("post_floor_shortlist", [])
+        pre_floor = static_mapping.get("pre_floor_top_k", [])
+        if not isinstance(post_floor, list):
+            post_floor = []
+        if not isinstance(pre_floor, list):
+            pre_floor = []
+        if post_floor and isinstance(post_floor[0], Mapping):
+            static_top1_memory_id = str(post_floor[0].get("memory_id", "")) or None
+        static_selector_unavailable = (
+            static_mapping.get("static_selector_unavailable") is True
+        )
+        try:
+            static_floor = float(static_mapping.get("score_floor", float("nan")))
+            static_k = int(static_mapping.get("shortlist_k", -1))
+            pre_ids = [str(item["memory_id"]) for item in pre_floor]
+            post_ids = [str(item["memory_id"]) for item in post_floor]
+            pre_scores = [float(item["static_score"]) for item in pre_floor]
+            post_scores = [float(item["static_score"]) for item in post_floor]
+            expected_post = [
+                item
+                for item in pre_floor
+                if float(item["static_score"]) >= static_floor
+            ]
+            static_lists_well_formed = True
+        except (KeyError, TypeError, ValueError):
+            static_floor = float("nan")
+            static_k = -1
+            pre_ids = []
+            post_ids = []
+            pre_scores = []
+            post_scores = []
+            expected_post = []
+            static_lists_well_formed = False
+        if len(post_floor) >= 2:
+            expected_unavailable_reason = None
+        elif not pre_floor:
+            expected_unavailable_reason = "empty_bank"
+        elif not post_floor:
+            expected_unavailable_reason = "below_applicability_floor"
+        else:
+            expected_unavailable_reason = "insufficient_shortlist"
+        static_query_ok = (
+            bool(static_mapping)
+            and static_mapping.get("schema_version")
+            == "experience-memory-v3.5-static-shortlist-v1"
+            and isinstance(static_query, Mapping)
+            and bool(static_query.get("static_question_text_sha256"))
+            and int(static_query.get("static_question_token_count", 0)) > 0
+            and bool(static_query.get("static_question_token_ids_sha256"))
+            and bool(static_query.get("static_question_embedding_sha256"))
+            and int(static_query.get("layer_number", -1)) == 24
+            and static_query.get("pooling") == "last_valid_token"
+            and static_query.get("normalization") == "l2"
+            and static_query.get("side_kv_disabled") is True
+            and static_mapping.get("shortlist_fixed_for_generation") is True
+            and static_mapping.get("retrieval_method") == "exact_cosine"
+            and static_mapping.get("stable_tie_break")
+            == "memory_id_ascending"
+            and static_mapping.get("score_floor_tie_policy")
+            == "retain_score_greater_than_or_equal_to_floor"
+            and static_lists_well_formed
+            and math.isfinite(static_floor)
+            and -1.0 <= static_floor <= 1.0
+            and 1 <= static_k <= 32
+            and len(pre_floor) <= static_k
+            and len(post_floor) <= static_k
+            and len(pre_ids) == len(set(pre_ids))
+            and len(post_ids) == len(set(post_ids))
+            and all(pre_ids)
+            and all(post_ids)
+            and all(math.isfinite(score) for score in pre_scores + post_scores)
+            and all(
+                left_score > right_score
+                or (left_score == right_score and left_id < right_id)
+                for left_score, right_score, left_id, right_id in zip(
+                    pre_scores, pre_scores[1:], pre_ids, pre_ids[1:]
+                )
+            )
+            and [
+                int(item.get("original_global_rank", -1))
+                for item in pre_floor
+            ]
+            == list(range(1, len(pre_floor) + 1))
+            and post_floor == expected_post
+            and len(static_shortlist_ids) == len(set(static_shortlist_ids))
+            and all(static_shortlist_ids)
+            and static_shortlist_ids == post_ids
+            and static_mapping.get("shortlist_nonempty") is bool(post_floor)
+            and bool(static_mapping.get("applicability_bank_manifest_sha256"))
+        )
+        audit.check(
+            static_query_ok,
+            "v35_static_selector_trace_is_authenticated",
+            sample_id,
+        )
+        available_shape_ok = (
+            static_mapping.get("unavailable_reason")
+            == expected_unavailable_reason
+            and static_selector_unavailable
+            is (expected_unavailable_reason is not None)
+        )
+        audit.check(
+            available_shape_ok,
+            "v35_static_selector_availability_is_consistent",
+            sample_id,
+        )
+        audit.check(
+            diagnostics.get("static_selector_unavailable")
+            is static_selector_unavailable,
+            "v35_static_selector_diagnostic_matches",
+            sample_id,
+        )
+        audit.check(
+            diagnostics.get("static_selector_unavailable_reason")
+            == expected_unavailable_reason
+            and int(diagnostics.get("static_shortlist_size", -1))
+            == len(static_shortlist_ids)
+            and diagnostics.get("static_shortlist_ids_sha256")
+            == canonical_json_sha256(static_shortlist_ids)
+            and diagnostics.get("static_shortlist_fixed_for_generation") is True
+            and diagnostics.get("static_query_side_kv_disabled") is True
+            and diagnostics.get("both_query_encodings_side_kv_disabled") is True,
+            "v35_static_selector_diagnostics_are_complete",
+            sample_id,
+        )
+        if static_top1_memory_id is not None:
+            streaming.static_top1_memory_counts[static_top1_memory_id] += 1
+        for memory_id in static_shortlist_ids:
+            streaming.static_shortlist_memory_counts[memory_id] += 1
     if attempt_count:
         audit.check(
             str(attempts[0].get("outcome")) in {"activated", "abstained"},
@@ -445,7 +865,10 @@ def extract_sample(
     activation_top1_change_count = 0
     first_top1_score = None
     first_margin = None
+    first_selected_static_score = None
     expected_active_memory_id: str | None = None
+    terminal_boundary_indices: list[int] = []
+    clear_points: list[tuple[int, str]] = []
     for position, attempt in enumerate(attempts):
         decision = attempt.get("retrieval_decision", {})
         query = decision.get("query", {})
@@ -470,6 +893,39 @@ def extract_sample(
         prompt_count = int(query.get("prompt_token_count", -1))
         partial_count = int(query.get("partial_cot_token_count", -1))
         query_count = int(query.get("query_token_count", -1))
+        full_prefix_ok = (
+            query_count == prompt_count + partial_count
+            and partial_count == boundary_index + 1
+            and query.get("context") == "question_plus_full_partial_cot"
+            and (
+                query.get("encoder_state")
+                in {
+                    "pure_prefix_reencode_side_kv_disabled",
+                    "pure_prefix_side_kv_suspended",
+                }
+            )
+            and bool(query.get("query_token_ids_sha256"))
+            and bool(query.get("query_embedding_sha256"))
+            and (
+                not is_v35
+                or (
+                    query.get("side_kv_disabled") is True
+                    and int(query.get("encoded_full_prefix_token_count", -1))
+                    == query_count
+                    and query.get("pooling") == "current_generated_token"
+                    and query.get("normalization") == "l2"
+                    and int(query.get("layer_number", -1)) == 24
+                    and int(query.get("query_embedding_token_index", -1))
+                    == query_count - 1
+                    and int(query.get(
+                        "query_embedding_causal_context_token_count", -1
+                    ))
+                    == query_count
+                )
+            )
+        )
+        if is_v35 and safety is not None:
+            safety.violation("full_prefix_query", sample_id, not full_prefix_ok)
         audit.check(
             query_count == prompt_count + partial_count,
             "query_count_is_prompt_plus_full_partial",
@@ -487,7 +943,10 @@ def extract_sample(
         )
         audit.check(
             query.get("encoder_state")
-            == "pure_prefix_reencode_side_kv_disabled",
+            in {
+                "pure_prefix_reencode_side_kv_disabled",
+                "pure_prefix_side_kv_suspended",
+            },
             "query_encoder_is_pure_prefix",
             sample_id,
         )
@@ -514,21 +973,30 @@ def extract_sample(
             )
             if has_position_audit:
                 boundary_token_id = int(attempt.get("boundary_token_id", -1))
-                audit.check(
+                position_ok = (
                     int(query.get("encoded_full_prefix_token_count", -1))
                     == query_count
                     and int(query.get("query_embedding_token_index", -1))
                     == expected_embedding_index
-                    and int(query.get("query_embedding_causal_context_token_count", -1))
+                    and int(query.get(
+                        "query_embedding_causal_context_token_count", -1
+                    ))
                     == expected_embedding_index + 1
-                    and int(query.get("trigger_boundary_token_index", -1))
-                    == query_count - 1
-                    and int(query.get("trigger_boundary_token_id", -1))
-                    == boundary_token_id
-                    and bool(
-                        query.get("trigger_boundary_excluded_from_pooling")
+                )
+                if not is_v35:
+                    position_ok = (
+                        position_ok
+                        and int(query.get("trigger_boundary_token_index", -1))
+                        == query_count - 1
+                        and int(query.get("trigger_boundary_token_id", -1))
+                        == boundary_token_id
+                        and bool(
+                            query.get("trigger_boundary_excluded_from_pooling")
+                        )
+                        is (query_pooling == V3_QUERY_POOLING_PRE_BOUNDARY)
                     )
-                    is (query_pooling == V3_QUERY_POOLING_PRE_BOUNDARY),
+                audit.check(
+                    position_ok,
                     "query_pooling_position_audit_is_consistent",
                     sample_id,
                 )
@@ -540,7 +1008,11 @@ def extract_sample(
                         sample_id,
                     )
         audit.check(
-            query.get("method") == "exact_cosine",
+            query.get("method")
+            in {
+                "exact_cosine",
+                "exact_cosine_within_static_applicability_shortlist",
+            },
             "retrieval_method_is_exact_cosine",
             sample_id,
         )
@@ -591,6 +1063,110 @@ def extract_sample(
             "retrieval_hits_are_finite_and_ranked",
             sample_id,
         )
+        if is_v35:
+            decision_shortlist_ids = _decision_shortlist_ids(decision)
+            query_shortlist_ids = [
+                str(value)
+                for value in query.get("static_shortlist_ids", [])
+            ]
+            selected_inside = (
+                selected_id is None
+                or str(selected_id) in static_shortlist_ids
+            )
+            shortlist_consistent = (
+                decision.get("schema_version")
+                == V35_RETRIEVAL_DECISION_SCHEMA
+                and decision_shortlist_ids == static_shortlist_ids
+                and query_shortlist_ids == static_shortlist_ids
+                and query.get("static_shortlist_fixed_for_generation") is True
+                and query.get(
+                    "dynamic_search_restricted_to_static_shortlist"
+                )
+                is True
+                and all(
+                    str(hit.get("memory_id", "")) in static_shortlist_ids
+                    for hit in hits
+                )
+                and selected_inside
+            )
+            audit.check(
+                shortlist_consistent,
+                "v35_dynamic_search_stays_inside_static_shortlist",
+                sample_id,
+            )
+            if safety is not None:
+                safety.violation(
+                    "selected_outside_shortlist",
+                    sample_id,
+                    not shortlist_consistent or not selected_inside,
+                )
+            status = str(decision.get("status", ""))
+            threshold = _finite_or_none(
+                query.get("minimum_top1_top2_margin")
+            )
+            margin = _finite_or_none(query.get("top1_top2_margin"))
+            static_score = _finite_or_none(
+                query.get("selected_memory_static_score")
+            )
+            score_floor = _finite_or_none(
+                query.get("minimum_applicability_score")
+            )
+            expected_margin_passed = (
+                margin is not None
+                and (threshold is None or margin >= threshold)
+            )
+            expected_static_passed = (
+                static_score is not None
+                and score_floor is not None
+                and static_score >= score_floor
+            )
+            decision_shape_ok = (
+                status
+                in {
+                    "selected",
+                    "static_shortlist_unavailable",
+                    "below_applicability_floor",
+                    "insufficient_shortlist",
+                    "below_dynamic_margin",
+                    "empty_bank",
+                }
+                and query.get("decision_reason") == status
+                and query.get("static_condition_passed")
+                is expected_static_passed
+                and query.get("dynamic_margin_condition_passed")
+                is expected_margin_passed
+                and query.get("joint_admission_passed")
+                is (status == "selected")
+                and (
+                    (
+                        status == "selected"
+                        and selected_id is not None
+                        and expected_static_passed
+                        and expected_margin_passed
+                    )
+                    or (
+                        status != "selected"
+                        and selected_id is None
+                        and outcome == "abstained"
+                    )
+                )
+            )
+            audit.check(
+                decision_shape_ok,
+                "v35_static_dynamic_joint_admission_is_valid",
+                sample_id,
+            )
+            kv_aligned = (
+                status != "selected"
+                or query.get("selected_memory_kv_metadata_aligned") is True
+            )
+            audit.check(
+                kv_aligned,
+                "v35_selected_memory_kv_metadata_is_aligned",
+                sample_id,
+            )
+            if safety is not None:
+                safety.violation("kv_alignment", sample_id, not kv_aligned)
         abstention_policy = query.get("abstention_policy")
         if abstention_policy is not None:
             threshold = _finite_or_none(
@@ -646,10 +1222,12 @@ def extract_sample(
                 "selected_memory_is_top1",
                 sample_id,
             )
+        abstain_shape = (
+            selected_id is None
+            and active_after_id == (None if is_v35 else previous_id)
+        )
         expected_outcome_shape = {
-            "abstained": (
-                selected_id is None and active_after_id == previous_id
-            ),
+            "abstained": abstain_shape,
             "activated": (
                 previous_id is None
                 and selected_id is not None
@@ -672,10 +1250,117 @@ def extract_sample(
             "attempt_outcome_memory_transition_is_valid",
             sample_id,
         )
+        if is_v35:
+            terminal = attempt.get("terminal_abstain")
+            cleared = attempt.get("memory_cleared_on_abstain")
+            cleared_id = (
+                str(attempt.get("cleared_memory_id"))
+                if attempt.get("cleared_memory_id") is not None
+                else None
+            )
+            actual_path = attempt.get("actual_path_after_abstain")
+            actual_memory_after = (
+                str(attempt.get("actual_path_memory_id_after"))
+                if attempt.get("actual_path_memory_id_after") is not None
+                else None
+            )
+            if outcome == "abstained":
+                terminal_boundary_indices.append(boundary_index)
+                base_terminal_ok = (
+                    terminal is True
+                    and active_after_id is None
+                    and actual_path == "native"
+                    and actual_memory_after is None
+                    and position == len(attempts) - 1
+                )
+                if previous_id is None:
+                    clear_shape_ok = (
+                        cleared is False
+                        and cleared_id is None
+                        and attempt.get("clear_affects_generated_token_index")
+                        is None
+                        and attempt.get("deactivation_forward_seconds") is None
+                        and attempt.get("deactivation_first_step_logits_kl")
+                        is None
+                        and attempt.get("deactivation_first_step_top1_changed")
+                        is None
+                        and attempt.get("deactivation_baseline_first_token_id")
+                        is None
+                        and attempt.get("deactivation_native_first_token_id")
+                        is None
+                    )
+                else:
+                    clear_index = int(attempt.get(
+                        "clear_affects_generated_token_index", -1
+                    ))
+                    deactivation_seconds = _finite_or_none(
+                        attempt.get("deactivation_forward_seconds")
+                    )
+                    deactivation_kl = _finite_or_none(
+                        attempt.get("deactivation_first_step_logits_kl")
+                    )
+                    clear_shape_ok = (
+                        cleared is True
+                        and cleared_id == previous_id
+                        and clear_index == boundary_index + 1
+                        and deactivation_seconds is not None
+                        and deactivation_seconds >= 0.0
+                        and deactivation_kl is not None
+                        and deactivation_kl >= 0.0
+                        and isinstance(
+                            attempt.get("deactivation_first_step_top1_changed"),
+                            bool,
+                        )
+                        and isinstance(
+                            attempt.get("deactivation_baseline_first_token_id"),
+                            int,
+                        )
+                        and isinstance(
+                            attempt.get("deactivation_native_first_token_id"),
+                            int,
+                        )
+                        and attempt.get("deactivation_first_step_top1_changed")
+                        is (
+                            attempt.get("deactivation_baseline_first_token_id")
+                            != attempt.get("deactivation_native_first_token_id")
+                        )
+                        and 0 <= clear_index < len(v3_ids)
+                        and int(attempt.get("deactivation_native_first_token_id"))
+                        == v3_ids[clear_index]
+                    )
+                    if cleared_id is not None:
+                        clear_points.append((boundary_index, cleared_id))
+                terminal_shape_ok = base_terminal_ok and clear_shape_ok
+            else:
+                terminal_shape_ok = (
+                    terminal is False
+                    and cleared is False
+                    and cleared_id is None
+                    and actual_path is None
+                    and actual_memory_after == active_after_id
+                    and attempt.get("deactivation_forward_seconds") is None
+                    and attempt.get("deactivation_first_step_logits_kl") is None
+                    and attempt.get("deactivation_first_step_top1_changed") is None
+                    and attempt.get("deactivation_baseline_first_token_id") is None
+                    and attempt.get("deactivation_native_first_token_id") is None
+                    and attempt.get("clear_affects_generated_token_index") is None
+                )
+            audit.check(
+                terminal_shape_ok,
+                "v35_terminal_abstain_lifecycle_is_valid",
+                sample_id,
+            )
+            if safety is not None:
+                safety.violation(
+                    "terminal_state_drift", sample_id, not terminal_shape_ok
+                )
         expected_active_memory_id = active_after_id
         if position == 0:
             first_top1_score = _finite_or_none(query.get("top1_score"))
             first_margin = _finite_or_none(query.get("top1_top2_margin"))
+            first_selected_static_score = _finite_or_none(
+                query.get("selected_memory_static_score")
+            )
         query_encoding_seconds += float(attempt.get("query_encoding_seconds", 0.0))
         retrieval_seconds += float(attempt.get("retrieval_seconds", 0.0))
         attempt_total_seconds += float(attempt.get("attempt_total_seconds", 0.0))
@@ -711,6 +1396,32 @@ def extract_sample(
             "attempt_timings_are_finite_and_nonnegative",
             sample_id,
         )
+
+    if is_v35:
+        selected_outside_count = sum(
+            memory_id not in static_shortlist_ids
+            for memory_id in selected_memory_ids
+        )
+        audit.check(
+            diagnostics.get("dynamic_search_restricted_to_static_shortlist")
+            is True
+            and diagnostics.get(
+                "selected_memory_belongs_to_static_shortlist"
+            )
+            is (selected_outside_count == 0)
+            and int(diagnostics.get(
+                "selected_outside_static_shortlist_count", -1
+            ))
+            == selected_outside_count,
+            "v35_dynamic_shortlist_diagnostics_match_attempts",
+            sample_id,
+        )
+        if safety is not None:
+            safety.violation(
+                "selected_outside_shortlist",
+                sample_id,
+                selected_outside_count != 0,
+            )
 
     boundary_by_index = {
         int(item.get("generated_boundary_index", -1)): item for item in boundaries
@@ -792,16 +1503,23 @@ def extract_sample(
         for item in boundaries:
             action = str(item.get("action", ""))
             if action == "rearmed":
-                audit.check(
+                rearm_ok = (
                     int(item.get("low_entropy_streak_before", -1)) == 1
                     and int(item.get("low_entropy_streak_after", -1)) == 0
                     and item.get("state_before") == "DISARMED"
                     and item.get("state_after") == "ARMED"
+                    and int(item.get("retrieval_attempt_count_before", -1))
+                    == int(item.get("retrieval_attempt_count_after", -2))
                     and float(item.get("entropy", float("inf")))
-                    <= float(item.get("low_entropy_threshold", float("-inf"))),
+                    <= float(item.get("low_entropy_threshold", float("-inf")))
+                )
+                audit.check(
+                    rearm_ok,
                     "continuous_rearm_requires_second_low_token",
                     sample_id,
                 )
+                if is_v35 and safety is not None:
+                    safety.violation("rearm", sample_id, not rearm_ok)
             if action == "retrieval_attempt":
                 audit.check(
                     item.get("joint_trigger_qualified") is True
@@ -815,6 +1533,46 @@ def extract_sample(
                     ),
                     "continuous_attempt_requires_joint_entropy_risk",
                     sample_id,
+                )
+        if is_v35:
+            summary = runtime.get("summary", {})
+            rearm_summary_ok = (
+                summary.get("two_low_rearm_respected") is True
+                and summary.get("second_low_rearms_without_trigger") is True
+                and summary.get("no_rearm_after_terminal_abstain") is True
+                and diagnostics.get("two_low_rearm_respected") is True
+                and diagnostics.get("second_low_rearms_without_trigger") is True
+                and diagnostics.get("no_rearm_after_terminal_abstain") is True
+            )
+            terminal_state_ok = True
+            if terminal_boundary_indices:
+                first_terminal = min(terminal_boundary_indices)
+                terminal_trace = boundary_by_index.get(first_terminal, {})
+                terminal_state_ok = (
+                    terminal_trace.get("action") == "retrieval_attempt"
+                    and terminal_trace.get("state_after") == "EXHAUSTED"
+                    and not any(
+                        int(item.get("generated_boundary_index", -1))
+                        > first_terminal
+                        and item.get("action")
+                        in {"rearmed", "retrieval_attempt"}
+                        for item in boundaries
+                    )
+                )
+            audit.check(
+                rearm_summary_ok,
+                "v35_rearm_summary_is_safe",
+                sample_id,
+            )
+            audit.check(
+                terminal_state_ok,
+                "v35_terminal_abstain_exhausts_gate",
+                sample_id,
+            )
+            if safety is not None:
+                safety.violation("rearm", sample_id, not rearm_summary_ok)
+                safety.violation(
+                    "terminal_state_drift", sample_id, not terminal_state_ok
                 )
     first_trigger_entropy = None
     first_trigger_boundary_index = None
@@ -875,6 +1633,148 @@ def extract_sample(
         "attention_step_count_matches",
         sample_id,
     )
+    stale_attention_count = sum(
+        int(trace.get("generated_input_index", -1)) >= clear_index
+        and str(trace.get("memory_id", "")) == cleared_memory_id
+        for clear_index, cleared_memory_id in clear_points
+        for trace in attention
+    )
+    active_memory_lifetime_tokens = sum(
+        int(span.get("attention_step_count", 0))
+        for span in runtime.get("memory_activation_spans", [])
+        if isinstance(span, Mapping)
+    )
+    if is_v35:
+        transitions = list(runtime.get("memory_transitions", []))
+        clear_transitions = [
+            transition
+            for transition in transitions
+            if transition.get("transition")
+            == "deactivated_on_terminal_abstain"
+        ]
+        transition_shape_ok = (
+            len(clear_transitions) == clear_on_terminal_abstain_count
+            and all(
+                transition.get("previous_memory_id") is not None
+                and transition.get("next_memory_id") is None
+                and int(transition.get("affects_generated_token_index", -1))
+                == int(transition.get("generated_boundary_index", -2)) + 1
+                for transition in clear_transitions
+            )
+        )
+        stale_summary_ok = (
+            stale_attention_count == 0
+            and int(diagnostics.get(
+                "stale_memory_attention_after_terminal_clear_count", -1
+            ))
+            == stale_attention_count
+            and diagnostics.get("terminal_clear_attention_safe") is True
+            and int(runtime.get("summary", {}).get(
+                "stale_memory_attention_after_terminal_clear_count", -1
+            ))
+            == stale_attention_count
+            and runtime.get("summary", {}).get(
+                "terminal_clear_attention_safe"
+            )
+            is True
+        )
+        kv_summary_ok = (
+            diagnostics.get("selected_memory_kv_metadata_aligned") is True
+            and int(diagnostics.get(
+                "selected_memory_kv_alignment_unlogged_count", -1
+            ))
+            == 0
+        )
+        attempt_summary_ok = (
+            diagnostics.get("attempt_budget_respected") is True
+            and runtime.get("summary", {}).get(
+                "max_three_attempts_respected"
+            )
+            is True
+        )
+        full_prefix_summary_ok = (
+            diagnostics.get("query_context_is_full_prefix") is True
+            and diagnostics.get("both_query_encodings_side_kv_disabled") is True
+        )
+        audit.check(
+            transition_shape_ok,
+            "v35_terminal_clear_transition_is_valid",
+            sample_id,
+        )
+        audit.check(
+            stale_summary_ok,
+            "v35_no_stale_attention_after_terminal_clear",
+            sample_id,
+        )
+        audit.check(
+            kv_summary_ok,
+            "v35_kv_alignment_diagnostics_are_safe",
+            sample_id,
+        )
+        audit.check(
+            attempt_summary_ok,
+            "v35_attempt_budget_diagnostics_are_safe",
+            sample_id,
+        )
+        audit.check(
+            full_prefix_summary_ok,
+            "v35_full_prefix_query_diagnostics_are_safe",
+            sample_id,
+        )
+        initial_state_ok = (
+            runtime.get("summary", {}).get("initial_gate_state")
+            == ("EXHAUSTED" if static_selector_unavailable else "ARMED")
+        )
+        final_state = runtime.get("final_gate_state")
+        final_memory = runtime.get("final_memory_id")
+        final_state_ok = (
+            runtime.get("summary", {}).get("static_selector_unavailable")
+            is static_selector_unavailable
+            and runtime.get("summary", {}).get("final_gate_state")
+            == final_state
+            and runtime.get("summary", {}).get("final_memory_id")
+            == final_memory
+            and diagnostics.get("final_gate_state") == final_state
+            and diagnostics.get("final_memory_id") == final_memory
+            and (
+                not terminal_boundary_indices
+                or (final_state == "EXHAUSTED" and final_memory is None)
+            )
+            and (
+                not static_selector_unavailable
+                or (final_state == "EXHAUSTED" and final_memory is None)
+            )
+        )
+        audit.check(
+            initial_state_ok,
+            "v35_static_availability_sets_initial_gate_state",
+            sample_id,
+        )
+        audit.check(
+            final_state_ok,
+            "v35_final_gate_and_memory_state_is_consistent",
+            sample_id,
+        )
+        if safety is not None:
+            safety.violation(
+                "stale_attention_after_terminal_clear",
+                sample_id,
+                not stale_summary_ok,
+            )
+            safety.violation(
+                "terminal_state_drift",
+                sample_id,
+                not transition_shape_ok
+                or not initial_state_ok
+                or not final_state_ok,
+            )
+            safety.violation("kv_alignment", sample_id, not kv_summary_ok)
+            safety.violation(
+                "attempt_budget", sample_id, not attempt_summary_ok
+            )
+            safety.violation(
+                "full_prefix_query", sample_id, not full_prefix_summary_ok
+            )
 
     cache_parity = row.get("cache_parity")
     if cache_parity is not None:
@@ -908,6 +1808,21 @@ def extract_sample(
             f"runtime_summary_{field}_matches",
             sample_id,
         )
+    if is_v35:
+        for field, expected_value in (
+            ("abstain_count", abstain_count),
+            ("terminal_abstain_count", terminal_abstain_count),
+            (
+                "clear_on_terminal_abstain_count",
+                clear_on_terminal_abstain_count,
+            ),
+        ):
+            audit.check(
+                int(runtime_summary.get(field, -1)) == expected_value
+                and int(diagnostics.get(field, -1)) == expected_value,
+                f"v35_{field}_matches",
+                sample_id,
+            )
     return CompactSample(
         sample_id=sample_id,
         vanilla_strict=vanilla_strict,
@@ -946,6 +1861,36 @@ def extract_sample(
         query_encoding_seconds=query_encoding_seconds,
         retrieval_seconds=retrieval_seconds,
         attempt_total_seconds=attempt_total_seconds,
+        static_selector_unavailable=static_selector_unavailable,
+        static_shortlist_size=len(static_shortlist_ids),
+        static_top1_memory_id=static_top1_memory_id,
+        first_selected_static_score=first_selected_static_score,
+        terminal_abstain_count=terminal_abstain_count,
+        clear_on_terminal_abstain_count=clear_on_terminal_abstain_count,
+        active_memory_lifetime_tokens=active_memory_lifetime_tokens,
+        vanilla_numeric_correct_but_format_invalid=(
+            vanilla_numeric_format_invalid
+        ),
+        v3_numeric_correct_but_format_invalid=v3_numeric_format_invalid,
+        vanilla_answer_marker_seen=vanilla_marker_seen,
+        v3_answer_marker_seen=v3_marker_seen,
+        vanilla_first_answer_marker_token_index=vanilla_marker_index,
+        v3_first_answer_marker_token_index=v3_marker_index,
+        attempt_to_first_answer_marker_distances=tuple(
+            marker_distance["distances"]
+        ),
+        attempts_with_subsequent_answer_marker_count=int(
+            marker_distance["attempts_with_subsequent_answer_marker_count"]
+        ),
+        late_attempt_within_32_tokens_count=int(
+            marker_distance["late_attempt_within_32_tokens_count"]
+        ),
+        marker_missing_attempt_count=int(
+            marker_distance["marker_missing_attempt_count"]
+        ),
+        marker_not_after_attempt_count=int(
+            marker_distance["marker_not_after_attempt_count"]
+        ),
     )
 
 
@@ -1015,6 +1960,33 @@ def scope_summary(
     v3_format_wrong = sum(
         item.v3_format and not item.v3_strict for item in samples
     )
+    vanilla_numeric_format_invalid = sum(
+        item.vanilla_numeric_correct_but_format_invalid for item in samples
+    )
+    v3_numeric_format_invalid = sum(
+        item.v3_numeric_correct_but_format_invalid for item in samples
+    )
+    marker_pairs = Counter(
+        (
+            item.vanilla_answer_marker_seen,
+            item.v3_answer_marker_seen,
+        )
+        for item in samples
+        if item.vanilla_answer_marker_seen is not None
+        and item.v3_answer_marker_seen is not None
+    )
+    marker_distances = [
+        distance
+        for item in samples
+        for distance in item.attempt_to_first_answer_marker_distances
+    ]
+    attempt_count = sum(item.attempt_count for item in samples)
+    subsequent_marker_count = sum(
+        item.attempts_with_subsequent_answer_marker_count for item in samples
+    )
+    late_attempt_count = sum(
+        item.late_attempt_within_32_tokens_count for item in samples
+    )
     return {
         "sample_count": len(samples),
         "strict": paired_metric_summary(
@@ -1033,6 +2005,44 @@ def scope_summary(
             "vanilla": vanilla_format_wrong,
             "v3": v3_format_wrong,
             "delta_v3_minus_vanilla": v3_format_wrong - vanilla_format_wrong,
+        },
+        "descriptive_numeric_correct_but_format_invalid": {
+            "formal_metric": False,
+            "vanilla_count": vanilla_numeric_format_invalid,
+            "v3_count": v3_numeric_format_invalid,
+            "delta_v3_minus_vanilla": (
+                v3_numeric_format_invalid - vanilla_numeric_format_invalid
+            ),
+        },
+        "descriptive_answer_marker_pairs": {
+            "both_seen": marker_pairs[(True, True)],
+            "vanilla_seen_v3_absent": marker_pairs[(True, False)],
+            "vanilla_absent_v3_seen": marker_pairs[(False, True)],
+            "both_absent": marker_pairs[(False, False)],
+            "paired_observation_count": sum(marker_pairs.values()),
+        },
+        "descriptive_attempt_to_first_answer_marker": {
+            "formal_metric": False,
+            "attempt_count": attempt_count,
+            "attempts_with_subsequent_answer_marker_count": (
+                subsequent_marker_count
+            ),
+            "distance_tokens": numeric_summary(marker_distances),
+            "late_attempt_within_32_tokens_count": late_attempt_count,
+            "late_attempt_rate_over_all_attempts": (
+                late_attempt_count / attempt_count if attempt_count else None
+            ),
+            "late_attempt_rate_over_attempts_with_subsequent_marker": (
+                late_attempt_count / subsequent_marker_count
+                if subsequent_marker_count
+                else None
+            ),
+            "marker_missing_attempt_count": sum(
+                item.marker_missing_attempt_count for item in samples
+            ),
+            "marker_not_after_attempt_count": sum(
+                item.marker_not_after_attempt_count for item in samples
+            ),
         },
         "tokens": {
             "vanilla": numeric_summary([item.vanilla_tokens for item in samples]),
@@ -1066,6 +2076,18 @@ def grouped_scope_summary(
             groups.items(), key=lambda item: (-len(item[1]), item[0])
         )
     ]
+
+
+def marker_proximity_group(sample: CompactSample) -> str:
+    if not sample.attempt_count:
+        return "no_attempt"
+    if sample.late_attempt_within_32_tokens_count:
+        return "late_attempt_within_32_tokens"
+    if sample.marker_missing_attempt_count:
+        return "answer_marker_missing"
+    if sample.marker_not_after_attempt_count:
+        return "answer_marker_not_after_attempt"
+    return "subsequent_marker_more_than_32_tokens"
 
 
 def _average_ranks(values: Sequence[float]) -> list[float]:
@@ -1166,6 +2188,23 @@ def sample_brief(sample: CompactSample) -> dict[str, Any]:
         "first_memory_id": sample.first_memory_id,
         "final_memory_id": sample.final_memory_id,
         "first_top1_top2_margin": sample.first_top1_top2_margin,
+        "first_selected_static_score": sample.first_selected_static_score,
+        "static_shortlist_size": sample.static_shortlist_size,
+        "static_selector_unavailable": sample.static_selector_unavailable,
+        "terminal_abstain_count": sample.terminal_abstain_count,
+        "clear_on_terminal_abstain_count": (
+            sample.clear_on_terminal_abstain_count
+        ),
+        "first_answer_marker_token_index": (
+            sample.v3_first_answer_marker_token_index
+        ),
+        "attempt_to_first_answer_marker_distances": list(
+            sample.attempt_to_first_answer_marker_distances
+        ),
+        "late_attempt_within_32_tokens_count": (
+            sample.late_attempt_within_32_tokens_count
+        ),
+        "active_memory_lifetime_tokens": sample.active_memory_lifetime_tokens,
         "mean_activation_kl": sample.mean_activation_kl,
         "mean_attention_mass": sample.mean_attention_mass,
     }
@@ -1218,6 +2257,44 @@ def memory_group_analysis(
         "best_strict_net_effect": best,
         "worst_strict_net_effect": worst,
         "warning": "Exploratory grouping; no multiple-comparison correction.",
+    }
+
+
+def concentration_summary(counts: Mapping[str, int]) -> dict[str, Any]:
+    """Describe selector concentration without treating geometry as a metric."""
+
+    normalized = {
+        str(memory_id): int(count)
+        for memory_id, count in counts.items()
+        if int(count) > 0
+    }
+    total = sum(normalized.values())
+    if not total:
+        return {
+            "selection_count": 0,
+            "selected_memory_count": 0,
+            "top1_share": None,
+            "gini_over_selected_memories": None,
+            "frequency": [],
+        }
+    values = sorted(normalized.values())
+    weighted = sum(
+        (index + 1) * value for index, value in enumerate(values)
+    )
+    count = len(values)
+    gini = (2.0 * weighted) / (count * total) - (count + 1.0) / count
+    frequency = [
+        {"memory_id": memory_id, "count": value}
+        for memory_id, value in sorted(
+            normalized.items(), key=lambda item: (-item[1], item[0])
+        )
+    ]
+    return {
+        "selection_count": total,
+        "selected_memory_count": count,
+        "top1_share": frequency[0]["count"] / total,
+        "gini_over_selected_memories": gini,
+        "frequency": frequency,
     }
 
 
@@ -1378,6 +2455,19 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         f"- Activations / replacements / duplicates / abstains: "
         f"{mechanism['activation_count']} / {mechanism['replacement_count']} / "
         f"{mechanism['duplicate_count']} / {mechanism['abstain_count']}",
+        f"- Terminal abstains / clear-on-abstain: "
+        f"{mechanism['terminal_abstain_count']} / "
+        f"{mechanism['clear_on_terminal_abstain_count']}",
+        f"- Static-selector unavailable: "
+        f"{mechanism['static_selector_unavailable_count']}",
+        f"- Attempts with a subsequent first answer marker / within 32 tokens: "
+        f"{mechanism['attempts_with_subsequent_answer_marker_count']} / "
+        f"{mechanism['late_attempt_within_32_tokens_count']}",
+        f"- Attempt→first-marker distance (descriptive): "
+        f"`{json.dumps(mechanism['attempt_to_first_answer_marker_distance_tokens'], sort_keys=True)}`",
+        f"- Marker missing / marker not after attempt counts: "
+        f"{mechanism['marker_missing_attempt_count']} / "
+        f"{mechanism['marker_not_after_attempt_count']}",
         f"- Re-arms: {mechanism['rearm_count']}",
         f"- Memory attention steps: {mechanism['memory_attention_step_count']}",
         f"- Activation first-step top-1 changes: "
@@ -1392,6 +2482,12 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         f"- Exact completion matches: "
         f"{report['zero_attempt_parity']['completion_exact_match_count']}",
         f"- Mismatches: {report['zero_attempt_parity']['mismatch_count']}",
+        f"- Static-unavailable exact-parity mismatches: "
+        f"{report['static_selector_unavailable_parity']['mismatch_count']}",
+        "",
+        "## V3.5 safety violations",
+        "",
+        f"- Counts: `{json.dumps(report['safety']['violation_counts'], sort_keys=True)}`",
         "",
         "## Token deltas",
         "",
@@ -1427,6 +2523,18 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         "### Outcome sequence",
         "",
         scope_table(report["stratified_analysis"]["by_outcome_sequence"]),
+        "",
+        "### Terminal clear lifecycle",
+        "",
+        scope_table(report["stratified_analysis"]["by_terminal_clear"]),
+        "",
+        "### Attempt proximity to first answer marker (descriptive only)",
+        "",
+        scope_table(
+            report["stratified_analysis"][
+                "by_attempt_to_first_answer_marker_proximity"
+            ]
+        ),
         "",
         "## Exploratory online-signal associations",
         "",
@@ -1465,6 +2573,10 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         "",
         f"- {strict_read}",
         f"- {parity_read}",
+        f"- Numeric-correct/format-invalid is descriptive only: "
+        f"{report['descriptive_diagnostics']['numeric_correct_but_format_invalid']}",
+        f"- Attempt→first-answer-marker timing is descriptive only: "
+        f"{report['descriptive_diagnostics']['attempt_to_first_answer_marker']}",
         "- Use the triggered/replacement/memory strata in the JSON to localize the effect; these are descriptive, not causal.",
         "",
         "## Integrity failures",
@@ -1493,14 +2605,43 @@ def main() -> None:
     ):
         raise ValueError("Invalid analysis limits")
     profile = load_run_profile(args.run_profile)
+    is_v35 = (
+        profile.get("schema_version") == V35_EVALUATION_PROFILE_SCHEMA
+        or profile.get("system_version") == "v3.5"
+        or profile.get("system_profile", {}).get("schema_version")
+        == V35_SYSTEM_PROFILE_SCHEMA
+    )
+    expected_profile_schema = (
+        V35_EVALUATION_PROFILE_SCHEMA if is_v35 else EVALUATION_PROFILE_SCHEMA
+    )
+    if profile.get("schema_version") != expected_profile_schema:
+        raise ValueError("Evaluation/profile version schema combination drifted")
     expected_profile_sha256 = str(profile["profile_sha256"])
     expected_risk_role = str(
         profile.get("system_profile", {}).get(
             "risk_role", "diagnostic_only"
         )
     )
+    system_profile_schema = profile.get("system_profile", {}).get(
+        "schema_version"
+    )
+    expected_generation_schema = {
+        V3_SYSTEM_PROFILE_SCHEMA: V3_GENERATION_RESULT_SCHEMA,
+        V34_SYSTEM_PROFILE_SCHEMA: V34_GENERATION_RESULT_SCHEMA,
+        V35_SYSTEM_PROFILE_SCHEMA: V35_GENERATION_RESULT_SCHEMA,
+    }.get(system_profile_schema)
+    if (
+        expected_generation_schema is None
+        and system_profile_schema is None
+        and profile.get("system_version") is None
+    ):
+        # Historical analyzer fixtures predate explicit V3 system schemas.
+        expected_generation_schema = V3_GENERATION_RESULT_SCHEMA
+    if expected_generation_schema is None:
+        raise ValueError("Unknown V3 system profile schema")
     expected_count = int(profile.get("selected_sample_count", -1))
     audit = IntegrityAudit()
+    safety = V35SafetyAudit()
     streaming = StreamingDiagnostics()
     samples: list[CompactSample] = []
     seen_ids: set[str] = set()
@@ -1521,6 +2662,9 @@ def main() -> None:
                 audit=audit,
                 streaming=streaming,
                 validate_hash=not args.skip_row_hash_validation,
+                is_v35=is_v35,
+                safety=safety,
+                expected_generation_schema=expected_generation_schema,
             )
             audit.check(
                 sample.sample_id not in seen_ids,
@@ -1542,6 +2686,14 @@ def main() -> None:
     mismatched_no_trigger = [
         sample for sample in no_trigger if not sample.completion_exact_match
     ]
+    static_unavailable_samples = [
+        sample for sample in samples if sample.static_selector_unavailable
+    ]
+    mismatched_static_unavailable = [
+        sample
+        for sample in static_unavailable_samples
+        if not sample.completion_exact_match
+    ]
     mechanism = {
         "questions_with_attempt": len(triggered),
         "question_trigger_rate": len(triggered) / len(samples),
@@ -1557,6 +2709,12 @@ def main() -> None:
         "replacement_count": sum(item.replacement_count for item in samples),
         "duplicate_count": sum(item.duplicate_count for item in samples),
         "abstain_count": sum(item.abstain_count for item in samples),
+        "terminal_abstain_count": sum(
+            item.terminal_abstain_count for item in samples
+        ),
+        "clear_on_terminal_abstain_count": sum(
+            item.clear_on_terminal_abstain_count for item in samples
+        ),
         "rearm_count": sum(item.rearm_count for item in samples),
         "memory_attention_step_count": sum(
             item.attention_step_count for item in samples
@@ -1578,6 +2736,30 @@ def main() -> None:
         "outcome_sequence_distribution": dict(sorted(Counter(
             item.outcome_sequence for item in samples
         ).items())),
+        "static_selector_unavailable_count": len(
+            static_unavailable_samples
+        ),
+        "attempts_with_subsequent_answer_marker_count": sum(
+            item.attempts_with_subsequent_answer_marker_count
+            for item in samples
+        ),
+        "late_attempt_within_32_tokens_count": sum(
+            item.late_attempt_within_32_tokens_count for item in samples
+        ),
+        "attempt_to_first_answer_marker_distance_tokens": numeric_summary([
+            distance
+            for item in samples
+            for distance in item.attempt_to_first_answer_marker_distances
+        ]),
+        "marker_missing_attempt_count": sum(
+            item.marker_missing_attempt_count for item in samples
+        ),
+        "marker_not_after_attempt_count": sum(
+            item.marker_not_after_attempt_count for item in samples
+        ),
+        "active_memory_lifetime_tokens": numeric_summary([
+            item.active_memory_lifetime_tokens for item in triggered
+        ]),
         "sampled_native_cache_parity": {
             "checked": streaming.cache_parity_checked,
             "failed": streaming.cache_parity_failed,
@@ -1600,12 +2782,14 @@ def main() -> None:
     for attribute in (
         "first_top1_score",
         "first_top1_top2_margin",
+        "first_selected_static_score",
         "first_trigger_entropy",
         "first_trigger_boundary_index",
         "mean_activation_kl",
         "mean_attention_mass",
         "attention_step_count",
         "attempt_count",
+        "active_memory_lifetime_tokens",
     ):
         associations[attribute] = association_summary(triggered, attribute)
         quartiles[attribute] = quartile_summary(triggered, attribute)
@@ -1641,6 +2825,8 @@ def main() -> None:
         "status": "completed",
         "run": {
             "profile_sha256": expected_profile_sha256,
+            "run_profile_file_sha256": file_sha256(args.run_profile),
+            "results_file_sha256": file_sha256(args.results),
             "evaluation_interpretation": profile.get(
                 "evaluation_interpretation"
             ),
@@ -1650,6 +2836,8 @@ def main() -> None:
             "logical_split": profile.get("logical_split"),
             "dataset_revision": profile.get("dataset_revision"),
             "selected_sample_count": expected_count,
+            "system_version": profile.get("system_version", "v3"),
+            "evaluation_profile_schema": profile.get("schema_version"),
             "system_profile": profile.get("system_profile"),
             "hysteresis_gate": profile.get("hysteresis_gate"),
             "inputs": profile.get("inputs"),
@@ -1705,6 +2893,23 @@ def main() -> None:
                 sample_brief(item) for item in mismatched_no_trigger[:args.top_k]
             ],
         },
+        "static_selector_unavailable_parity": {
+            "applicable": is_v35,
+            "sample_count": len(static_unavailable_samples),
+            "completion_exact_match_count": (
+                len(static_unavailable_samples)
+                - len(mismatched_static_unavailable)
+            ),
+            "mismatch_count": len(mismatched_static_unavailable),
+            "mismatch_examples": [
+                sample_brief(item)
+                for item in mismatched_static_unavailable[:args.top_k]
+            ],
+        },
+        "safety": {
+            "applicable": is_v35,
+            **safety.to_dict(),
+        },
         "mechanism": mechanism,
         "stratified_analysis": {
             "by_attempt_count": grouped_scope_summary(
@@ -1729,6 +2934,25 @@ def main() -> None:
                 triggered,
                 lambda item: "has_abstain" if item.abstain_count else "no_abstain",
             ),
+            "by_terminal_clear": grouped_scope_summary(
+                triggered,
+                lambda item: (
+                    "terminal_clear"
+                    if item.clear_on_terminal_abstain_count
+                    else "no_terminal_clear"
+                ),
+            ),
+            "by_static_selector_availability": grouped_scope_summary(
+                samples,
+                lambda item: (
+                    "static_unavailable"
+                    if item.static_selector_unavailable
+                    else "static_available"
+                ),
+            ),
+            "by_static_shortlist_size": grouped_scope_summary(
+                samples, lambda item: str(item.static_shortlist_size)
+            ),
             "by_activation_top1_change": grouped_scope_summary(
                 triggered,
                 lambda item: (
@@ -1736,6 +2960,9 @@ def main() -> None:
                     if item.activation_top1_change_count
                     else "top1_unchanged_or_not_applicable"
                 ),
+            ),
+            "by_attempt_to_first_answer_marker_proximity": (
+                grouped_scope_summary(samples, marker_proximity_group)
             ),
         },
         "exploratory_associations": {
@@ -1745,6 +2972,35 @@ def main() -> None:
             ),
             "correlations": associations,
             "equal_count_rank_quartiles": quartiles,
+        },
+        "v35_static_dynamic_lifecycle_strata": {
+            "applicable": is_v35,
+            "static_applicability_score_quartiles": quartiles[
+                "first_selected_static_score"
+            ],
+            "dynamic_margin_quartiles": quartiles[
+                "first_top1_top2_margin"
+            ],
+            "active_memory_lifetime_quartiles": quartiles[
+                "active_memory_lifetime_tokens"
+            ],
+            "late_activation_position_quartiles": quartiles[
+                "first_trigger_boundary_index"
+            ],
+            "terminal_clear": grouped_scope_summary(
+                triggered,
+                lambda item: (
+                    "terminal_clear"
+                    if item.clear_on_terminal_abstain_count
+                    else "no_terminal_clear"
+                ),
+            ),
+            "activation_paths": grouped_scope_summary(
+                triggered, lambda item: item.outcome_sequence
+            ),
+            "attempt_to_first_answer_marker_proximity": (
+                grouped_scope_summary(samples, marker_proximity_group)
+            ),
         },
         "memory_analysis": {
             "first_memory": memory_group_analysis(
@@ -1766,6 +3022,91 @@ def main() -> None:
                 )
             ],
             "attention_top_by_exposure": memory_attention[:args.top_k],
+        },
+        "selector_geometry": {
+            "applicable": is_v35,
+            "static_selector_available_count": (
+                len(samples) - len(static_unavailable_samples)
+            ),
+            "static_selector_unavailable_count": len(
+                static_unavailable_samples
+            ),
+            "static_selector_availability_rate": (
+                (len(samples) - len(static_unavailable_samples)) / len(samples)
+            ),
+            "static_shortlist_size": numeric_summary([
+                item.static_shortlist_size for item in samples
+            ]),
+            "static_top1_concentration": concentration_summary(
+                streaming.static_top1_memory_counts
+            ),
+            "dynamic_selected_concentration": concentration_summary(
+                streaming.selected_memory_attempt_counts
+            ),
+            "selected_memory_count": len(
+                streaming.selected_memory_attempt_counts
+            ),
+            "mem_051": {
+                "memory_id": "mem-051ae8fcf60f21781c7f145f",
+                "static_shortlist_question_count": int(
+                    streaming.static_shortlist_memory_counts[
+                        "mem-051ae8fcf60f21781c7f145f"
+                    ]
+                ),
+                "actual_selected_attempt_count": int(
+                    streaming.selected_memory_attempt_counts[
+                        "mem-051ae8fcf60f21781c7f145f"
+                    ]
+                ),
+                "first_selected_strict_improved_sample_ids": [
+                    item.sample_id
+                    for item in samples
+                    if item.first_memory_id
+                    == "mem-051ae8fcf60f21781c7f145f"
+                    and item.strict_delta > 0
+                ],
+                "first_selected_strict_harmed_sample_ids": [
+                    item.sample_id
+                    for item in samples
+                    if item.first_memory_id
+                    == "mem-051ae8fcf60f21781c7f145f"
+                    and item.strict_delta < 0
+                ],
+            },
+            "own_source_audit": profile.get("applicability_calibration"),
+        },
+        "descriptive_diagnostics": {
+            "not_formal_accuracy_metrics": True,
+            "numeric_correct_but_format_invalid": scope_summary(samples)[
+                "descriptive_numeric_correct_but_format_invalid"
+            ],
+            "answer_marker_pairs": scope_summary(samples)[
+                "descriptive_answer_marker_pairs"
+            ],
+            "attempt_to_first_answer_marker": scope_summary(samples)[
+                "descriptive_attempt_to_first_answer_marker"
+            ],
+            "vanilla_marker_seen_v3_absent_sample_ids": [
+                item.sample_id
+                for item in samples
+                if item.vanilla_answer_marker_seen is True
+                and item.v3_answer_marker_seen is False
+            ],
+            "late_attempt_within_32_tokens_sample_ids": [
+                item.sample_id
+                for item in samples
+                if item.late_attempt_within_32_tokens_count > 0
+            ],
+            "answer_marker_missing_after_attempt_sample_ids": [
+                item.sample_id
+                for item in samples
+                if item.marker_missing_attempt_count > 0
+            ],
+            "answer_marker_not_after_attempt_sample_ids": [
+                item.sample_id
+                for item in samples
+                if item.marker_not_after_attempt_count > 0
+            ],
         },
         "token_tail_analysis": {
             "max_new_tokens": max_budget,
@@ -1789,6 +3130,15 @@ def main() -> None:
             ),
             "largest_positive_deltas": [sample_brief(item) for item in top_positive],
             "largest_negative_deltas": [sample_brief(item) for item in top_negative],
+            "runaway_v3_only_sample_ids": [
+                item.sample_id
+                for item in samples
+                if item.v3_tokens == max_budget
+                and item.vanilla_tokens != max_budget
+            ],
+            "token_outlier_sample_ids": [
+                item.sample_id for item in top_positive
+            ],
         },
         "interpretation_guardrails": {
             "official_test_reused": (
