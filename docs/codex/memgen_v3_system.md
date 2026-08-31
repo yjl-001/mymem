@@ -691,6 +691,40 @@ random control，并非 full-bank oracle；没有资格声称未 treatment 的 m
 reward，所以它是 exploratory causal diagnostic，不回写 V3.5 answer-blind calibration、不选择 variant 或
 threshold，也不直接取得 online qualification。
 
+#### V3.8 failure-only full-bank causal matrix and bottleneck attribution
+
+V3.7 只 treatment 每种 retriever top-4 的并集和随机 control，因而无法区分“bank/value 中没有 helpful
+memory”和“helpful memory 存在但 retriever 没找到”。V3.8 固定 V3.7 已完成的前 64 个 held-out profile，
+只选择其中 gate-eligible 且 strict baseline reward 为零的 query，对 V3.6 中全部 104 条已认证 state-key /
+side-KV 绑定 memory 做穷举 treatment。这里的 full bank 严格指完整的 V3.6 authenticated state-key universe；
+原始 161 条 side-KV 中缺少同构 source-state key 的 57 条不混入 retrieval attribution。
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_8_failure_full_bank_causal_audit.sh \
+  "$PHASE1_DIR" \
+  "$E0_DIR" \
+  "$OUTPUT_ROOT/v3_4_token_risk/token-entropy-risk-gate-v3.4.pt" \
+  "$OUTPUT_ROOT"
+```
+
+默认读取
+`$OUTPUT_ROOT/v3_7_cross_problem_causal/dev_offset0_limit64_k4_random4_seed3617`；其他已认证 V3.7 profile
+必须通过 `--v37-run-dir DIR` 显式传入。V3.7 已运行的失败-query treatment 通过原始行的 canonical hash
+认证后复用，脚本只生成其余 query-memory 对；每个新 treatment 立即 flush，因此中断后可逐 pair 续跑。
+完整结果写出 `full_bank_treatments.jsonl` 和固定 query/memory 顺序的 `utility_matrix.json`。
+
+P2 不使用事后阈值判断，而在固定 `diagnosis_k=4` 下把每个 baseline failure 分进四个互斥桶：authenticated
+bank 中无 helpful memory；helpful 存在但未进 Top-K；helpful 已进 Top-K 但未到 Top-1；Top-1 helpful。
+这四个计数分别对应当前固定 treatment 下的 bank/value/injection coverage gap、candidate retrieval gap、
+top-1 reranking gap 和已捕获收益。报告对五个预注册 V3.7 ranking 全部给出该分解、full-positive MRR、
+Helpful-hit@K 与同 helpful 密度下的 uniform-random expected hit，不选择线上 variant 或阈值。
+
+failure-only sweep 的 baseline reward 已为零，因此只能观测 neutral/helpful，不能估计 harmful；风险证据仍只
+能引用 V3.7 在成功与失败 query 上的候选池 treatment。另一个解释边界是：某条 memory 在固定
+persistent-to-EOS side-KV treatment 下不 helpful，可能来自 value 本身无跨题修复能力，也可能来自当前注入
+剂量/时长无法执行该 value，不能单独归因于 key。V3.8 仍是使用 task reward 的 causal diagnostic，不改变
+V3.5 formal qualification。
+
 ### Injection layer
 
 当前 V3 只在 layer 24 注入，不做 layer search、multi-layer 或候选层双路编译。等 V3 全流程和全量
