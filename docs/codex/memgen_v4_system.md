@@ -63,6 +63,13 @@ model、base URL、prompt version、construction input hash 与输出 hash，但
 3. 每个 cluster 合成 target/reference process card；
 4. 对已经生成的 card 做只审核、不改写的 semantic review。
 
+Signature 构造逐条持久化。若 DeepSeek 请求成功但返回的 JSON 未通过 V4 schema 或实例泄漏检查，后续短重试会
+携带上一条输出和本地校验原因，要求模型定向修正。若短重试仍失败，该 construction example 会被写成
+`applicable=false` 的确定性拒绝审计记录并从聚类输入中排除，批处理继续；系统不会据此编造 repair
+signature。网络故障、代理重试耗尽、鉴权、余额或不可重试 HTTP 错误仍然失败关闭。
+`repair_signatures.jsonl` 的 `generation_status` 区分正常教师输出与受控拒绝，最终 manifest 的
+`teacher_invalid_signature_ids` 汇总后者。
+
 cluster 不按题目故事、对象或宽泛数学主题划分。一个正式 runtime bank 至少含五个不同 sample ID；DeepSeek
 从中选择五到十个独立 representative examples 覆盖结构变化。少于五个、机制混杂、无法落到单一 repair
 operator 的组被拒绝，不通过合并弱相关 singleton 凑数。

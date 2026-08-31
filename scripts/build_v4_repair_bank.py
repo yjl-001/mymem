@@ -60,7 +60,7 @@ from memgen.experience.v4_bank import (
     parse_v4_process_card,
     parse_v4_repair_signature,
 )
-from scripts.build_teacher_bank import TeacherClient
+from scripts.build_teacher_bank import TeacherClient, TeacherInvalidResponseError
 
 
 SIGNATURE_RECORD_SCHEMA = "memgen-v4-repair-signature-record-v1"
@@ -521,6 +521,16 @@ def _write_jsonl(path: Path, values: Iterable[Mapping[str, Any]]) -> None:
             os.fsync(handle.fileno())
 
 
+def _append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
+    """Durably append one record without rewriting an ever-growing JSONL file."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _client(args: argparse.Namespace, *, api_key: str, max_tokens: int) -> TeacherClient:
     return TeacherClient(
         base_url=args.base_url,
@@ -544,11 +554,13 @@ def _signature_record(
     example: Mapping[str, Any],
     model: str,
     base_url: str,
+    generation_status: str = "teacher_validated",
 ) -> dict[str, Any]:
     record = {
         "schema_version": SIGNATURE_RECORD_SCHEMA,
         "prompt_version": V4_SIGNATURE_PROMPT_VERSION,
         "created_at": utc_now(),
+        "generation_status": generation_status,
         "teacher": {
             "model": model,
             "base_url": base_url,
@@ -560,6 +572,30 @@ def _signature_record(
         "signature_sha256": signature.signature_sha256,
     }
     return record
+
+
+def _rejected_signature_after_invalid_response(
+    example: Mapping[str, Any],
+) -> V4RepairSignature:
+    """Create a non-applicable audit record without inventing a repair signature."""
+
+    return V4RepairSignature(
+        experience_id=str(example["experience_id"]),
+        sample_id=str(example["sample_id"]),
+        experience_type=str(example["experience_type"]),
+        problem_structure="an example whose process abstraction was not validated",
+        decision_point="before admitting the example into repair clustering",
+        failure_mechanism="no validated transferable failure mechanism was recovered",
+        repair_operator="exclude the unvalidated example from repair clustering",
+        verification_operator=(
+            "require a grounded schema compliant abstraction before admission"
+        ),
+        applicable=False,
+        rejection_reason=(
+            "teacher output remained outside the instance free schema after retries"
+        ),
+        source_provenance_sha256=str(example["source_provenance_sha256"]),
+    )
 
 
 def _card_record(
@@ -738,12 +774,18 @@ def main() -> None:
                     compatible_signatures[experience_id] = record
 
     signature_records: list[dict[str, Any]] = []
+    # Compatible resume records are already held in memory. Rebuild the ordered
+    # checkpoint once, then append one durable record per completed example.
+    # Rewriting all prior records after every API call is quadratic at bank scale.
+    _write_jsonl(signatures_path, ())
     with _client(
         args, api_key=api_key, max_tokens=args.signature_max_tokens
     ) as signature_client:
         for index, example in enumerate(examples, start=1):
             experience_id = str(example["experience_id"])
             record = compatible_signatures.get(experience_id)
+            if record is not None and "generation_status" not in record:
+                record = {**record, "generation_status": "teacher_validated"}
             if record is None:
                 def parse_signature_response(content: str) -> dict[str, Any]:
                     candidate = _parse_json_object(content)
@@ -758,29 +800,48 @@ def main() -> None:
                     )
                     return candidate
 
-                payload = signature_client.call(
-                    repair_signature_messages(example),
-                    response_parser=parse_signature_response,
-                    request_label="v4-signature",
-                    expose_parser_error=True,
-                )
-                signature = parse_v4_repair_signature(
-                    payload,
-                    experience_id=experience_id,
-                    sample_id=str(example["sample_id"]),
-                    experience_type=str(example["experience_type"]),
-                    source_provenance_sha256=str(
-                        example["source_provenance_sha256"]
-                    ),
-                )
-                record = _signature_record(
-                    signature,
-                    example=example,
-                    model=args.model,
-                    base_url=args.base_url,
-                )
+                try:
+                    payload = signature_client.call(
+                        repair_signature_messages(example),
+                        response_parser=parse_signature_response,
+                        request_label="v4-signature",
+                        expose_parser_error=True,
+                        repair_parser_errors=True,
+                    )
+                    signature = parse_v4_repair_signature(
+                        payload,
+                        experience_id=experience_id,
+                        sample_id=str(example["sample_id"]),
+                        experience_type=str(example["experience_type"]),
+                        source_provenance_sha256=str(
+                            example["source_provenance_sha256"]
+                        ),
+                    )
+                    record = _signature_record(
+                        signature,
+                        example=example,
+                        model=args.model,
+                        base_url=args.base_url,
+                    )
+                except TeacherInvalidResponseError:
+                    signature = _rejected_signature_after_invalid_response(example)
+                    record = _signature_record(
+                        signature,
+                        example=example,
+                        model=args.model,
+                        base_url=args.base_url,
+                        generation_status=(
+                            "deterministic_rejection_after_invalid_teacher_response"
+                        ),
+                    )
+                    print(
+                        f"[v4-bank] signature rejected after invalid responses "
+                        f"{experience_id}; continuing",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             signature_records.append(record)
-            _write_jsonl(signatures_path, signature_records)
+            _append_jsonl(signatures_path, record)
             print(
                 f"[v4-bank] signatures {index}/{len(examples)} {experience_id}",
                 flush=True,
@@ -836,6 +897,7 @@ def main() -> None:
                 response_parser=parse_cluster_response,
                 request_label="v4-cluster",
                 expose_parser_error=True,
+                repair_parser_errors=True,
             )
         clusters, rejected_ids = parse_v4_cluster_plan(
             cluster_payload, signatures=signatures
@@ -937,6 +999,7 @@ def main() -> None:
                     response_parser=parse_card_response,
                     request_label="v4-card",
                     expose_parser_error=True,
+                    repair_parser_errors=True,
                 )
                 card = parse_v4_process_card(
                     payload, cluster_key=cluster.cluster_key
@@ -991,6 +1054,7 @@ def main() -> None:
                     response_parser=parse_review_response,
                     request_label="v4-card-review",
                     expose_parser_error=True,
+                    repair_parser_errors=True,
                 )
                 review = parse_v4_card_review(
                     payload, cluster_key=cluster.cluster_key
@@ -1046,6 +1110,12 @@ def main() -> None:
             "split_manifest_logical_sha256": split_manifest["manifest_sha256"],
             "dataset_revision": args.dataset_revision,
             "construction_example_count": len(examples),
+            "teacher_invalid_signature_ids": [
+                str(record["signature"]["experience_id"])
+                for record in signature_records
+                if record.get("generation_status")
+                == "deterministic_rejection_after_invalid_teacher_response"
+            ],
             "cluster_input_sha256": cluster_input_sha256,
             "rejected_signature_ids": list(rejected_ids),
             "repository": _repository_state(),

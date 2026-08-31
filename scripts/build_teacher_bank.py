@@ -41,6 +41,10 @@ DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
 
 
+class TeacherInvalidResponseError(RuntimeError):
+    """The teacher returned HTTP success but exhausted response validation retries."""
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Construct inspectable target/reference bank records with a teacher LLM."
@@ -444,10 +448,12 @@ class TeacherClient:
         response_parser: Callable[[str], dict[str, Any]] = parse_json_payload,
         request_label: str = "teacher-bank",
         expose_parser_error: bool = False,
+        repair_parser_errors: bool = False,
     ) -> dict[str, Any]:
+        original_messages = [dict(message) for message in messages]
         body = {
             "model": self.model,
-            "messages": messages,
+            "messages": original_messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "response_format": {"type": "json_object"},
@@ -526,6 +532,7 @@ class TeacherClient:
                     "balance, model name, and request parameters."
                 )
 
+            content: Any = None
             try:
                 payload = response.json()
                 content = payload["choices"][0]["message"]["content"]
@@ -533,7 +540,7 @@ class TeacherClient:
             except (requests.exceptions.JSONDecodeError, KeyError, IndexError, ValueError) as exc:
                 ordinary_failures += 1
                 if ordinary_failures >= self.retries:
-                    raise RuntimeError(
+                    raise TeacherInvalidResponseError(
                         f"{request_label} API returned an invalid response after short retries."
                     ) from None
                 delay = 2 ** (ordinary_failures - 1)
@@ -542,6 +549,20 @@ class TeacherClient:
                     if expose_parser_error and isinstance(exc, ValueError) and str(exc)
                     else type(exc).__name__
                 )
+                if repair_parser_errors and isinstance(content, str) and content.strip():
+                    body["messages"] = [
+                        *original_messages,
+                        {"role": "assistant", "content": content},
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous JSON object failed local validation: "
+                                f"{reason}. Return a corrected JSON object only. Preserve "
+                                "the requested schema and change every field implicated by "
+                                "the validation error."
+                            ),
+                        },
+                    ]
                 print(
                     f"[{request_label}] invalid API response ({reason}) "
                     f"(retry {ordinary_failures}/{self.retries - 1}); waiting {delay}s...",

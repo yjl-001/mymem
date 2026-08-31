@@ -20,6 +20,7 @@ from memgen.experience.v4_bank import (
     parse_v4_repair_signature,
 )
 from scripts.build_v4_repair_bank import (
+    _rejected_signature_after_invalid_response,
     attach_official_solutions,
     cluster_messages,
     process_card_messages,
@@ -94,6 +95,22 @@ def review(*, approve: bool = True) -> V4CardReview:
 
 
 class V4BankContractTests(unittest.TestCase):
+    def test_invalid_teacher_response_becomes_nonapplicable_audit_record(self) -> None:
+        value = _rejected_signature_after_invalid_response(
+            {
+                "experience_id": "experience-a",
+                "sample_id": "sample-a",
+                "experience_type": "answer_correctness",
+                "source_provenance_sha256": "provenance-a",
+            }
+        )
+        self.assertFalse(value.applicable)
+        self.assertIn("outside the instance free schema", value.rejection_reason)
+        self.assertEqual(
+            value.repair_operator,
+            "exclude the unvalidated example from repair clustering",
+        )
+
     def test_profile_freezes_deepseek_and_layer(self) -> None:
         profile = V4ConstructionProfile()
         self.assertEqual(profile.teacher_model, "deepseek-v4-flash")

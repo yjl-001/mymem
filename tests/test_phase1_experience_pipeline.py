@@ -21,7 +21,11 @@ from memgen.experience.phase1 import (
     route_ai_review,
     split_audit_reasons,
 )
-from scripts.build_teacher_bank import TeacherClient, jsonl_examples
+from scripts.build_teacher_bank import (
+    TeacherClient,
+    TeacherInvalidResponseError,
+    jsonl_examples,
+)
 from scripts.build_teacher_bank import teacher_messages
 from data.utils.math_utils import diagnose_gsm8k_completion
 from scripts.review_experience_bank import (
@@ -87,10 +91,12 @@ class FakeSession:
         self.headers: dict[str, str] = {}
         self.trust_env = False
         self.post_calls = 0
+        self.post_json_bodies: list[dict | None] = []
         self.closed = False
 
     def post(self, *_args, **_kwargs):
         self.post_calls += 1
+        self.post_json_bodies.append(copy.deepcopy(_kwargs.get("json")))
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
@@ -611,6 +617,68 @@ class TeacherClientTests(unittest.TestCase):
                 [], response_parser=lambda content: {"raw": json.loads(content)}
             )
         self.assertEqual(parsed, {"raw": {"decision": "approve"}})
+
+    def test_parser_retry_can_send_validation_feedback(self) -> None:
+        invalid_content = json.dumps({"repair_operator": "multiply by 7"})
+        valid_content = json.dumps({"repair_operator": "preserve the prior state"})
+        session = FakeSession(
+            [
+                FakeResponse(
+                    200, {"choices": [{"message": {"content": invalid_content}}]}
+                ),
+                FakeResponse(
+                    200, {"choices": [{"message": {"content": valid_content}}]}
+                ),
+            ]
+        )
+        sleeps: list[float] = []
+
+        def parser(content: str) -> dict:
+            payload = json.loads(content)
+            if any(character.isdigit() for character in payload["repair_operator"]):
+                raise ValueError("repair_operator contains instance-specific content")
+            return payload
+
+        with teacher_client(session, sleeps) as client:
+            result = client.call(
+                [{"role": "user", "content": "Return the repair."}],
+                response_parser=parser,
+                request_label="v4-signature",
+                expose_parser_error=True,
+                repair_parser_errors=True,
+            )
+
+        self.assertEqual(result, {"repair_operator": "preserve the prior state"})
+        self.assertEqual(sleeps, [1])
+        retry_messages = session.post_json_bodies[1]["messages"]
+        self.assertEqual(
+            retry_messages[-2], {"role": "assistant", "content": invalid_content}
+        )
+        self.assertIn(
+            "repair_operator contains instance-specific",
+            retry_messages[-1]["content"],
+        )
+
+    def test_invalid_response_exhaustion_has_distinct_exception(self) -> None:
+        content = json.dumps({"invalid": True})
+        session = FakeSession(
+            [
+                FakeResponse(200, {"choices": [{"message": {"content": content}}]})
+                for _ in range(3)
+            ]
+        )
+
+        def reject_fixture(_content: str) -> dict:
+            raise ValueError("invalid fixture")
+
+        with teacher_client(session, []) as client:
+            with self.assertRaises(TeacherInvalidResponseError):
+                client.call(
+                    [],
+                    response_parser=reject_fixture,
+                    request_label="v4-signature",
+                    repair_parser_errors=True,
+                )
 
     def test_http_407_uses_long_proxy_backoff(self) -> None:
         proxy_response = FakeResponse(407)
