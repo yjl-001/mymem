@@ -629,6 +629,36 @@ task accuracy，也不选择线上 query/key winner。
 dynamic，则 `Prefer` action 仍不应进入 key；若所有变体都弱，应转向独立的 structured trigger condition 或
 显式 query/key alignment，而不是继续做 key-only geometry 修正。强 in-source 结果仍不等于跨题 usefulness。
 
+#### V3.6 source causal-state retrieval-key diagnostic
+
+V3.5 的 applicability/dynamic key 都来自脱离问题上下文的 `when_facing` 文本，而 runtime query 来自
+GSM8K prompt、完整问题和 partial CoT 的 causal state；相同 reasoner、layer 和向量宽度并不能保证两个表示
+天然可做 cosine。V3.6 首先不训练 projection，而是直接验证同构 state key：reference/verified-failure
+trajectory 的 first counterfactual gate causal-prefix state 作为 key，paired target/verified-success first-gate
+state 作为 query。value 继续绑定原 `When facing + Prefer + Avoid` side-KV，不在同一实验里改变。
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_6_source_state_key_audit.sh \
+  "$PHASE1_DIR" \
+  "$E0_DIR" \
+  "$OUTPUT_ROOT/v3_4_token_risk/token-entropy-risk-gate-v3.4.pt" \
+  "$OUTPUT_ROOT"
+```
+
+该 audit 复用并认证 V3.5 source alignment 与 query-state sidecar，不再运行 reasoner 或 generation。reference
+first-gate eligible memories 构成固定 key universe；只有 target/reference first-gate 都存在的 memory 进入 paired
+query。任何 target query 都不会把同一个 sidecar tensor origin 复用为 reference key；跨轨迹 embedding
+数值恰好相同的数量另行显式报告。五个预注册变体是：现有
+applicability-text key × target-current control、reference-prompt × target-prompt identity control、
+reference-current × target-current、reference-delta × target-delta、reference-local16 × target-local16。
+
+prompt control 对同一 memory 的 target/reference 使用完全相同的问题 prompt，因此它是 episode/question
+identity ceiling，不是 state transfer。若 current/local 很强但 delta 失败，应把增益主要解释为共享题目内容；
+只有 delta 仍保留明显 rank/margin 提升，才支持跨轨迹动态成分对齐。即使 state key 结果很强，它仍是同题
+cross-trajectory sanity check，不能证明跨题 usefulness，也不会直接取得 online qualification。正式 state-key
+bank 还需要为 reference 无 first-gate 的 memory 定义 authenticated anchor policy，或为每条 transferable
+memory 收集多个跨问题 positive states；不能用 exact source-query self lookup 代替这个证据。
+
 ### Injection layer
 
 当前 V3 只在 layer 24 注入，不做 layer search、multi-layer 或候选层双路编译。等 V3 全流程和全量
