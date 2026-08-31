@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+import runpy
+from types import SimpleNamespace
 import unittest
+
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - CPU contract suites may omit torch.
+    torch = None
 
 from memgen.experience.v3_7_cross_problem import (
     V37_RETRIEVAL_VARIANTS,
@@ -12,7 +20,80 @@ from memgen.experience.v3_7_cross_problem import (
 )
 
 
+AUDIT = runpy.run_path(
+    str(
+        Path(__file__).resolve().parents[1]
+        / "scripts/audit_v3_7_cross_problem_causal_applicability.py"
+    ),
+    run_name="v37_cross_problem_test_module",
+)
+
+
 class V37CrossProblemContractsTest(unittest.TestCase):
+    @unittest.skipIf(torch is None, "torch is unavailable")
+    def test_continuous_observation_probes_a_non_delimiter_token(self) -> None:
+        class FakeModel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __call__(self, **_: object) -> SimpleNamespace:
+                self.calls += 1
+                return SimpleNamespace(
+                    logits=torch.zeros((1, 1, 2)),
+                    past_key_values=(self.calls,),
+                )
+
+        class FakeDecoding:
+            def __init__(self) -> None:
+                self.tokens = iter((10, 11, 99))
+
+            def next_token(self, **_: object) -> int:
+                return next(self.tokens)
+
+            @staticmethod
+            def is_eos(token_id: int) -> bool:
+                return token_id == 99
+
+        class FakeTokenizer:
+            @staticmethod
+            def decode(*_: object, **__: object) -> str:
+                return "reasoning"
+
+        class FakeGate:
+            def __init__(self) -> None:
+                self.probe_count = 0
+                self.config = SimpleNamespace(
+                    entropy_threshold=0.5,
+                    risk_threshold=0.25,
+                )
+
+            def probe(self, *, model: object, **kwargs: object) -> SimpleNamespace:
+                self.probe_count += 1
+                output = model(**kwargs)
+                return SimpleNamespace(entropy=0.8, risk_score=0.7, output=output)
+
+            @staticmethod
+            def triggered(_: object) -> bool:
+                return True
+
+        runtime = SimpleNamespace(
+            max_new_tokens=3,
+            model=FakeModel(),
+            tokenizer=FakeTokenizer(),
+            decoding=FakeDecoding(),
+            _tensor=lambda values: torch.tensor([list(values)], dtype=torch.long),
+        )
+        gate = FakeGate()
+        result = AUDIT["_generate_continuous_observation"](
+            runtime=runtime,
+            prompt_token_ids=(1, 2),
+            gate=gate,
+        )
+        self.assertEqual(gate.probe_count, 1)
+        self.assertEqual(result.prefix_token_ids, (1, 2, 10))
+        self.assertEqual(result.completion_token_ids, (10, 11, 99))
+        self.assertEqual(result.gate_observation.generated_boundary_index, 0)
+
     def test_stable_rank_and_rrf_are_deterministic(self) -> None:
         memory_ids = ("mem-b", "mem-a", "mem-c")
         ordered, ranks = stable_rank(memory_ids, (0.5, 0.5, 0.1))

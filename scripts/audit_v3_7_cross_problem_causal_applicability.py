@@ -17,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 import sys
 import time
@@ -59,6 +60,9 @@ QUERY_FILE = "causal_queries.jsonl"
 TREATMENT_FILE = "causal_treatments.jsonl"
 REPORT_FILE = "causal_report.json"
 MARKDOWN_FILE = "causal_report.md"
+_ANSWER_MARKER_RE = re.compile(
+    r"(?:\\boxed|\\fbox|final\s+answer|answer\s+is)", re.IGNORECASE
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -411,6 +415,89 @@ def _score_condition(
         "diagnostic_failure_types": list(verifier.get("failure_types", ())),
         "scorer_version": GSM8K_VERIFIER_VERSION,
     }
+
+
+def _generate_continuous_observation(
+    *, runtime: Any, prompt_token_ids: Sequence[int], gate: Any
+) -> Any:
+    """Run vanilla decoding while probing every pre-answer generated token.
+
+    V3.5 freezes ``memgen/model/e1_runtime.py`` by content hash, so the V3.7
+    every-token observation policy deliberately lives here instead of changing
+    the older delimiter-only E1 method.  Before the first event, this is exactly
+    the V3.4/V3.5 joint entropy+risk qualification policy; hysteresis/re-arm is
+    irrelevant because only the first event is selected.
+    """
+
+    import torch
+    from memgen.experience.e1 import GateObservation
+    from memgen.model.e1_runtime import ObservationRolloutResult
+
+    ids = list(prompt_token_ids)
+    if not ids:
+        raise ValueError("V3.7 continuous observation requires a prompt")
+    prompt_length = len(ids)
+    past = None
+    selected: GateObservation | None = None
+    selected_prefix: tuple[int, ...] = ()
+    candidate_count = 0
+    with torch.inference_mode():
+        for generation_step in range(runtime.max_new_tokens):
+            full = runtime._tensor(ids)
+            attention_mask = torch.ones_like(full)
+            probe = None
+            completion_text = runtime.tokenizer.decode(
+                ids[prompt_length:], skip_special_tokens=False
+            )
+            can_observe = selected is None and not _ANSWER_MARKER_RE.search(
+                completion_text
+            )
+            if generation_step > 0 and can_observe:
+                candidate_count += 1
+                probe = gate.probe(
+                    model=runtime.model,
+                    boundary_token=full[:, -1:],
+                    attention_mask=attention_mask,
+                    past_key_values=past,
+                )
+                if gate.triggered(probe):
+                    selected = GateObservation(
+                        generated_boundary_index=(
+                            len(ids) - prompt_length - 1
+                        ),
+                        boundary_token_id=int(ids[-1]),
+                        entropy=probe.entropy,
+                        entropy_threshold=gate.config.entropy_threshold,
+                        persistence_risk_score=probe.risk_score,
+                        persistence_risk_threshold=gate.config.risk_threshold,
+                    )
+                    selected_prefix = tuple(ids)
+
+            if probe is not None:
+                output = probe.output
+            else:
+                kwargs: dict[str, Any] = {
+                    "attention_mask": attention_mask,
+                    "use_cache": True,
+                    "return_dict": True,
+                    "input_ids": full if past is None else full[:, -1:],
+                }
+                if past is not None:
+                    kwargs["past_key_values"] = past
+                output = runtime.model(**kwargs)
+            next_token = runtime.decoding.next_token(
+                token_ids=ids, logits=output.logits
+            )
+            ids.append(next_token)
+            past = output.past_key_values
+            if runtime.decoding.is_eos(next_token):
+                break
+    return ObservationRolloutResult(
+        completion_token_ids=tuple(ids[prompt_length:]),
+        gate_observation=selected,
+        prefix_token_ids=selected_prefix,
+        candidate_boundary_count=candidate_count,
+    )
 
 
 def _processed_solution(answer: str) -> str:
@@ -903,10 +990,10 @@ def main() -> None:
                     raise ValueError(f"V3.7 dataset or cross-problem drift: {sample_id}")
                 prompt_ids = GSM8K_PROMPT_CONTRACT.token_ids(tokenizer, question)
                 baseline_started = time.perf_counter()
-                observation = runtime.generate_observation_only(
+                observation = _generate_continuous_observation(
+                    runtime=runtime,
                     prompt_token_ids=prompt_ids,
                     gate=gate,
-                    observe_every_generated_token=True,
                 )
                 baseline_seconds = time.perf_counter() - baseline_started
 
