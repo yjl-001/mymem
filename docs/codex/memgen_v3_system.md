@@ -659,6 +659,38 @@ cross-trajectory sanity check，不能证明跨题 usefulness，也不会直接�
 bank 还需要为 reference 无 first-gate 的 memory 定义 authenticated anchor policy，或为每条 transferable
 memory 收集多个跨问题 positive states；不能用 exact source-query self lookup 代替这个证据。
 
+#### V3.7 held-out cross-problem causal applicability diagnostic
+
+V3.6 只回答同一道题的 reference/target state 是否能够跨轨迹找回 own memory。V3.7 把 query 改成与
+`bank-source` 严格隔离的 `dev-test` vanilla rollout，并对每条候选强制验证 source-question hash 不同。
+冻结 V3.4 token entropy+risk gate 的第一次 joint event 后，先保留无 memory completion，再从完全相同的
+causal prefix/cache 分支运行一个 persistent side-KV treatment。对 gate-eligible query，候选池冻结后才计算
+官方 GSM8K strict reward，reward 差值定义 causal utility：`+1=helpful`、`0=neutral`、`-1=harmful`。
+答案和 reward 不得参与 query/key、
+cosine、候选池、RRF 或随机对照构造。
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_7_cross_problem_causal_applicability_audit.sh \
+  "$PHASE1_DIR" \
+  "$E0_DIR" \
+  "$OUTPUT_ROOT/v3_4_token_risk/token-entropy-risk-gate-v3.4.pt" \
+  "$OUTPUT_ROOT"
+```
+
+默认预注册前 64 个 `dev-test` 样本、每种 retriever top-4、4 个不与 deterministic top 集合重合的随机
+control。五种 retrieval ranking 是 state-current、state-delta、state-local16、旧 text-applicability，
+以及只使用 local16/delta ranks 的固定 RRF。每个 gate-eligible query 的 treatment pool 是五种 top-k 与
+random controls 的去重并集；脚本逐 treatment flush，query 只在其完整 pool 跑完后落盘，因此相同 output
+目录可安全续跑。可用 `--offset`、`--limit`、`--candidate-top-k` 和 `--random-candidates` 建立独立 profile，
+但不同 profile 的结果不能在没有显式聚合审计时拼接。
+
+报告必须把两个问题分开：evaluated-pool oracle（含 no-memory abstain）是否高于 baseline，回答当前 value
+bank 中是否观察到跨题 causal ceiling；各 retriever 的 top-1 uplift、Helpful@1、Harmful@1 和 pool-conditional
+Helpful-hit@K，回答 state key 能否把这些 helpful memories 排到前面。该 oracle 只覆盖 retriever-union 加
+random control，并非 full-bank oracle；没有资格声称未 treatment 的 memories 全部无用。V3.7 使用 task
+reward，所以它是 exploratory causal diagnostic，不回写 V3.5 answer-blind calibration、不选择 variant 或
+threshold，也不直接取得 online qualification。
+
 ### Injection layer
 
 当前 V3 只在 layer 24 注入，不做 layer search、multi-layer 或候选层双路编译。等 V3 全流程和全量

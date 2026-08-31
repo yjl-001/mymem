@@ -478,6 +478,7 @@ class GreedyE1Runtime:
         *,
         prompt_token_ids: Sequence[int],
         gate: EntropyRiskGate,
+        observe_every_generated_token: bool = False,
     ) -> ObservationRolloutResult:
         ids = list(prompt_token_ids)
         prompt_length = len(ids)
@@ -498,7 +499,10 @@ class GreedyE1Runtime:
             if (
                 generation_step > 0
                 and can_observe
-                and self._is_delimiter(ids[-1])
+                and (
+                    observe_every_generated_token
+                    or self._is_delimiter(ids[-1])
+                )
             ):
                 candidate_count += 1
                 probe = gate.probe(
