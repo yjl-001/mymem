@@ -362,17 +362,23 @@ def _paired_state_inputs(
         raise ValueError("state-key audit has no reference keys or paired queries")
 
     key_vectors = {
-        variant: torch.stack([
-            state_tensors[("reference", memory_id, variant)]
-            for memory_id in reference_ids
-        ], dim=0).double().contiguous()
+        variant: _normalize_rows(
+            torch.stack([
+                state_tensors[("reference", memory_id, variant)]
+                for memory_id in reference_ids
+            ], dim=0).double().contiguous(),
+            owner=f"state-key reference {variant}",
+        )
         for variant in STATE_COMPONENTS
     }
     query_vectors = {
-        variant: torch.stack([
-            state_tensors[("target", memory_id, variant)]
-            for memory_id in paired_ids
-        ], dim=0).double().contiguous()
+        variant: _normalize_rows(
+            torch.stack([
+                state_tensors[("target", memory_id, variant)]
+                for memory_id in paired_ids
+            ], dim=0).double().contiguous(),
+            owner=f"state-key target {variant}",
+        )
         for variant in STATE_COMPONENTS
     }
     metadata: list[dict[str, Any]] = []

@@ -145,6 +145,8 @@ class V36StateKeyContractTests(unittest.TestCase):
         self.assertIn("full_when_facing_prefer_avoid", audit)
         self.assertIn("target_and_reference_tensor_origins_distinct", audit)
         self.assertIn("exact_cross_trajectory_embedding_matches_measured", audit)
+        self.assertIn('owner=f"state-key reference {variant}"', audit)
+        self.assertIn('owner=f"state-key target {variant}"', audit)
         self.assertNotIn("final-test", runner)
         self.assertNotIn("--device", runner)
 
