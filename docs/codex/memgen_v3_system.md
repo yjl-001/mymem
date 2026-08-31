@@ -596,6 +596,39 @@ full-bank Gini、所有成对 rank delta、key-key geometry、applicability/dyna
 追加 decision 干扰了表示；若 residual 明显强于两个完整 key，说明 decision 方向存在但被基础场景表示掩盖，
 下一步才有理由设计独立的 decision/action 检索通道。无论哪种结果，本诊断都不改变正式 V3.5 qualification。
 
+#### Dynamic query-state decomposition diagnostic
+
+当 key-component audit 表明 applicability key 只保留弱信号、完整 dynamic key 更差且 decision residual
+失败时，固定 source first-gate anchors 与 dual bank，进一步分解 runtime query：
+
+```bash
+bash scripts/experiments/gsm8k/run_v3_5_dynamic_query_state_audit.sh \
+  "$PHASE1_DIR" \
+  "$E0_DIR" \
+  "$OUTPUT_ROOT/v3_4_token_risk/token-entropy-risk-gate-v3.4.pt" \
+  "$OUTPUT_ROOT"
+```
+
+该 audit 认证 source alignment report、逐 token evidence、exact current-query sidecar、key-component report、
+dual bank 和原始 source join，不重新选择 gate 位置。它在每个已认证 first-gate prefix 上运行一次独立
+layer-24 forward；每条 memory 另做一次独立 prompt-only prefix forward 并让 target/reference 共用缓存的
+prompt anchor。四个预注册 query 是 prompt→completion boundary 的最后 prompt token、现有 exact current
+token、由未归一化 hidden states 构造的 `L2(current - prompt_boundary)`，以及包含 anchor 的最近
+最多 16 个 reasoning token 的 raw-state mean 后 L2 normalize。窗口固定为 16，不搜索其他窗口。
+
+`current_token` 的实际评分继续使用原 source sidecar，并要求新 forward 的 current state 与它满足固定的
+cosine/max-absolute-delta 容差；其 applicability/dynamic 汇总还必须逐指标精确复现 key-component report，
+否则停止。四种 query 都分别对 applicability 与 dynamic keys 做 full-bank exact cosine，共固定八个网格，
+reference 仍是 primary，applicability key 是 primary key control。报告包含 rank、permutation null、hubness、
+所有 query/key paired comparisons、prompt/current/local 几何和 top-hub 文本，不运行 generation、side-KV、
+task accuracy，也不选择线上 query/key winner。
+
+若 prompt-boundary 与 current 的 rank 和 top-1 高度一致，说明 current query 仍由静态 prompt/task 语义主导；
+若 prompt-subtracted delta 改善 reference alignment，说明 prompt baseline 遮蔽了可恢复的动态状态；若 local-16
+改善，说明 single-token/delimiter pooling 丢失了局部推理信息。若 state variants 只改善 applicability、不改善
+dynamic，则 `Prefer` action 仍不应进入 key；若所有变体都弱，应转向独立的 structured trigger condition 或
+显式 query/key alignment，而不是继续做 key-only geometry 修正。强 in-source 结果仍不等于跨题 usefulness。
+
 ### Injection layer
 
 当前 V3 只在 layer 24 注入，不做 layer search、multi-layer 或候选层双路编译。等 V3 全流程和全量
