@@ -23,7 +23,7 @@ while [[ "$#" -gt 0 ]]; do
     --run-dir) RUN_DIR="$2"; shift 2 ;;
     --resume) RESUME=1; shift ;;
     -h|--help)
-      echo "Usage: $0 [--stage construct|side-kv|selector|offline|eval|all] [--logical-split calibration-val|dev-test] [--offset N] [--limit N] [--max-new-tokens N] [--resume] PHASE1_DIR E0_DIR RISK_ARTIFACT OUTPUT_ROOT"
+      echo "Usage: $0 [--stage construct-cluster|construct-cards|construct|side-kv|selector|offline|eval|all] [--logical-split calibration-val|dev-test] [--offset N] [--limit N] [--max-new-tokens N] [--resume] PHASE1_DIR E0_DIR RISK_ARTIFACT OUTPUT_ROOT"
       exit 0
       ;;
     -*) echo "Unknown option: $1" >&2; exit 2 ;;
@@ -32,11 +32,11 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 if [[ "${#POSITIONAL[@]}" -ne 4 ]]; then
-  echo "Usage: $0 [--stage construct|side-kv|selector|offline|eval|all] [--logical-split calibration-val|dev-test] [--offset N] [--limit N] [--max-new-tokens N] [--resume] PHASE1_DIR E0_DIR RISK_ARTIFACT OUTPUT_ROOT" >&2
+  echo "Usage: $0 [--stage construct-cluster|construct-cards|construct|side-kv|selector|offline|eval|all] [--logical-split calibration-val|dev-test] [--offset N] [--limit N] [--max-new-tokens N] [--resume] PHASE1_DIR E0_DIR RISK_ARTIFACT OUTPUT_ROOT" >&2
   exit 2
 fi
 case "$STAGE" in
-  construct|side-kv|selector|offline|eval|all) ;;
+  construct-cluster|construct-cards|construct|side-kv|selector|offline|eval|all) ;;
   *) echo "Unexpected --stage: $STAGE" >&2; exit 2 ;;
 esac
 if [[ "$LOGICAL_SPLIT" != "calibration-val" && "$LOGICAL_SPLIT" != "dev-test" ]]; then
@@ -56,13 +56,15 @@ RISK_ARTIFACT="${POSITIONAL[2]}"
 OUTPUT_ROOT="${POSITIONAL[3]}"
 DEVICE="${MEMGEN_V4_DEVICE:-cuda}"
 DTYPE="${MEMGEN_V4_DTYPE:-bfloat16}"
-CLUSTER_MAP_BATCH_SIZE="${MEMGEN_V4_CLUSTER_MAP_BATCH_SIZE:-48}"
-CLUSTER_REDUCE_BATCH_SIZE="${MEMGEN_V4_CLUSTER_REDUCE_BATCH_SIZE:-48}"
+CANONICAL_BATCH_SIZE="${MEMGEN_V4_1_CANONICAL_BATCH_SIZE:-24}"
+PAIR_BATCH_SIZE="${MEMGEN_V4_1_PAIR_BATCH_SIZE:-24}"
+NEIGHBOR_COUNT="${MEMGEN_V4_1_NEIGHBOR_COUNT:-12}"
+EMBEDDING_DEVICE="${MEMGEN_V4_1_EMBEDDING_DEVICE:-cpu}"
 export CUDA_VISIBLE_DEVICES="${MEMGEN_V4_CUDA_VISIBLE_DEVICES:-0}"
 
-for VALUE in "$CLUSTER_MAP_BATCH_SIZE" "$CLUSTER_REDUCE_BATCH_SIZE"; do
+for VALUE in "$CANONICAL_BATCH_SIZE" "$PAIR_BATCH_SIZE" "$NEIGHBOR_COUNT"; do
   if ! [[ "$VALUE" =~ ^[1-9][0-9]*$ ]]; then
-    echo "V4 cluster batch sizes must be positive integers" >&2
+    echo "V4.1 construction batch sizes and neighbor count must be positive integers" >&2
     exit 2
   fi
 done
@@ -70,7 +72,8 @@ done
 SPLIT_MANIFEST="$PHASE1_DIR/split_manifest.json"
 EXPERIENCES="$PHASE1_DIR/verified_experiences.jsonl"
 REASONER_MANIFEST="$E0_DIR/side_kv_manifest.json"
-CONSTRUCTION_DIR="$OUTPUT_ROOT/offline/construction"
+SOURCE_CONSTRUCTION_DIR="${MEMGEN_V4_SOURCE_CONSTRUCTION_DIR:-$OUTPUT_ROOT/offline/construction}"
+CONSTRUCTION_DIR="${MEMGEN_V4_1_CONSTRUCTION_DIR:-$OUTPUT_ROOT/offline/construction_v4_1}"
 SIDE_KV_DIR="$OUTPUT_ROOT/offline/side_kv"
 SELECTOR_DIR="$OUTPUT_ROOT/offline/selector"
 if [[ -z "$RUN_DIR" ]]; then
@@ -89,18 +92,37 @@ if [[ "$RESUME" -eq 1 ]]; then
   RESUME_ARGS=(--resume)
 fi
 
-if [[ "$STAGE" == "construct" || "$STAGE" == "offline" || "$STAGE" == "all" ]]; then
+if [[ "$STAGE" == "construct-cluster" || "$STAGE" == "construct-cards" || "$STAGE" == "construct" || "$STAGE" == "offline" || "$STAGE" == "all" ]]; then
   if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
     echo "DEEPSEEK_API_KEY is required for V4 bank construction" >&2
     exit 1
   fi
-  python scripts/build_v4_repair_bank.py \
+  for REQUIRED in \
+    "$SOURCE_CONSTRUCTION_DIR/repair_signatures.jsonl" \
+    "$SOURCE_CONSTRUCTION_DIR/construction_profile.json"; do
+    if [[ ! -s "$REQUIRED" ]]; then
+      echo "Missing V4 source-signature artifact: $REQUIRED" >&2
+      exit 1
+    fi
+  done
+  CONSTRUCTION_STAGE="all"
+  if [[ "$STAGE" == "construct-cluster" ]]; then
+    CONSTRUCTION_STAGE="cluster"
+  elif [[ "$STAGE" == "construct-cards" ]]; then
+    CONSTRUCTION_STAGE="cards"
+  fi
+  python scripts/build_v4_1_repair_bank.py \
     --experiences "$EXPERIENCES" \
     --split-manifest "$SPLIT_MANIFEST" \
+    --source-signatures "$SOURCE_CONSTRUCTION_DIR/repair_signatures.jsonl" \
+    --source-construction-profile "$SOURCE_CONSTRUCTION_DIR/construction_profile.json" \
     --output-dir "$CONSTRUCTION_DIR" \
     --dataset-revision main \
-    --cluster-map-batch-size "$CLUSTER_MAP_BATCH_SIZE" \
-    --cluster-reduce-batch-size "$CLUSTER_REDUCE_BATCH_SIZE" \
+    --stage "$CONSTRUCTION_STAGE" \
+    --canonical-batch-size "$CANONICAL_BATCH_SIZE" \
+    --pair-batch-size "$PAIR_BATCH_SIZE" \
+    --neighbor-count "$NEIGHBOR_COUNT" \
+    --embedding-device "$EMBEDDING_DEVICE" \
     "${RESUME_ARGS[@]}"
 fi
 
@@ -168,7 +190,8 @@ if [[ "$STAGE" == "eval" || "$STAGE" == "all" ]]; then
     "${RESUME_ARGS[@]}"
 fi
 
-echo "V4 construction: $CONSTRUCTION_DIR"
+echo "V4 source signatures: $SOURCE_CONSTRUCTION_DIR"
+echo "V4.1 construction: $CONSTRUCTION_DIR"
 echo "V4 side-KV: $SIDE_KV_DIR"
 echo "V4 selector: $SELECTOR_DIR"
 echo "V4 evaluation: $RUN_DIR"

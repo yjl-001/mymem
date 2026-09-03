@@ -60,6 +60,8 @@ class V4PipelineContractTests(unittest.TestCase):
 
     def test_side_kv_compiles_reference_but_exposes_target_only(self) -> None:
         source = (ROOT / "memgen/model/v4_side_kv.py").read_text(encoding="utf-8")
+        self.assertIn("V4_1_BANK_MANIFEST_SCHEMA", source)
+        self.assertIn("V41ConstructionProfile", source)
         self.assertIn('role="target"', source)
         self.assertIn('role="reference"', source)
         self.assertIn("def get_target(", source)
@@ -78,7 +80,8 @@ class V4PipelineContractTests(unittest.TestCase):
         source = (
             ROOT / "scripts/experiments/gsm8k/run_v4_system.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn("build_v4_repair_bank.py", source)
+        self.assertIn("build_v4_1_repair_bank.py", source)
+        self.assertIn("repair_signatures.jsonl", source)
         self.assertIn("compile_v4_side_kv.py", source)
         self.assertIn("compile_v4_selector_anchors.py", source)
         self.assertIn("evaluate_v4_experience_memory.py", source)

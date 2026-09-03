@@ -1,4 +1,4 @@
-# MemGen V4：MI 风格 repair bank 与单层在线 selector
+# MemGen V4.1：MI 风格 repair bank 与单层在线 selector
 
 V4 延续 V3 已确认的研究方向，不修改 V3.5 的冻结实现。它针对 V3.8 暴露的首要瓶颈——大多数失败 query
 在旧 bank、旧 value 和 persistent-to-EOS 注入组合下没有 helpful memory——重新构造 bank/value，并把
@@ -18,15 +18,19 @@ V4 当前只研究 GSM8K，固定：
 ```text
 阶段一：离线构造 bank
 
-raw verifier-backed bank-source pairs + official GSM8K solution
-  └─ DeepSeek V4 Flash：逐 pair 抽象 repair signature
-       └─ 有界 map shards：按 failure mechanism + repair operator 产生局部簇
-            └─ 有界 reduce rounds：只归并局部簇摘要并在本地展开完整 membership
-            ├─ 至少五个独立 construction problem
-            ├─ target process card：official solution + verified success
-            └─ reference process card：paired verified failure
-                 └─ 独立 DeepSeek semantic review
-                      └─ target/reference 三种上下文化形式分别编译 layer-24 side-KV
+已认证 V4 repair signatures（不重新生成）
+  └─ DeepSeek V4 Flash：规范化为受控 repair atom
+       ├─ reasoning process：进入候选聚类
+       ├─ answer serialization：归档，禁止进入 target bank
+       └─ unusable：归档，不强制分配
+            └─ 固定 revision 的 BGE embedding：仅召回跨 type 候选边
+                 └─ DeepSeek：逐候选对判断 mechanism/action/applicability
+                      └─ 本地 complete-link：簇内每一对 seed 必须有正边
+                           └─ 五到十个独立 examples 的 coherence audit
+                                ├─ target：official solution + verified success
+                                └─ reference：paired verified failure
+                                     └─ 独立 card review
+                                          └─ target/reference 编译 layer-24 side-KV
 
 同一批 construction pairs
   └─ failure trajectory 第一次 entropy+risk joint gate
@@ -50,72 +54,60 @@ bank 工件的组成部分，不单独定义新的研究阶段。
 
 ## 2. Construction evidence 与聚类
 
-输入不是 V3 teacher bank 或旧的 104/161 条 memory，而是 Phase-1 的原始、verifier-backed contrast
-pairs。每个 pair 必须来自 `bank-source`，并同时满足：target reward 为一、reference reward 为零、source
-provenance 与 split manifest 完整一致。官方 GSM8K solution 通过 source index、question hash、answer hash
-和 dataset fingerprint 重新 join，不信任自由文本路径。
+V4.1 不再续跑旧的 bounded map-reduce，也不重新调用已经完成的 5318 条 signature。输入仍不是 V3 teacher
+bank 或旧 memory，而是 Phase-1 原始 verifier-backed contrast pairs、完整的
+`repair_signatures.jsonl` 及其 `construction_profile.json`。加载时逐条验证 ID、sample、原始 provenance、
+signature hash、teacher/prompt/profile 绑定，并要求 signature checkpoint 精确覆盖全部 construction pairs。
+任何漂移都会失败关闭。官方 GSM8K solution 只在最终 card 阶段通过 source index、question hash、answer hash
+和 dataset fingerprint 重新 join；前面的规范化、候选图和 cluster audit 不需要重复下载题目内容。
 
 DeepSeek 模型固定为 `deepseek-v4-flash`、temperature 为零、thinking disabled、JSON mode。每次调用记录
-model、base URL、prompt version、construction input hash 与输出 hash，但绝不落盘 API key。构造分四次
-独立调用：
+model、base URL、prompt version、输入 hash、输出 hash 与 record hash，但绝不落盘 API key。V4.1 新构造分
+为五个逻辑步骤：
 
-1. 每个 contrast pair 抽象一个 instance-free repair signature；
-2. 通过有界 map-reduce 全局按 `failure_mechanism + repair_operator` 聚类；
-3. 每个 cluster 合成 target/reference process card；
-4. 对已经生成的 card 做只审核、不改写的 semantic review。
+1. 将旧的 applicable signature 批量规范化为受控 repair atom；
+2. 用冻结 BGE revision 产生候选边，再由 DeepSeek 对候选 pair 做语义判定；
+3. 本地形成 complete-link candidate，并用五到十个不同 sample 做 coherence audit；
+4. 对通过 audit 的 cluster 合成 target/reference process card；
+5. 对 card 做只审核、不改写的独立 semantic review。
 
-Signature 构造逐条持久化。若 DeepSeek 请求成功但返回的 JSON 未通过 V4 schema 或实例泄漏检查，后续短重试会
-携带上一条输出和本地校验原因，要求模型定向修正。若短重试仍失败，该 construction example 会被写成
-`applicable=false` 的确定性拒绝审计记录并从聚类输入中排除，批处理继续；系统不会据此编造 repair
-signature。网络故障、代理重试耗尽、鉴权、余额或不可重试 HTTP 错误仍然失败关闭。
-`repair_signatures.jsonl` 的 `generation_status` 区分正常教师输出与受控拒绝，最终 manifest 的
-`teacher_invalid_signature_ids` 汇总后者。
+repair atom 明确分离两个概念：`source_experience_type` 只是 verifier 对最终失败的记录，`memory_role` 才决定
+该经验能否成为 reasoning memory。规范化器必须从有限词表选择 state scope、mechanism family、repair family
+与 applicability family，并输出 canonical failure transition、repair action、applicability condition 和
+verification action。所有 boxing、标签、货币符号、末尾单位、显示精度等只改变最终表达而不改变推理状态的经验
+统一标为 `answer_serialization`；它们保留在审计计数中，但不会进入 target bank。无法获得单一、可复用、可验证
+transition 的条目标为 `unusable`，也不会被迫塞入某个簇。对 verifier 已确认答案内容正确、只有表达失败的
+`format_compliance`，本地 parser 还设置了确定性防线：教师不能把它重新解释成 reasoning memory；这项防线只
+决定隔离角色，不把 `experience_type` 用作 reasoning cluster 边界。
 
-若失败原因是 JSON 本身被截断或语法不完整，修正请求不会把可能很长的残缺输出再次塞回上下文，而是基于原始
-prompt 要求重新生成完整、紧凑的 JSON；语义/schema 校验失败仍携带原输出做定向修正。
+reasoning atoms 先按四个受控类别组成的 canonical tuple 做确定性 exact seed；此处允许不同
+`source_experience_type` 合并。自然语言 transition/action 保留为 seed 内证据，不作为脆弱的逐字硬边界；若同一
+类别组合实际包含不同过程，后续五到十例 coherence audit 必须拒绝，不能因为类别相同而自动进入 bank。
+每个 seed 用固定模型 `BAAI/bge-small-en-v1.5` 的固定 commit、CLS pooling 与 L2 normalization 得到 centroid。
+embedding 只从全局近邻、同 repair family 近邻和同 mechanism family 近邻召回候选，不参与最终 merge，也不是
+在线 selector 的 key。DeepSeek 对每个候选 pair 必须分别确认相同 failure mechanism、相同 repair action、
+兼容 applicability 和 process-only；四项全真才产生正边。这样 `experience_type` 不再人为切断同一机制，向量
+相似也不能越权成为 bank membership。
 
-聚类不再把全部 signature 塞入一个 API 请求。map 默认按 `experience_type` 隔离、语义排序后每批最多四十八
-条；每个 shard 必须精确覆盖本批输入，但局部簇可以少于五条，避免为了过早满足 runtime support 而误合并。
-map/reduce 都必须把暂时无法匹配的输入保留成 singleton，禁止因它在当前物理 batch 内缺少近邻就提前拒绝；
-只有完成全局摘要归并后仍不足五个独立 construction problems 的最终簇才进入 rejected 集合。
-reduce 请求只携带局部簇的 process 摘要和 support count，不携带展开后的成员，默认每批最多四十八个
-prototype；每轮在本地递归展开 membership，再做下一轮摘要归并，直到每个 `experience_type` 都完成一次
-全局有界归并。map/reduce 的教师输出采用 assignment-only map，只返回 `input_id -> cluster_label` 字典，不再
-为几十个 singleton 重复生成 title、mechanism、operator 和 scope。这些 prototype 摘要从簇内已验证
-signature 或前一轮 prototype 中确定性继承，最终 process card 仍由五到十个原始 construction examples 独立
-合成。这样既把最坏情况下的响应从数万字符压缩到几千字符，避免撞到模型输出 token 上限，也减少聚类阶段再
-生成一遍过程文本带来的漂移。每个输入 ID 必须恰好是字典中的一个 key，cluster label 必须是规范化小写 ASCII，
-同时原始 JSON 的重复 object key 也会被拒绝。这使同一个 experience 或 prototype 无法被同时列入多个簇，
-而不是在冲突发生后猜测保留哪一个归属。任何一次 map/reduce 都必须完整、不重叠地覆盖输入，否则拒绝响应并
-定向重试。若在冻结轮数内无法达到全局归并条件，构造失败关闭，不把局部结果冒充全局 bank。
+正边图在本地用确定性 complete-link 分组：一个 seed 只有与现有组内每个 seed 都有显式正边才能加入。因此
+即使 A-B、B-C 都相似，缺少 A-C 正边时也不会通过传递闭包把三者链式合并。每个至少含五个不同 sample 的
+candidate 再接受一次 DeepSeek coherence audit；audit 同时检查单一机制、单一修复、适用性、process-only、
+serialization-free 和 leakage-free。多 seed candidate 被拒绝后，只允许各 exact seed 独立回退审计，不会再
+以较弱阈值强行合并。支持不足、audit 拒绝、serialization、unusable 与旧 signature non-applicable 五类都在
+`cluster_plan.json` 中显式归档，所有源 signature 必须恰好归入一个终态。
 
-map/reduce 分别逐请求写入 `cluster_map_shards.jsonl` 与 `cluster_reduce_batches.jsonl`；记录绑定模型、URL、
-prompt version、输入 hash、输出 hash 和自身 record hash，`--resume` 可从失败单元继续。每个请求还设有二十万
-字符的本地硬上限，超过时在发往 API 前失败并提示缩小 batch，避免再次由网关以不透明的 HTTP 状态拒绝。
-最终 `cluster_plan.json` 仍由原有严格 parser 检查所有 applicable signature 的完整覆盖。
-runner 可通过 `MEMGEN_V4_CLUSTER_MAP_BATCH_SIZE` 与
-`MEMGEN_V4_CLUSTER_REDUCE_BATCH_SIZE` 显式缩小默认 batch；改变 batch size 会改变 clustering profile，已有
-不匹配的 map/reduce 单元不会被错误复用。
+canonical、pair 和 audit API 单元分别追加到独立 JSONL checkpoint；`--resume` 只复用 prompt、teacher、输入
+和 payload hash 全部一致的单元。一个批次若反复返回截断或 schema 错误，会递归二分；仍失败的 singleton 被
+确定性归档，其他条目继续。HTTP 402/403、代理耗尽或网络错误仍失败关闭，但此前 checkpoint 保留。BGE 向量
+及其 atom 顺序、输入文本、model revision、dtype、shape 和文件 hash 也独立认证，恢复时不会重复编码。默认
+canonical batch、pair batch 和近邻数分别为二十四、二十四和十二，可通过
+`MEMGEN_V4_1_CANONICAL_BATCH_SIZE`、`MEMGEN_V4_1_PAIR_BATCH_SIZE` 与
+`MEMGEN_V4_1_NEIGHBOR_COUNT` 设置；这些值进入 profile，不能与旧 checkpoint 混用。
 
-若 bounded reduce 收缩缓慢，可在不继续调用教师的情况下运行只读诊断器：
-
-```bash
-python scripts/inspect_v4_cluster_progress.py \
-  --construction-dir "$V4_OUTPUT/offline/construction"
-```
-
-诊断器按原始确定性 batch 顺序验证并重放 signature、map 和已完整完成的 reduce round，不加载模型或 GPU，
-不修改任何 checkpoint，只写入独立的 `reduce_progress_report.json`。报告包含逐轮 retention/reduction ratio、
-按 `experience_type` 的 prototype 数、按独立 sample 数计算的 support histogram、全部五例以上候选、最大簇、
-singleton/小簇的确定性样本，以及只用于诊断而不决定 merge 的词级 Jaccard 近重复统计。若最后一轮只完成了
-部分 batch，报告停在前一完整 round，并单独列出当前 round 的已完成、缺失 unit 数。所有输入文件记录路径与
-SHA256，报告自身也带逻辑 SHA256；任何 cluster-unit hash、prompt、teacher 或重建输入绑定不一致都会失败关闭。
-
-cluster 不按题目故事、对象或宽泛数学主题划分。一个正式 runtime bank 至少含五个不同 sample ID。本地使用
-signature process 字段的最大最小词集距离，从每个最终簇确定性选择五到十个 representative examples，覆盖
-结构变化且避免把全部成员重新放进 card 请求。少于五个、机制混杂、无法落到单一 repair operator 的组被
-拒绝，不通过合并弱相关 singleton 凑数。card synthesis 与独立 review 只接收这批 representatives 的
-signatures 和 construction evidence，同时保留最终簇的总 support count。
+每个正式 runtime bank 仍至少由五个不同 sample ID 支持。用 atom embedding 的确定性 farthest-first 选择五到
+十个代表，coherence audit、card synthesis 和独立 review 都只读取这批有界证据。card 的 target 只保留适用
+范围、诊断、修复动作、验证和禁用边界；reference 只描述重复失败过程及与 target 的边界。线上仍只能加载
+target，reference 只用于离线对照和 provenance。
 
 所有 signature/card 字段必须是 process-only 文本，确定性检查禁止数字、boxed answer、分式、显式方程和
 GSM8K answer marker。target 卡只保留适用范围、诊断、修复动作、验证和禁用边界；reference 卡只描述重复
@@ -198,10 +190,20 @@ direct side-KV 卸载后，过去 token 已形成的 model cache 仍然保留其
 
 ```text
 OUTPUT_ROOT/
-  offline/construction/
+  offline/construction/                 # 已完成的旧 V4 source signature 工件，只读
     repair_signatures.jsonl
-    cluster_map_shards.jsonl
-    cluster_reduce_batches.jsonl
+    construction_profile.json
+  offline/construction_v4_1/
+    canonicalization_units.jsonl
+    canonical_atoms.jsonl
+    canonical_embeddings.npy
+    canonical_embeddings_manifest.json
+    exact_seeds.json
+    candidate_pairs.json
+    pair_judgment_units.jsonl
+    pair_judgments.jsonl
+    clique_candidates.json
+    cluster_audit_units.jsonl
     cluster_plan.json
     process_cards.jsonl
     card_reviews.jsonl
@@ -223,7 +225,34 @@ OUTPUT_ROOT/
     v4_report.json
 ```
 
-完整 smoke run：
+建议先完成 V4.1 聚类。它复用 `offline/construction` 中已经生成的 signature，不读取旧 map/reduce：
+
+```bash
+export DEEPSEEK_API_KEY='...'
+export MEMGEN_V4_CUDA_VISIBLE_DEVICES=0
+
+bash scripts/experiments/gsm8k/run_v4_system.sh \
+  --stage construct-cluster \
+  --resume \
+  "$PHASE1_DIR" \
+  "$E0_DIR" \
+  "$RISK_ARTIFACT" \
+  "$OUTPUT_ROOT/v4"
+```
+
+检查 `construction_v4_1/cluster_plan.json` 后，再构造 card：
+
+```bash
+bash scripts/experiments/gsm8k/run_v4_system.sh \
+  --stage construct-cards \
+  --resume \
+  "$PHASE1_DIR" \
+  "$E0_DIR" \
+  "$RISK_ARTIFACT" \
+  "$OUTPUT_ROOT/v4"
+```
+
+也可以从 V4.1 构造到 dev-test 一次完整运行：
 
 ```bash
 export DEEPSEEK_API_KEY='...'
