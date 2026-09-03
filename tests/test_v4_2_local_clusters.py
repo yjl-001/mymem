@@ -312,6 +312,7 @@ class V42LocalClusterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory)
             for name in (
+                "construction_profile.json",
                 "local_atoms.jsonl",
                 "multiview_embeddings_manifest.json",
                 "mechanism_embeddings.npy",
@@ -345,7 +346,7 @@ class V42LocalClusterTests(unittest.TestCase):
         self.assertFalse(plan["qualified_for_online_use"])
         self.assertEqual(plan["external_api_calls"], 0)
         self.assertEqual(plan["diagnostics"]["qualified_cluster_count"], 1)
-        self.assertEqual(len(plan["artifacts"]), 9)
+        self.assertEqual(len(plan["artifacts"]), 10)
         self.assertIn("plan_sha256", plan)
 
     def test_review_packet_contains_only_five_authenticated_representatives(self) -> None:

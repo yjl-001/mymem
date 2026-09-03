@@ -169,8 +169,10 @@ def _write_npy(path: Path, value: np.ndarray) -> None:
 
 def _implementation_state() -> dict[str, str]:
     paths = (
+        "memgen/experience/phase1.py",
         "memgen/experience/v4_bank.py",
         "memgen/experience/v4_2_bank.py",
+        "scripts/build_v4_repair_bank.py",
         "scripts/build_v4_1_repair_bank.py",
         "scripts/build_v4_2_local_clusters.py",
     )
@@ -989,6 +991,7 @@ def build_cluster_plan(
         "artifacts": {
             name: file_sha256(output_dir / name)
             for name in (
+                "construction_profile.json",
                 "local_atoms.jsonl",
                 "multiview_embeddings_manifest.json",
                 "mechanism_embeddings.npy",
