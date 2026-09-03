@@ -414,6 +414,7 @@ class V42ShortlistTests(unittest.TestCase):
                     "MEMGEN_V4_2_LOCAL_DIR": str(local_dir),
                     "MEMGEN_V4_2_SHORTLIST_DIR": str(shortlist_dir),
                     "MEMGEN_V4_2_AUDIT_DIR": str(audit_dir),
+                    "MEMGEN_V4_2_SKIP_SEMANTIC": "1",
                 }
             )
             completed = subprocess.run(

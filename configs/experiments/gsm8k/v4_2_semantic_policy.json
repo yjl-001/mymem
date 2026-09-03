@@ -1,0 +1,25 @@
+{
+  "schema_version": "memgen-v4.2-semantic-policy-v1",
+  "benchmark": "openai/gsm8k",
+  "source_shortlist_profile_sha256": "7287c86e92872cdd8f92823313ae2d1ca79ba75b46f54d485295376ebdcba64e",
+  "source_shortlist_manifest_sha256": "483bfdeb0b4ce05b4ae58889d69f5e2d30dac8ea3d5b35d5d9f7ab851ca3daa3",
+  "source_shortlist_report_sha256": "8e5662790fbcf4b3b86c0035fa7a537761047cbc33b1ef01494dd619edbc74ca",
+  "candidate_exclusions": [
+    {
+      "candidate_id": "v42-candidate-cfd10d78c5498529218c",
+      "reason": "The audited representatives mix range cardinality, hierarchical multiplication, and duplicate accumulation rather than grounding one repair mechanism."
+    }
+  ],
+  "representative_evidence_exclusions": [
+    {
+      "candidate_id": "v42-candidate-d84abed154ca5edf260f",
+      "evidence_id": "evidence-4",
+      "reason": "The representative incorrectly reasons about doubling speed over a fixed distance and is not factually usable construction evidence."
+    },
+    {
+      "candidate_id": "v42-candidate-c42c677c03eaf5e0a97c",
+      "evidence_id": "evidence-3",
+      "reason": "The representative incorrectly equates three quarters with one hundred cents and is not factually usable construction evidence."
+    }
+  ]
+}

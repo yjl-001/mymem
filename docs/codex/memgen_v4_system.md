@@ -298,6 +298,18 @@ OUTPUT_ROOT/
     rejected_or_redundant_candidates.jsonl
     synthesis_shortlist_manifest.json
     api_preflight_report.json
+  offline/construction_v4_2_semantic/
+    construction_profile.json
+    semantic_evidence_packets.jsonl
+    policy_exclusions.jsonl
+    paid_stage_plan.json
+    api_preflight_report.json
+    combined_synthesis_records.jsonl       # paid, resumable
+    review_records.jsonl                   # paid, resumable
+    semantic_rejections.jsonl              # paid
+    bank_records.jsonl                     # paid, tensor-free
+    bank_manifest.json                     # paid, not yet runtime-qualified
+    paid_stage_report.json                 # paid
   offline/side_kv/
     v4_side_kv.safetensors
     v4_side_kv_manifest.json
@@ -373,8 +385,70 @@ jq '{status, external_api_calls_made, api_key_read,
   "$OUTPUT_ROOT/offline/construction_v4_2_shortlist/api_preflight_report.json"
 ```
 
-只有检查 shortlist 的语义样本之后，才应另行实现并显式启动 candidate-level synthesis。现有
-`run_v4_system.sh --stage construct-cards` 消费的是 V4.1 `cluster_plan.json`，不能读取 V4.2 local plan。
+shortlist 的人工语义检查结论保存在
+`configs/experiments/gsm8k/v4_2_semantic_policy.json`。最终语义阶段最多为每个 candidate 提交八条
+distinct-sample 证据：support 不超过八时提交全部 policy-eligible members；更大的 cluster 保留五条
+diverse representatives，再补三条 centroid-near members。每条证据都重新接回原题、官方解、verified
+success、paired verified failure 和 verifier 结果。
+
+先运行零 API 的精确 preflight。该模式不会读取 `DEEPSEEK_API_KEY`：
+
+```bash
+python scripts/build_v4_2_semantic_bank.py \
+  --experiences "$PHASE1_DIR/verified_experiences.jsonl" \
+  --split-manifest "$PHASE1_DIR/split_manifest.json" \
+  --source-signatures "$V4_SOURCE_DIR/repair_signatures.jsonl" \
+  --source-construction-profile "$V4_SOURCE_DIR/construction_profile.json" \
+  --local-construction-dir "$OUTPUT_ROOT/offline/construction_v4_2_local" \
+  --shortlist-dir "$OUTPUT_ROOT/offline/construction_v4_2_shortlist" \
+  --semantic-policy configs/experiments/gsm8k/v4_2_semantic_policy.json \
+  --output-dir "$OUTPUT_ROOT/offline/construction_v4_2_semantic" \
+  --dataset-revision main \
+  --stage preflight \
+  --resume
+```
+
+preflight 报告区分 nominal batch count、schema-invalid response 递归拆包后的逻辑请求上界，以及 short
+retry 的 HTTP 尝试上界。先检查 `api_preflight_report.json`；只有明确接受成本后才运行付费模式：
+
+```bash
+python scripts/build_v4_2_semantic_bank.py \
+  --experiences "$PHASE1_DIR/verified_experiences.jsonl" \
+  --split-manifest "$PHASE1_DIR/split_manifest.json" \
+  --source-signatures "$V4_SOURCE_DIR/repair_signatures.jsonl" \
+  --source-construction-profile "$V4_SOURCE_DIR/construction_profile.json" \
+  --local-construction-dir "$OUTPUT_ROOT/offline/construction_v4_2_local" \
+  --shortlist-dir "$OUTPUT_ROOT/offline/construction_v4_2_shortlist" \
+  --semantic-policy configs/experiments/gsm8k/v4_2_semantic_policy.json \
+  --output-dir "$OUTPUT_ROOT/offline/construction_v4_2_semantic" \
+  --dataset-revision main \
+  --stage paid \
+  --approve-paid-stage \
+  --resume
+```
+
+付费阶段把 per-evidence factual/coherence audit 与 target/reference card synthesis 合并为一次响应；只有至少
+五条 evidence 的 factual、failure、repair、verification 四项检查全部通过且共享同一过程机制，才进入独立
+batch review。target 只来自官方解与 verified success；reference 只来自 paired verified failure。任一阶段
+拒绝都不会生成正式 bank record。所有有效响应按 candidate checkpoint，HTTP `402/403` 后可用同一命令
+恢复。
+
+仓库根目录 `test.sh` 将 shortlist authentication 与 semantic preflight 合并成一条安全命令。默认调用为零
+API；只有同时指定 paid stage、显式批准变量和 key 才会调用 DeepSeek：
+
+```bash
+bash test.sh
+
+MEMGEN_V4_2_STAGE=paid \
+MEMGEN_V4_2_APPROVE_PAID_STAGE=1 \
+DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
+bash test.sh
+```
+
+如果自动发现到不止一个 Phase-1 目录，再显式设置 `MEMGEN_PHASE1_DIR`。V4.2 semantic manifest 仍标记为
+`constructed_not_tensor_compiled` 和 `qualified_for_online_use: false`；下一阶段才编译固定 layer 24 的
+target/reference side-KV 与单层 selector anchors。现有 `run_v4_system.sh --stage construct-cards` 消费的是
+V4.1 `cluster_plan.json`，不能读取 V4.2 semantic bank。
 
 以下 V4.1 付费命令保留为历史复现实验，不是当前推荐路径。检查
 `construction_v4_1/cluster_plan.json` 后，再构造 card：

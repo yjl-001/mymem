@@ -10,8 +10,14 @@ OUTPUT_ROOT="${MEMGEN_V4_OUTPUT_ROOT:-$REPO_ROOT/output/experiments/v4}"
 LOCAL_DIR="${MEMGEN_V4_2_LOCAL_DIR:-$OUTPUT_ROOT/offline/construction_v4_2_local}"
 SHORTLIST_DIR="${MEMGEN_V4_2_SHORTLIST_DIR:-$OUTPUT_ROOT/offline/construction_v4_2_shortlist}"
 AUDIT_DIR="${MEMGEN_V4_2_AUDIT_DIR:-$SHORTLIST_DIR/audit}"
+SOURCE_DIR="${MEMGEN_V4_SOURCE_DIR:-$OUTPUT_ROOT/offline/construction}"
+SEMANTIC_DIR="${MEMGEN_V4_2_SEMANTIC_DIR:-$OUTPUT_ROOT/offline/construction_v4_2_semantic}"
+SEMANTIC_POLICY="${MEMGEN_V4_2_SEMANTIC_POLICY:-$REPO_ROOT/configs/experiments/gsm8k/v4_2_semantic_policy.json}"
+SEMANTIC_STAGE="${MEMGEN_V4_2_STAGE:-preflight}"
+SKIP_SEMANTIC="${MEMGEN_V4_2_SKIP_SEMANTIC:-0}"
 REPORT_PATH="$AUDIT_DIR/v4_2_shortlist_test_report.json"
 LOG_PATH="$AUDIT_DIR/v4_2_shortlist_test.log"
+SEMANTIC_LOG_PATH="$SEMANTIC_DIR/v4_2_semantic_${SEMANTIC_STAGE}.log"
 
 mkdir -p "$AUDIT_DIR"
 : > "$LOG_PATH"
@@ -24,6 +30,16 @@ fail() {
 command -v "$PYTHON_BIN" >/dev/null 2>&1 \
   || fail "Python executable not found: $PYTHON_BIN"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
+case "$SEMANTIC_STAGE" in
+  preflight) ;;
+  paid)
+    [[ "${MEMGEN_V4_2_APPROVE_PAID_STAGE:-0}" == "1" ]] \
+      || fail "paid stage requires MEMGEN_V4_2_APPROVE_PAID_STAGE=1"
+    [[ -n "${DEEPSEEK_API_KEY:-}" ]] \
+      || fail "paid stage requires DEEPSEEK_API_KEY"
+    ;;
+  *) fail "MEMGEN_V4_2_STAGE must be preflight or paid" ;;
+esac
 
 for REQUIRED in \
   construction_profile.json \
@@ -46,29 +62,29 @@ if grep -Eq 'TeacherClient|DEEPSEEK_API_KEY|os\.environ|urllib' \
   fail "shortlist entrypoint contains a forbidden paid/network dependency"
 fi
 
-# This stage is deliberately unable to inherit the paid-stage credential.
-unset DEEPSEEK_API_KEY || true
-
 REPO_REVISION="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 echo "[v4.2-test] repo_revision=$REPO_REVISION"
 echo "[v4.2-test] local_dir=$LOCAL_DIR"
 echo "[v4.2-test] shortlist_dir=$SHORTLIST_DIR"
 echo "[v4.2-test] audit_dir=$AUDIT_DIR"
 
-"$PYTHON_BIN" "$SHORTLIST_ENTRYPOINT" \
-  --local-construction-dir "$LOCAL_DIR" \
-  --output-dir "$SHORTLIST_DIR" \
-  --preferred-support 6 \
-  --minimum-support-cohesion-quantile 0.50 \
-  --redundancy-mechanism-threshold 0.92 \
-  --redundancy-repair-threshold 0.92 \
-  --redundancy-applicability-threshold 0.85 \
-  --max-synthesis-candidates 48 \
-  --target-runtime-bank-cap 32 \
-  --synthesis-batch-size 4 \
-  --review-batch-size 8 \
-  --resume \
-  2>&1 | tee "$LOG_PATH"
+# The local shortlist child is deliberately unable to inherit a paid-stage key.
+(
+  unset DEEPSEEK_API_KEY || true
+  "$PYTHON_BIN" "$SHORTLIST_ENTRYPOINT" \
+    --local-construction-dir "$LOCAL_DIR" \
+    --output-dir "$SHORTLIST_DIR" \
+    --preferred-support 6 \
+    --minimum-support-cohesion-quantile 0.50 \
+    --redundancy-mechanism-threshold 0.92 \
+    --redundancy-repair-threshold 0.92 \
+    --redundancy-applicability-threshold 0.85 \
+    --max-synthesis-candidates 48 \
+    --target-runtime-bank-cap 32 \
+    --synthesis-batch-size 4 \
+    --review-batch-size 8 \
+    --resume
+) 2>&1 | tee "$LOG_PATH"
 
 PREFLIGHT_PATH="$SHORTLIST_DIR/api_preflight_report.json"
 QUALITY_PATH="$SHORTLIST_DIR/candidate_quality_report.json"
@@ -246,4 +262,113 @@ REPORT_BYTES="$(wc -c < "$REPORT_PATH" | tr -d ' ')"
 echo "[v4.2-test] PASS source=$SOURCE_COUNT selected=$SELECTED_COUNT rejected=$REJECTED_COUNT redundancy_edges=$REDUNDANCY_COUNT high_risk=$HIGH_RISK_COUNT api_calls=0"
 echo "[v4.2-test] report=$REPORT_PATH bytes=$REPORT_BYTES"
 echo "[v4.2-test] log=$LOG_PATH"
-echo "[v4.2-test] send the single report file above for the next analysis"
+
+if [[ "$SKIP_SEMANTIC" == "1" ]]; then
+  echo "[v4.2-test] semantic stage explicitly skipped"
+  exit 0
+fi
+
+for REQUIRED in \
+  "$SOURCE_DIR/repair_signatures.jsonl" \
+  "$SOURCE_DIR/construction_profile.json" \
+  "$SEMANTIC_POLICY"; do
+  [[ -s "$REQUIRED" ]] || fail "missing semantic-bank input: $REQUIRED"
+done
+
+PHASE1_DIR="${MEMGEN_PHASE1_DIR:-}"
+if [[ -z "$PHASE1_DIR" ]]; then
+  PHASE1_CANDIDATES=()
+  while IFS= read -r CANDIDATE; do
+    [[ -s "$CANDIDATE/verified_experiences.jsonl" ]] \
+      && PHASE1_CANDIDATES+=("$CANDIDATE")
+  done < <(find "$REPO_ROOT/output/experiments" -type f -name split_manifest.json -print 2>/dev/null | sed 's#/split_manifest.json$##' | sort -u)
+  if [[ "${#PHASE1_CANDIDATES[@]}" -ne 1 ]]; then
+    fail "set MEMGEN_PHASE1_DIR; automatic discovery found ${#PHASE1_CANDIDATES[@]} matching directories"
+  fi
+  PHASE1_DIR="${PHASE1_CANDIDATES[0]}"
+fi
+for REQUIRED in \
+  "$PHASE1_DIR/verified_experiences.jsonl" \
+  "$PHASE1_DIR/split_manifest.json"; do
+  [[ -s "$REQUIRED" ]] || fail "missing Phase-1 input: $REQUIRED"
+done
+
+SEMANTIC_ENTRYPOINT="$REPO_ROOT/scripts/build_v4_2_semantic_bank.py"
+[[ -s "$SEMANTIC_ENTRYPOINT" ]] || fail "missing semantic-bank entrypoint"
+mkdir -p "$SEMANTIC_DIR"
+SEMANTIC_COMMAND=(
+  "$PYTHON_BIN" "$SEMANTIC_ENTRYPOINT"
+  --experiences "$PHASE1_DIR/verified_experiences.jsonl"
+  --split-manifest "$PHASE1_DIR/split_manifest.json"
+  --source-signatures "$SOURCE_DIR/repair_signatures.jsonl"
+  --source-construction-profile "$SOURCE_DIR/construction_profile.json"
+  --local-construction-dir "$LOCAL_DIR"
+  --shortlist-dir "$SHORTLIST_DIR"
+  --semantic-policy "$SEMANTIC_POLICY"
+  --output-dir "$SEMANTIC_DIR"
+  --dataset-revision main
+  --stage "$SEMANTIC_STAGE"
+  --resume
+)
+if [[ "$SEMANTIC_STAGE" == "paid" ]]; then
+  SEMANTIC_COMMAND+=(--approve-paid-stage)
+  "${SEMANTIC_COMMAND[@]}" 2>&1 | tee "$SEMANTIC_LOG_PATH"
+else
+  (
+    unset DEEPSEEK_API_KEY || true
+    "${SEMANTIC_COMMAND[@]}"
+  ) 2>&1 | tee "$SEMANTIC_LOG_PATH"
+fi
+
+SEMANTIC_PREFLIGHT="$SEMANTIC_DIR/api_preflight_report.json"
+[[ -s "$SEMANTIC_PREFLIGHT" ]] || fail "missing semantic preflight report"
+jq -e '
+  .status == "semantic_evidence_ready_api_not_started"
+  and .external_api_calls_made == 0
+  and .api_key_read == false
+  and .automatic_paid_stage_transition == false
+  and .qualified_for_online_use == false
+  and .planned_candidate_count > 0
+  and (.planned_candidate_count + .preflight_excluded_candidate_count
+       == .source_selected_candidate_count)
+  and .policy_excluded_evidence_count == 2
+  and .planned_combined_request_count > 0
+  and (.nominal_total_paid_request_count_if_all_coherent
+       <= .maximum_total_request_units_after_recursive_split)
+' "$SEMANTIC_PREFLIGHT" >/dev/null \
+  || fail "semantic preflight invariants did not pass"
+
+if [[ "$SEMANTIC_STAGE" == "paid" ]]; then
+  PAID_REPORT="$SEMANTIC_DIR/paid_stage_report.json"
+  BANK_MANIFEST="$SEMANTIC_DIR/bank_manifest.json"
+  BANK_RECORDS="$SEMANTIC_DIR/bank_records.jsonl"
+  for REQUIRED in "$PAID_REPORT" "$BANK_MANIFEST" "$BANK_RECORDS"; do
+    [[ -s "$REQUIRED" ]] || fail "missing paid semantic-bank artifact: $REQUIRED"
+  done
+  jq -e '
+    .status == "semantic_bank_constructed_not_tensor_compiled"
+    and .qualified_for_online_use == false
+    and .bank_record_count > 0
+    and .bank_record_count <= 32
+    and .bank_manifest_sha256 != null
+  ' "$PAID_REPORT" >/dev/null || fail "paid semantic-bank report did not pass"
+  jq -e '
+    .schema_version == "memgen-v4.2-bank-manifest-v1"
+    and .status == "constructed_not_tensor_compiled"
+    and .qualified_for_online_use == false
+    and .record_count > 0
+    and .record_count <= .profile.target_runtime_bank_cap
+    and (.record_count == (.bank_ids | length))
+  ' "$BANK_MANIFEST" >/dev/null || fail "semantic bank manifest did not pass"
+  BANK_RECORD_COUNT="$(wc -l < "$BANK_RECORDS" | tr -d ' ')"
+  [[ "$BANK_RECORD_COUNT" == "$(jq -r '.record_count' "$BANK_MANIFEST")" ]] \
+    || fail "semantic bank record count differs from manifest"
+  echo "[v4.2-test] PAID PASS bank_records=$BANK_RECORD_COUNT"
+  echo "[v4.2-test] paid_report=$PAID_REPORT"
+  echo "[v4.2-test] bank_manifest=$BANK_MANIFEST"
+else
+  echo "[v4.2-test] PREFLIGHT PASS api_key_read=false api_calls=0"
+fi
+echo "[v4.2-test] semantic_preflight=$SEMANTIC_PREFLIGHT"
+echo "[v4.2-test] semantic_log=$SEMANTIC_LOG_PATH"
+echo "[v4.2-test] send the semantic preflight report and, after paid mode, the paid report"
