@@ -40,6 +40,9 @@ V4_2_EMBEDDING_MANIFEST_SCHEMA = "memgen-v4.2-multiview-embeddings-v1"
 V4_2_POSITIVE_EDGE_SCHEMA = "memgen-v4.2-local-positive-edge-v1"
 V4_2_REVIEW_PACKET_SCHEMA = "memgen-v4.2-cluster-review-packet-v1"
 V4_2_PREFLIGHT_REPORT_SCHEMA = "memgen-v4.2-api-preflight-report-v1"
+V4_2_SHORTLIST_PROFILE_SCHEMA = "memgen-v4.2-shortlist-profile-v1"
+V4_2_SHORTLIST_MANIFEST_SCHEMA = "memgen-v4.2-synthesis-shortlist-manifest-v1"
+V4_2_SHORTLIST_PREFLIGHT_SCHEMA = "memgen-v4.2-shortlist-api-preflight-v1"
 
 V4_2_DEFAULT_NEIGHBOR_COUNT = 32
 V4_2_DEFAULT_MECHANISM_THRESHOLD = 0.82
@@ -51,6 +54,21 @@ V4_2_DEFAULT_APPLICABILITY_WEIGHT = 0.10
 V4_2_DEFAULT_REPRESENTATIVE_COUNT = V4_MIN_CONSTRUCTION_EXAMPLES
 V4_2_DEFAULT_SYNTHESIS_BATCH_SIZE = 4
 V4_2_DEFAULT_MAX_API_CANDIDATES = 80
+V4_2_DEFAULT_PREFERRED_SUPPORT = 6
+V4_2_DEFAULT_MAX_SYNTHESIS_CANDIDATES = 48
+V4_2_DEFAULT_TARGET_RUNTIME_BANK_CAP = 32
+V4_2_DEFAULT_REDUNDANCY_MECHANISM_THRESHOLD = 0.92
+V4_2_DEFAULT_REDUNDANCY_REPAIR_THRESHOLD = 0.92
+V4_2_DEFAULT_REDUNDANCY_APPLICABILITY_THRESHOLD = 0.85
+V4_2_DEFAULT_MIN_SUPPORT_COHESION_QUANTILE = 0.50
+V4_2_DEFAULT_REVIEW_BATCH_SIZE = 8
+V4_2_SYNTHESIS_SEMANTIC_FIELDS = (
+    "problem_structure",
+    "decision_point",
+    "failure_mechanism",
+    "repair_operator",
+    "verification_operator",
+)
 
 
 def _identifier(owner: str, value: Any) -> str:
@@ -170,6 +188,98 @@ class V42ConstructionProfile:
 
 
 @dataclass(frozen=True)
+class V42ShortlistProfile:
+    """Frozen high-quality basis selection applied after local discovery."""
+
+    source_cluster_schema: str = V4_2_LOCAL_CLUSTER_SCHEMA
+    selection_rule: str = "support_cohesion_centroid_nms"
+    unsupported_policy: str = "archive_without_recovery"
+    minimum_distinct_support: int = V4_MIN_CONSTRUCTION_EXAMPLES
+    preferred_distinct_support: int = V4_2_DEFAULT_PREFERRED_SUPPORT
+    minimum_support_cohesion_quantile: float = (
+        V4_2_DEFAULT_MIN_SUPPORT_COHESION_QUANTILE
+    )
+    redundancy_mechanism_threshold: float = (
+        V4_2_DEFAULT_REDUNDANCY_MECHANISM_THRESHOLD
+    )
+    redundancy_repair_threshold: float = V4_2_DEFAULT_REDUNDANCY_REPAIR_THRESHOLD
+    redundancy_applicability_threshold: float = (
+        V4_2_DEFAULT_REDUNDANCY_APPLICABILITY_THRESHOLD
+    )
+    max_synthesis_candidates: int = V4_2_DEFAULT_MAX_SYNTHESIS_CANDIDATES
+    target_runtime_bank_cap: int = V4_2_DEFAULT_TARGET_RUNTIME_BANK_CAP
+    synthesis_batch_size: int = V4_2_DEFAULT_SYNTHESIS_BATCH_SIZE
+    review_batch_size: int = V4_2_DEFAULT_REVIEW_BATCH_SIZE
+    semantic_prompt_fields: tuple[str, ...] = V4_2_SYNTHESIS_SEMANTIC_FIELDS
+    embedding_model: str = V4_1_EMBEDDING_MODEL
+    embedding_revision: str = V4_1_EMBEDDING_REVISION
+    injection_layer: int = V4_LAYER_NUMBER
+    relative_phase_delta: int = V4_RELATIVE_PHASE_DELTA
+    schema_version: str = V4_2_SHORTLIST_PROFILE_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema_version != V4_2_SHORTLIST_PROFILE_SCHEMA:
+            raise ValueError("Unexpected V4.2 shortlist profile schema")
+        if self.source_cluster_schema != V4_2_LOCAL_CLUSTER_SCHEMA:
+            raise ValueError("V4.2 shortlist requires local cluster candidates")
+        if self.selection_rule != "support_cohesion_centroid_nms":
+            raise ValueError("Unexpected V4.2 shortlist selection rule")
+        if self.unsupported_policy != "archive_without_recovery":
+            raise ValueError("V4.2 shortlist must not recover unsupported atoms")
+        for owner in (
+            "minimum_distinct_support",
+            "preferred_distinct_support",
+            "max_synthesis_candidates",
+            "target_runtime_bank_cap",
+            "synthesis_batch_size",
+            "review_batch_size",
+        ):
+            value = getattr(self, owner)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"V4.2 shortlist {owner} must be a positive integer")
+        if self.minimum_distinct_support != V4_MIN_CONSTRUCTION_EXAMPLES:
+            raise ValueError("V4.2 shortlist minimum support remains frozen at five")
+        if self.preferred_distinct_support <= self.minimum_distinct_support:
+            raise ValueError("V4.2 preferred support must exceed minimum support")
+        if self.target_runtime_bank_cap > self.max_synthesis_candidates:
+            raise ValueError("Runtime bank cap cannot exceed the synthesis shortlist cap")
+        for owner in (
+            "redundancy_mechanism_threshold",
+            "redundancy_repair_threshold",
+            "redundancy_applicability_threshold",
+        ):
+            _similarity_threshold(owner, getattr(self, owner))
+        quantile = self.minimum_support_cohesion_quantile
+        if (
+            isinstance(quantile, bool)
+            or not isinstance(quantile, (int, float))
+            or not math.isfinite(float(quantile))
+            or not 0.0 <= float(quantile) <= 1.0
+        ):
+            raise ValueError("V4.2 minimum-support cohesion quantile is invalid")
+        if tuple(self.semantic_prompt_fields) != V4_2_SYNTHESIS_SEMANTIC_FIELDS:
+            raise ValueError("V4.2 synthesis semantic prompt fields drifted")
+        if self.embedding_model != V4_1_EMBEDDING_MODEL:
+            raise ValueError("Unexpected V4.2 shortlist embedding model")
+        if self.embedding_revision != V4_1_EMBEDDING_REVISION:
+            raise ValueError("V4.2 shortlist embedding revision must remain pinned")
+        if self.injection_layer != V4_LAYER_NUMBER:
+            raise ValueError("V4.2 shortlist remains frozen at layer 24")
+        if self.relative_phase_delta != V4_RELATIVE_PHASE_DELTA:
+            raise ValueError("V4.2 shortlist keeps canonical pre-RoPE delta zero")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "semantic_prompt_fields": list(self.semantic_prompt_fields),
+        }
+
+    @property
+    def profile_sha256(self) -> str:
+        return canonical_json_sha256(self.to_dict())
+
+
+@dataclass(frozen=True)
 class V42LocalRepairAtom:
     """One immutable, teacher-free clustering atom derived from a V4 signature."""
 
@@ -254,6 +364,23 @@ class V42LocalRepairAtom:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def validate_v4_2_local_atom_payload(
+    payload: Mapping[str, Any],
+) -> V42LocalRepairAtom:
+    return V42LocalRepairAtom(
+        experience_id=payload.get("experience_id"),
+        sample_id=payload.get("sample_id"),
+        source_experience_type=payload.get("source_experience_type"),
+        problem_structure=payload.get("problem_structure"),
+        decision_point=payload.get("decision_point"),
+        failure_mechanism=payload.get("failure_mechanism"),
+        repair_operator=payload.get("repair_operator"),
+        verification_operator=payload.get("verification_operator"),
+        source_signature_sha256=payload.get("source_signature_sha256"),
+        schema_version=payload.get("schema_version", V4_2_LOCAL_ATOM_SCHEMA),
+    )
 
 
 @dataclass(frozen=True)
@@ -399,13 +526,21 @@ __all__ = [
     "V4_2_DEFAULT_APPLICABILITY_THRESHOLD",
     "V4_2_DEFAULT_APPLICABILITY_WEIGHT",
     "V4_2_DEFAULT_MAX_API_CANDIDATES",
+    "V4_2_DEFAULT_MAX_SYNTHESIS_CANDIDATES",
+    "V4_2_DEFAULT_MIN_SUPPORT_COHESION_QUANTILE",
     "V4_2_DEFAULT_MECHANISM_THRESHOLD",
     "V4_2_DEFAULT_MECHANISM_WEIGHT",
     "V4_2_DEFAULT_NEIGHBOR_COUNT",
+    "V4_2_DEFAULT_PREFERRED_SUPPORT",
+    "V4_2_DEFAULT_REDUNDANCY_APPLICABILITY_THRESHOLD",
+    "V4_2_DEFAULT_REDUNDANCY_MECHANISM_THRESHOLD",
+    "V4_2_DEFAULT_REDUNDANCY_REPAIR_THRESHOLD",
     "V4_2_DEFAULT_REPAIR_THRESHOLD",
     "V4_2_DEFAULT_REPAIR_WEIGHT",
     "V4_2_DEFAULT_REPRESENTATIVE_COUNT",
+    "V4_2_DEFAULT_REVIEW_BATCH_SIZE",
     "V4_2_DEFAULT_SYNTHESIS_BATCH_SIZE",
+    "V4_2_DEFAULT_TARGET_RUNTIME_BANK_CAP",
     "V4_2_EMBEDDING_MANIFEST_SCHEMA",
     "V4_2_LOCAL_ATOM_SCHEMA",
     "V4_2_LOCAL_CLUSTER_PLAN_SCHEMA",
@@ -413,8 +548,14 @@ __all__ = [
     "V4_2_POSITIVE_EDGE_SCHEMA",
     "V4_2_PREFLIGHT_REPORT_SCHEMA",
     "V4_2_REVIEW_PACKET_SCHEMA",
+    "V4_2_SHORTLIST_MANIFEST_SCHEMA",
+    "V4_2_SHORTLIST_PREFLIGHT_SCHEMA",
+    "V4_2_SHORTLIST_PROFILE_SCHEMA",
+    "V4_2_SYNTHESIS_SEMANTIC_FIELDS",
     "V42ConstructionProfile",
     "V42LocalClusterCandidate",
     "V42LocalRepairAtom",
+    "V42ShortlistProfile",
     "validate_v4_2_cluster_payload",
+    "validate_v4_2_local_atom_payload",
 ]

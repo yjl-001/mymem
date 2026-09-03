@@ -31,7 +31,12 @@ V4 当前只研究 GSM8K，固定：
                            └─ 三个视角分别通过绝对阈值才产生正边
                                 └─ 本地 complete-link：簇内每一对都必须有正边
                                      └─ 至少五个不同 sample 才成为 synthesis candidate
-                                          └─ 停止并输出零 API preflight
+                                          └─ 本地高质量 shortlist
+                                               ├─ support>=6：优先候选
+                                               ├─ support=5：仅保留高一致性且有增量多样性的候选
+                                               ├─ 三视角 candidate-centroid NMS 去冗余
+                                               └─ 最多 48 个进入 synthesis，runtime bank 最多 32 个
+                                                    └─ 停止并输出零 API preflight
 
 显式批准后的低频步骤（不属于本地聚类命令）
   └─ DeepSeek 按 candidate 批量做 coherence audit + target/reference synthesis
@@ -85,7 +90,30 @@ support。每个 candidate 固定选五个不同 sample 的代表：先选 medoi
 上界、代表证据字符数与粗略 token 估计、候选数量 guardrail，以及本轮 `external_api_calls_made: 0`。若 candidate 数
 超过 guardrail，后续付费步骤必须保持阻塞，先本地检查阈值和最大簇。
 
-### 2.2 冻结的 V4.1 路径（仅作历史对照）
+### 2.2 当前 V4.2 高质量 shortlist
+
+local cluster 的 95 个 candidate 是用于观察结构的 discovery pool，不是要求全部覆盖的 bank。V4.2 shortlist
+明确采用“小而高质量的 basis”原则：2181 条 answer-serialization、59 条 source-nonapplicable 以及 2463 个
+unsupported reasoning atoms 都只保留在上游审计工件中，不进入恢复、合并或付费合成路径。shortlist 命令只读取
+已经认证的 local profile、atom、三个 embedding tensor、cluster 与五例 review packet；它不会重新编码、读取
+API key、创建 teacher client 或自动进入任何付费阶段。
+
+每个 candidate 的一致性分数由三个上游簇内最小相似度相对于各自建图阈值的归一化余量构成，并取三者最弱值；
+这可避免 mechanism 很强但 repair 或 applicability 边界模糊的候选被平均分掩盖。`support>=6` 是优先层；
+`support=5` 是边界层，只有最弱余量不低于全体 candidate 的指定分位数（默认中位数）才有资格补位。
+
+冗余判定使用 candidate 在 mechanism、repair、applicability 三个既有 embedding 空间中的成员均值 centroid。
+只有三个 centroid cosine 分别达到 `0.92/0.92/0.85`，两个 candidate 才被视为冗余。筛选按质量从强到弱做
+greedy NMS，不使用传递闭包，因此 A 与 B、B 与 C 相似但 A 与 C 不相似时，仍可保留 A 和 C。边界层再按
+与已选集合的最大 joint similarity 从低到高做 farthest-first，以有限名额优先增加机制覆盖。
+
+进入后续 target/reference synthesis 的 candidate 硬上限为 48；未来正式 runtime bank 硬上限为 32。
+shortlist 输出仍设置 `qualified_for_online_use: false`，因为它只是付费合成的输入 basis，不是 process card 或
+side-KV。传给未来 synthesis prompt 的每条代表证据只包含
+`problem_structure/decision_point/failure_mechanism/repair_operator/verification_operator` 五个语义字段；ID、hash、
+support 与筛选分数单独保存在 provenance 中，避免把实例标识和审计噪声塞进 teacher prompt。
+
+### 2.3 冻结的 V4.1 路径（仅作历史对照）
 
 V4.1 不再续跑旧的 bounded map-reduce，也不重新调用已经完成的 5318 条 signature。输入仍不是 V3 teacher
 bank 或旧 memory，而是 Phase-1 原始 verifier-backed contrast pairs、完整的
@@ -262,6 +290,14 @@ OUTPUT_ROOT/
     cluster_review_packets.jsonl
     local_cluster_plan.json
     api_preflight_report.json
+  offline/construction_v4_2_shortlist/
+    construction_profile.json
+    candidate_quality_report.json
+    candidate_redundancy_edges.jsonl
+    selected_synthesis_candidates.jsonl
+    rejected_or_redundant_candidates.jsonl
+    synthesis_shortlist_manifest.json
+    api_preflight_report.json
   offline/side_kv/
     v4_side_kv.safetensors
     v4_side_kv_manifest.json
@@ -303,7 +339,41 @@ jq '{status, external_api_calls_made, api_key_read,
   "$OUTPUT_ROOT/offline/construction_v4_2_local/api_preflight_report.json"
 ```
 
-只有检查 candidate 规模和语义样本之后，才应另行实现并显式启动 candidate-level synthesis。现有
+然后从 discovery pool 生成本地高质量 basis。该命令只复用上一步的 embedding，不需要 GPU，也不进行外部
+调用：
+
+```bash
+python scripts/select_v4_2_bank_candidates.py \
+  --local-construction-dir "$OUTPUT_ROOT/offline/construction_v4_2_local" \
+  --output-dir "$OUTPUT_ROOT/offline/construction_v4_2_shortlist" \
+  --preferred-support 6 \
+  --minimum-support-cohesion-quantile 0.50 \
+  --redundancy-mechanism-threshold 0.92 \
+  --redundancy-repair-threshold 0.92 \
+  --redundancy-applicability-threshold 0.85 \
+  --max-synthesis-candidates 48 \
+  --target-runtime-bank-cap 32 \
+  --synthesis-batch-size 4 \
+  --review-batch-size 8 \
+  --resume \
+  2>&1 | tee "$OUTPUT_ROOT/v4_2_shortlist.log"
+```
+
+完成后检查最终选择数、拒绝原因、冗余边以及未来付费调用上界：
+
+```bash
+jq '{status, external_api_calls_made, api_key_read,
+     source_candidate_count, selected_synthesis_candidate_count,
+     rejected_candidate_count, decision_counts,
+     minimum_support_cohesion_threshold, redundancy_edge_count,
+     max_synthesis_candidates, target_runtime_bank_cap,
+     planned_initial_synthesis_requests,
+     maximum_followup_review_requests, maximum_total_paid_requests,
+     within_synthesis_candidate_guardrail, synthesis_blocked_reason}' \
+  "$OUTPUT_ROOT/offline/construction_v4_2_shortlist/api_preflight_report.json"
+```
+
+只有检查 shortlist 的语义样本之后，才应另行实现并显式启动 candidate-level synthesis。现有
 `run_v4_system.sh --stage construct-cards` 消费的是 V4.1 `cluster_plan.json`，不能读取 V4.2 local plan。
 
 以下 V4.1 付费命令保留为历史复现实验，不是当前推荐路径。检查
