@@ -68,13 +68,14 @@ from scripts.build_teacher_bank import TeacherClient, TeacherInvalidResponseErro
 SIGNATURE_RECORD_SCHEMA = "memgen-v4-repair-signature-record-v1"
 CARD_RECORD_SCHEMA = "memgen-v4-process-card-record-v1"
 REVIEW_RECORD_SCHEMA = "memgen-v4-process-card-review-record-v1"
-CLUSTER_MAP_SCHEMA = "memgen-v4-repair-cluster-map-v1"
-CLUSTER_REDUCE_SCHEMA = "memgen-v4-repair-cluster-reduce-v1"
+CLUSTER_MAP_SCHEMA = "memgen-v4-repair-cluster-map-v2-assignment-map"
+CLUSTER_REDUCE_SCHEMA = "memgen-v4-repair-cluster-reduce-v2-assignment-map"
 CLUSTER_UNIT_RECORD_SCHEMA = "memgen-v4-repair-cluster-unit-record-v1"
 DEFAULT_CLUSTER_MAP_BATCH_SIZE = 48
 DEFAULT_CLUSTER_REDUCE_BATCH_SIZE = 48
 MAX_CLUSTER_REQUEST_CHARACTERS = 200_000
 MAX_CLUSTER_REDUCE_ROUNDS = 8
+_LOCAL_CLUSTER_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 def utc_now() -> str:
@@ -151,6 +152,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(
+                f"DeepSeek response contains duplicate JSON object key: {key}"
+            )
+        value[key] = item
+    return value
+
+
 def _parse_json_object(content: str) -> dict[str, Any]:
     if not isinstance(content, str) or not content.strip():
         raise ValueError("DeepSeek returned an empty final content field")
@@ -158,7 +170,7 @@ def _parse_json_object(content: str) -> dict[str, Any]:
     if cleaned.startswith("```"):
         cleaned = cleaned.split("\n", 1)[1]
         cleaned = cleaned.rsplit("```", 1)[0].strip()
-    value = json.loads(cleaned)
+    value = json.loads(cleaned, object_pairs_hook=_unique_json_object)
     if not isinstance(value, dict):
         raise ValueError("DeepSeek response must be one JSON object")
     return value
@@ -368,26 +380,34 @@ object names, and broad GSM8K topic are metadata, not cluster keys.
 This is a provisional shard, not final runtime-bank admission. A provisional
 cluster may contain one or more signatures; preserve an unmatched signature as
 a singleton instead of rejecting it or merging weakly related items. Do not
-mix experience_type values. Assign every supplied experience exactly once to
-one provisional cluster. rejected_experience_ids must be empty. Titles and
-descriptions must contain no digits, equations, answer fragments, or
-instance-specific details."""
+mix experience_type values.
+
+Define each provisional cluster once with a unique lowercase ASCII
+local_cluster_key. Then return one assignments object whose keys are the exact
+supplied experience_id values and whose values are local_cluster_key values.
+Every supplied ID must occur exactly once as an assignments key, every value
+must name a defined cluster, and every defined cluster must be used. This
+assignment-map shape is mandatory; do not emit member arrays or rejected IDs.
+Titles and descriptions must contain no digits, equations, answer fragments,
+or instance-specific details."""
     user = f"""Repair-signature shard:
 {json.dumps(eligible, ensure_ascii=False, sort_keys=True)}
 
 Return exactly:
 {{
   "schema_version": "{CLUSTER_MAP_SCHEMA}",
-  "clusters": [
+  "cluster_definitions": [
     {{
+      "local_cluster_key": "brief-lowercase-key",
       "title": "brief reusable title",
       "failure_mechanism": "shared grounded mechanism",
       "repair_operator": "shared corrective operator",
-      "scope_summary": "when the repair is applicable",
-      "member_experience_ids": ["..."]
+      "scope_summary": "when the repair is applicable"
     }}
   ],
-  "rejected_experience_ids": ["..."]
+  "assignments": {{
+    "exact-experience-id": "brief-lowercase-key"
+  }}
 }}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -414,26 +434,33 @@ Surface topic or vaguely similar arithmetic is insufficient. Never merge
 prototypes merely to reach a minimum support count, and never mix
 experience_type values.
 
-Assign every supplied prototype exactly once to one merged cluster. Preserve
-an unmatched prototype as a singleton; rejected_prototype_ids must be empty.
-Preserve grounded distinctions. Titles and descriptions must contain no
-digits, equations, answer fragments, or instance-specific details."""
+Define each merged cluster once with a unique lowercase ASCII
+merged_cluster_key. Then return one assignments object whose keys are the exact
+supplied prototype_id values and whose values are merged_cluster_key values.
+Every supplied ID must occur exactly once as an assignments key, every value
+must name a defined cluster, and every defined cluster must be used. Preserve
+an unmatched prototype as a singleton. This assignment-map shape is mandatory;
+do not emit member arrays or rejected IDs. Preserve grounded distinctions.
+Titles and descriptions must contain no digits, equations, answer fragments,
+or instance-specific details."""
     user = f"""Provisional repair-cluster summaries:
 {json.dumps(compact, ensure_ascii=False, sort_keys=True)}
 
 Return exactly:
 {{
   "schema_version": "{CLUSTER_REDUCE_SCHEMA}",
-  "clusters": [
+  "cluster_definitions": [
     {{
+      "merged_cluster_key": "brief-lowercase-key",
       "title": "brief reusable title",
       "failure_mechanism": "shared grounded mechanism",
       "repair_operator": "shared corrective operator",
-      "scope_summary": "when the repair is applicable",
-      "member_prototype_ids": ["..."]
+      "scope_summary": "when the repair is applicable"
     }}
   ],
-  "rejected_prototype_ids": ["..."]
+  "assignments": {{
+    "exact-prototype-id": "brief-lowercase-key"
+  }}
 }}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -442,22 +469,6 @@ def _nonempty_string(owner: str, value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{owner} must be a non-empty string")
     return value.strip()
-
-
-def _unique_string_list(
-    owner: str, value: Any, *, allow_empty: bool = False
-) -> tuple[str, ...]:
-    if not isinstance(value, list):
-        raise ValueError(f"{owner} must be an array")
-    result = tuple(
-        _nonempty_string(f"{owner}[]", item)
-        for item in value
-    )
-    if not allow_empty and not result:
-        raise ValueError(f"{owner} must not be empty")
-    if len(set(result)) != len(result):
-        raise ValueError(f"{owner} contains duplicates")
-    return result
 
 
 def _cluster_summary(raw: Mapping[str, Any], *, owner: str) -> dict[str, str]:
@@ -469,6 +480,88 @@ def _cluster_summary(raw: Mapping[str, Any], *, owner: str) -> dict[str, str]:
             "repair_operator",
             "scope_summary",
         )
+    }
+
+
+def _local_cluster_key(owner: str, value: Any) -> str:
+    key = _nonempty_string(owner, value)
+    if not _LOCAL_CLUSTER_KEY_RE.fullmatch(key):
+        raise ValueError(
+            f"{owner} must be lowercase ASCII starting with a letter and contain "
+            "only letters, digits, underscores, or hyphens"
+        )
+    return key
+
+
+def _parse_assignment_groups(
+    payload: Mapping[str, Any],
+    *,
+    expected_ids: set[str],
+    definition_key_field: str,
+    stage: str,
+) -> tuple[dict[str, dict[str, str]], dict[str, tuple[str, ...]]]:
+    """Validate a total one-to-one-input assignment map and reverse it locally."""
+
+    raw_definitions = payload.get("cluster_definitions")
+    if not isinstance(raw_definitions, list):
+        raise ValueError(f"V4 cluster-{stage} payload is missing cluster_definitions")
+    definitions: dict[str, dict[str, str]] = {}
+    for index, raw in enumerate(raw_definitions):
+        owner = f"cluster_definitions[{index}]"
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{owner} must be an object")
+        key = _local_cluster_key(
+            f"{owner}.{definition_key_field}",
+            raw.get(definition_key_field),
+        )
+        if key in definitions:
+            raise ValueError(
+                f"V4 cluster-{stage} contains duplicate cluster key: {key}"
+            )
+        definitions[key] = _cluster_summary(raw, owner=owner)
+
+    raw_assignments = payload.get("assignments")
+    if not isinstance(raw_assignments, Mapping):
+        raise ValueError(f"V4 cluster-{stage} payload is missing assignments")
+    assignments: dict[str, str] = {}
+    for raw_input_id, raw_cluster_key in raw_assignments.items():
+        input_id = _nonempty_string("assignments key", raw_input_id)
+        cluster_key = _local_cluster_key(
+            f"assignments[{input_id}]",
+            raw_cluster_key,
+        )
+        assignments[input_id] = cluster_key
+
+    assigned_ids = set(assignments)
+    if assigned_ids != expected_ids:
+        missing = expected_ids - assigned_ids
+        extra = assigned_ids - expected_ids
+        raise ValueError(
+            f"V4 cluster-{stage} assignment coverage mismatch: "
+            f"missing_count={len(missing)} first_missing={sorted(missing)[:3]} "
+            f"extra_count={len(extra)} first_extra={sorted(extra)[:3]}"
+        )
+    unknown_cluster_keys = set(assignments.values()) - set(definitions)
+    if unknown_cluster_keys:
+        raise ValueError(
+            f"V4 cluster-{stage} assignments reference undefined cluster keys: "
+            f"count={len(unknown_cluster_keys)} "
+            f"first={sorted(unknown_cluster_keys)[:3]}"
+        )
+    unused_cluster_keys = set(definitions) - set(assignments.values())
+    if unused_cluster_keys:
+        raise ValueError(
+            f"V4 cluster-{stage} contains unused cluster definitions: "
+            f"count={len(unused_cluster_keys)} "
+            f"first={sorted(unused_cluster_keys)[:3]}"
+        )
+
+    grouped: dict[str, list[str]] = {key: [] for key in definitions}
+    for input_id, cluster_key in assignments.items():
+        grouped[cluster_key].append(input_id)
+    return definitions, {
+        key: tuple(sorted(member_ids))
+        for key, member_ids in grouped.items()
     }
 
 
@@ -508,40 +601,22 @@ def parse_cluster_map_payload(
 
     if payload.get("schema_version") != CLUSTER_MAP_SCHEMA:
         raise ValueError("Unexpected V4 cluster-map payload schema")
-    raw_clusters = payload.get("clusters")
-    if not isinstance(raw_clusters, list):
-        raise ValueError("V4 cluster-map payload is missing clusters")
-    rejected = _unique_string_list(
-        "rejected_experience_ids",
-        payload.get("rejected_experience_ids"),
-        allow_empty=True,
-    )
-    if rejected:
-        raise ValueError(
-            "V4 cluster-map must preserve unmatched signatures as singleton prototypes"
-        )
     signature_by_id = {item.experience_id: item for item in signatures}
     if len(signature_by_id) != len(signatures):
         raise ValueError("V4 cluster-map input contains duplicate signatures")
     expected_ids = set(signature_by_id)
     if any(not item.applicable for item in signatures):
         raise ValueError("V4 cluster-map input must contain applicable signatures only")
+    definitions, groups = _parse_assignment_groups(
+        payload,
+        expected_ids=expected_ids,
+        definition_key_field="local_cluster_key",
+        stage="map",
+    )
 
     prototypes: list[dict[str, Any]] = []
-    assigned: list[str] = []
-    for index, raw in enumerate(raw_clusters):
-        if not isinstance(raw, Mapping):
-            raise ValueError(f"clusters[{index}] must be an object")
-        members = _unique_string_list(
-            f"clusters[{index}].member_experience_ids",
-            raw.get("member_experience_ids"),
-        )
-        unknown = set(members) - expected_ids
-        if unknown:
-            raise ValueError(
-                "V4 cluster-map contains unknown IDs: "
-                f"count={len(unknown)} first={sorted(unknown)[:3]}"
-            )
+    for index, cluster_key in enumerate(sorted(groups)):
+        members = groups[cluster_key]
         experience_types = {
             signature_by_id[experience_id].experience_type
             for experience_id in members
@@ -554,23 +629,11 @@ def parse_cluster_map_payload(
                 unit_id=unit_id,
                 index=index,
                 experience_type=next(iter(experience_types)),
-                summary=_cluster_summary(raw, owner=f"clusters[{index}]"),
+                summary=definitions[cluster_key],
                 member_experience_ids=members,
             )
         )
-        assigned.extend(members)
-
-    if len(set(assigned)) != len(assigned):
-        raise ValueError("V4 cluster-map assigned an experience more than once")
-    covered = set(assigned) | set(rejected)
-    if set(assigned) & set(rejected) or covered != expected_ids:
-        missing = expected_ids - covered
-        extra = covered - expected_ids
-        raise ValueError(
-            "V4 cluster-map coverage mismatch: "
-            f"missing_count={len(missing)} extra_count={len(extra)}"
-        )
-    return tuple(prototypes), rejected
+    return tuple(prototypes), ()
 
 
 def parse_cluster_reduce_payload(
@@ -583,18 +646,6 @@ def parse_cluster_reduce_payload(
 
     if payload.get("schema_version") != CLUSTER_REDUCE_SCHEMA:
         raise ValueError("Unexpected V4 cluster-reduce payload schema")
-    raw_clusters = payload.get("clusters")
-    if not isinstance(raw_clusters, list):
-        raise ValueError("V4 cluster-reduce payload is missing clusters")
-    rejected = _unique_string_list(
-        "rejected_prototype_ids",
-        payload.get("rejected_prototype_ids"),
-        allow_empty=True,
-    )
-    if rejected:
-        raise ValueError(
-            "V4 cluster-reduce must preserve unmatched prototype singletons"
-        )
     prototype_by_id = {
         str(item["prototype_id"]): item
         for item in prototypes
@@ -609,23 +660,17 @@ def parse_cluster_reduce_payload(
     ]
     if len(set(input_members)) != len(input_members):
         raise ValueError("V4 cluster-reduce input has overlapping memberships")
+    definitions, groups = _parse_assignment_groups(
+        payload,
+        expected_ids=expected_ids,
+        definition_key_field="merged_cluster_key",
+        stage="reduce",
+    )
 
     merged: list[dict[str, Any]] = []
-    assigned: list[str] = []
     expanded_members: list[str] = []
-    for index, raw in enumerate(raw_clusters):
-        if not isinstance(raw, Mapping):
-            raise ValueError(f"clusters[{index}] must be an object")
-        prototype_ids = _unique_string_list(
-            f"clusters[{index}].member_prototype_ids",
-            raw.get("member_prototype_ids"),
-        )
-        unknown = set(prototype_ids) - expected_ids
-        if unknown:
-            raise ValueError(
-                "V4 cluster-reduce contains unknown prototype IDs: "
-                f"count={len(unknown)} first={sorted(unknown)[:3]}"
-            )
+    for index, cluster_key in enumerate(sorted(groups)):
+        prototype_ids = groups[cluster_key]
         experience_types = {
             str(prototype_by_id[prototype_id]["experience_type"])
             for prototype_id in prototype_ids
@@ -647,26 +692,15 @@ def parse_cluster_reduce_payload(
                 unit_id=unit_id,
                 index=index,
                 experience_type=next(iter(experience_types)),
-                summary=_cluster_summary(raw, owner=f"clusters[{index}]"),
+                summary=definitions[cluster_key],
                 member_experience_ids=members,
             )
         )
-        assigned.extend(prototype_ids)
         expanded_members.extend(members)
 
-    if len(set(assigned)) != len(assigned):
-        raise ValueError("V4 cluster-reduce assigned a prototype more than once")
     if len(set(expanded_members)) != len(expanded_members):
         raise ValueError("V4 cluster-reduce produced overlapping experience memberships")
-    covered = set(assigned) | set(rejected)
-    if set(assigned) & set(rejected) or covered != expected_ids:
-        missing = expected_ids - covered
-        extra = covered - expected_ids
-        raise ValueError(
-            "V4 cluster-reduce coverage mismatch: "
-            f"missing_count={len(missing)} extra_count={len(extra)}"
-        )
-    return tuple(merged), rejected
+    return tuple(merged), ()
 
 
 def _semantic_sort_key(item: Mapping[str, Any]) -> tuple[str, ...]:

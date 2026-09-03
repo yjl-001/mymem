@@ -77,8 +77,12 @@ map/reduce 都必须把暂时无法匹配的输入保留成 singleton，禁止�
 只有完成全局摘要归并后仍不足五个独立 construction problems 的最终簇才进入 rejected 集合。
 reduce 请求只携带局部簇的 process 摘要和 support count，不携带展开后的成员，默认每批最多四十八个
 prototype；每轮在本地递归展开 membership，再做下一轮摘要归并，直到每个 `experience_type` 都完成一次
-全局有界归并。任何一次 map/reduce 都必须完整、不重叠地覆盖输入，否则拒绝响应并定向重试。若在冻结轮数
-内无法达到全局归并条件，构造失败关闭，不把局部结果冒充全局 bank。
+全局有界归并。map/reduce 的教师输出采用唯一 assignment map：模型只定义一次 cluster 摘要，再返回
+`input_id -> cluster_key` 字典；成员数组由本地代码反向展开。每个输入 ID 必须恰好是字典中的一个 key，所有
+cluster key 必须已定义且被实际使用，同时原始 JSON 的重复 object key 也会被拒绝。这使同一个 experience 或
+prototype 无法被同时列入多个簇，而不是在冲突发生后猜测保留哪一个归属。任何一次 map/reduce 都必须完整、
+不重叠地覆盖输入，否则拒绝响应并定向重试。若在冻结轮数内无法达到全局归并条件，构造失败关闭，不把局部
+结果冒充全局 bank。
 
 map/reduce 分别逐请求写入 `cluster_map_shards.jsonl` 与 `cluster_reduce_batches.jsonl`；记录绑定模型、URL、
 prompt version、输入 hash、输出 hash 和自身 record hash，`--resume` 可从失败单元继续。每个请求还设有二十万

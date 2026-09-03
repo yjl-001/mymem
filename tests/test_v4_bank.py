@@ -28,6 +28,7 @@ from scripts.build_v4_repair_bank import (
     CLUSTER_REDUCE_SCHEMA,
     _bounded_batches,
     _merge_exact_prototypes,
+    _parse_json_object,
     _rejected_signature_after_invalid_response,
     _signature_sort_key,
     attach_official_solutions,
@@ -368,31 +369,30 @@ class V4BankContractTests(unittest.TestCase):
         signatures = tuple(signature(suffix) for suffix in "abcdef")
         map_payload = {
             "schema_version": CLUSTER_MAP_SCHEMA,
-            "clusters": [
+            "cluster_definitions": [
                 {
+                    "local_cluster_key": "dependent-update",
                     "title": "Preserve dependent updates",
                     "failure_mechanism": "an intermediate state is discarded too early",
                     "repair_operator": "carry each state into the next update",
                     "scope_summary": "later changes depend on the preceding state",
-                    "member_experience_ids": [
-                        "experience-a",
-                        "experience-b",
-                        "experience-c",
-                    ],
                 },
                 {
+                    "local_cluster_key": "chained-state",
                     "title": "Preserve chained state",
                     "failure_mechanism": "a dependent state is dropped before reuse",
                     "repair_operator": "retain each state for the following update",
                     "scope_summary": "successive changes consume updated state",
-                    "member_experience_ids": [
-                        "experience-d",
-                        "experience-e",
-                        "experience-f",
-                    ],
                 },
             ],
-            "rejected_experience_ids": [],
+            "assignments": {
+                "experience-a": "dependent-update",
+                "experience-b": "dependent-update",
+                "experience-c": "dependent-update",
+                "experience-d": "chained-state",
+                "experience-e": "chained-state",
+                "experience-f": "chained-state",
+            },
         }
         prototypes, rejected = parse_cluster_map_payload(
             map_payload,
@@ -418,18 +418,19 @@ class V4BankContractTests(unittest.TestCase):
 
         reduce_payload = {
             "schema_version": CLUSTER_REDUCE_SCHEMA,
-            "clusters": [
+            "cluster_definitions": [
                 {
+                    "merged_cluster_key": "dependent-state",
                     "title": "Preserve dependent state updates",
                     "failure_mechanism": "an intermediate state is discarded too early",
                     "repair_operator": "carry each state into the next update",
                     "scope_summary": "later changes depend on the preceding state",
-                    "member_prototype_ids": [
-                        item["prototype_id"] for item in prototypes
-                    ],
                 }
             ],
-            "rejected_prototype_ids": [],
+            "assignments": {
+                item["prototype_id"]: "dependent-state"
+                for item in prototypes
+            },
         }
         merged, rejected_prototypes = parse_cluster_reduce_payload(
             reduce_payload,
@@ -453,12 +454,70 @@ class V4BankContractTests(unittest.TestCase):
         self.assertEqual(len(clusters[0].representative_experience_ids), 6)
         self.assertEqual(final_rejected, ())
 
-        map_payload["rejected_experience_ids"] = ["experience-a"]
-        with self.assertRaisesRegex(ValueError, "singleton prototypes"):
+        del map_payload["assignments"]["experience-a"]
+        with self.assertRaisesRegex(ValueError, "assignment coverage mismatch"):
             parse_cluster_map_payload(
                 map_payload,
                 signatures=signatures,
-                unit_id="map-overlap",
+                unit_id="map-missing",
+            )
+
+    def test_cluster_assignment_map_rejects_ambiguous_or_invalid_keys(self) -> None:
+        signatures = tuple(signature(suffix) for suffix in "abc")
+        base_payload = {
+            "schema_version": CLUSTER_MAP_SCHEMA,
+            "cluster_definitions": [
+                {
+                    "local_cluster_key": "dependent-update",
+                    "title": "Preserve dependent updates",
+                    "failure_mechanism": "an intermediate state is discarded too early",
+                    "repair_operator": "carry each state into the next update",
+                    "scope_summary": "later changes depend on the preceding state",
+                }
+            ],
+            "assignments": {
+                item.experience_id: "dependent-update" for item in signatures
+            },
+        }
+
+        undefined = json.loads(json.dumps(base_payload))
+        undefined["assignments"]["experience-a"] = "undefined-key"
+        with self.assertRaisesRegex(ValueError, "undefined cluster keys"):
+            parse_cluster_map_payload(
+                undefined,
+                signatures=signatures,
+                unit_id="map-undefined",
+            )
+
+        unused = json.loads(json.dumps(base_payload))
+        unused["cluster_definitions"].append(
+            {
+                **unused["cluster_definitions"][0],
+                "local_cluster_key": "unused-cluster",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "unused cluster definitions"):
+            parse_cluster_map_payload(
+                unused,
+                signatures=signatures,
+                unit_id="map-unused",
+            )
+
+        duplicate_definition = json.loads(json.dumps(base_payload))
+        duplicate_definition["cluster_definitions"].append(
+            dict(duplicate_definition["cluster_definitions"][0])
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate cluster key"):
+            parse_cluster_map_payload(
+                duplicate_definition,
+                signatures=signatures,
+                unit_id="map-duplicate-definition",
+            )
+
+        with self.assertRaisesRegex(ValueError, "duplicate JSON object key"):
+            _parse_json_object(
+                '{"assignments":{"experience-a":"first",'
+                '"experience-a":"second"}}'
             )
 
     def test_cluster_requests_are_physically_bounded(self) -> None:
@@ -475,18 +534,18 @@ class V4BankContractTests(unittest.TestCase):
 
         map_payload = {
             "schema_version": CLUSTER_MAP_SCHEMA,
-            "clusters": [
+            "cluster_definitions": [
                 {
+                    "local_cluster_key": "dependent-update",
                     "title": "Preserve dependent updates",
                     "failure_mechanism": "an intermediate state is discarded too early",
                     "repair_operator": "carry each state into the next update",
                     "scope_summary": "later changes depend on the preceding state",
-                    "member_experience_ids": [
-                        item.experience_id for item in batches[0]
-                    ],
                 }
             ],
-            "rejected_experience_ids": [],
+            "assignments": {
+                item.experience_id: "dependent-update" for item in batches[0]
+            },
         }
         prototypes, _ = parse_cluster_map_payload(
             map_payload,
@@ -539,18 +598,21 @@ class V4BankContractTests(unittest.TestCase):
         def map_payload(member_ids: list[str]) -> dict:
             return {
                 "schema_version": CLUSTER_MAP_SCHEMA,
-                "clusters": [
+                "cluster_definitions": [
                     {
+                        "local_cluster_key": "dependent-update",
                         "title": "Preserve dependent updates",
                         "failure_mechanism": (
                             "an intermediate state is discarded too early"
                         ),
                         "repair_operator": "carry each state into the next update",
                         "scope_summary": "later changes depend on the preceding state",
-                        "member_experience_ids": member_ids,
                     }
                 ],
-                "rejected_experience_ids": [],
+                "assignments": {
+                    experience_id: "dependent-update"
+                    for experience_id in member_ids
+                },
             }
 
         class FakeClusterClient:
@@ -586,14 +648,19 @@ class V4BankContractTests(unittest.TestCase):
         second_map_payload = map_payload(
             ["experience-d", "experience-e", "experience-f"]
         )
-        second_map_payload["clusters"][0].update(
+        second_map_payload["cluster_definitions"][0].update(
             {
+                "local_cluster_key": "chained-state",
                 "title": "Preserve chained state",
                 "failure_mechanism": "a dependent state is dropped before reuse",
                 "repair_operator": "retain each state for the following update",
                 "scope_summary": "successive changes consume updated state",
             }
         )
+        second_map_payload["assignments"] = {
+            experience_id: "chained-state"
+            for experience_id in second_map_payload["assignments"]
+        }
         first_prototype = parse_cluster_map_payload(
             first_map_payload,
             signatures=signatures[:3],
@@ -610,18 +677,19 @@ class V4BankContractTests(unittest.TestCase):
         )
         reduce_payload = {
             "schema_version": CLUSTER_REDUCE_SCHEMA,
-            "clusters": [
+            "cluster_definitions": [
                 {
+                    "merged_cluster_key": "dependent-state",
                     "title": "Preserve dependent state updates",
                     "failure_mechanism": "an intermediate state is discarded too early",
                     "repair_operator": "carry each state into the next update",
                     "scope_summary": "later changes depend on the preceding state",
-                    "member_prototype_ids": [
-                        item["prototype_id"] for item in post_map_prototypes
-                    ],
                 }
             ],
-            "rejected_prototype_ids": [],
+            "assignments": {
+                item["prototype_id"]: "dependent-state"
+                for item in post_map_prototypes
+            },
         }
         first_client = FakeClusterClient(
             [first_map_payload, second_map_payload, reduce_payload]
