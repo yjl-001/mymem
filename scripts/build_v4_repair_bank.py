@@ -68,14 +68,14 @@ from scripts.build_teacher_bank import TeacherClient, TeacherInvalidResponseErro
 SIGNATURE_RECORD_SCHEMA = "memgen-v4-repair-signature-record-v1"
 CARD_RECORD_SCHEMA = "memgen-v4-process-card-record-v1"
 REVIEW_RECORD_SCHEMA = "memgen-v4-process-card-review-record-v1"
-CLUSTER_MAP_SCHEMA = "memgen-v4-repair-cluster-map-v2-assignment-map"
-CLUSTER_REDUCE_SCHEMA = "memgen-v4-repair-cluster-reduce-v2-assignment-map"
+CLUSTER_MAP_SCHEMA = "memgen-v4-repair-cluster-map-v3-assignment-only"
+CLUSTER_REDUCE_SCHEMA = "memgen-v4-repair-cluster-reduce-v3-assignment-only"
 CLUSTER_UNIT_RECORD_SCHEMA = "memgen-v4-repair-cluster-unit-record-v1"
 DEFAULT_CLUSTER_MAP_BATCH_SIZE = 48
 DEFAULT_CLUSTER_REDUCE_BATCH_SIZE = 48
 MAX_CLUSTER_REQUEST_CHARACTERS = 200_000
 MAX_CLUSTER_REDUCE_ROUNDS = 8
-_LOCAL_CLUSTER_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+_LOCAL_CLUSTER_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 
 def utc_now() -> str:
@@ -382,31 +382,22 @@ cluster may contain one or more signatures; preserve an unmatched signature as
 a singleton instead of rejecting it or merging weakly related items. Do not
 mix experience_type values.
 
-Define each provisional cluster once with a unique lowercase ASCII
-local_cluster_key. Then return one assignments object whose keys are the exact
-supplied experience_id values and whose values are local_cluster_key values.
-Every supplied ID must occur exactly once as an assignments key, every value
-must name a defined cluster, and every defined cluster must be used. This
-assignment-map shape is mandatory; do not emit member arrays or rejected IDs.
-Titles and descriptions must contain no digits, equations, answer fragments,
-or instance-specific details."""
+Return only one assignments object whose keys are the exact supplied
+experience_id values and whose values are short lowercase ASCII cluster labels.
+Use the same label exactly when signatures share both the failure mechanism and
+the repair operator; otherwise use different labels. Every supplied ID must
+occur exactly once as an assignments key. Preserve an unmatched signature with
+its own singleton label. This assignment-only shape is mandatory: do not emit
+cluster definitions, prose summaries, member arrays, or rejected IDs. Local
+code will inherit grounded summaries from the assigned signatures."""
     user = f"""Repair-signature shard:
 {json.dumps(eligible, ensure_ascii=False, sort_keys=True)}
 
 Return exactly:
 {{
   "schema_version": "{CLUSTER_MAP_SCHEMA}",
-  "cluster_definitions": [
-    {{
-      "local_cluster_key": "brief-lowercase-key",
-      "title": "brief reusable title",
-      "failure_mechanism": "shared grounded mechanism",
-      "repair_operator": "shared corrective operator",
-      "scope_summary": "when the repair is applicable"
-    }}
-  ],
   "assignments": {{
-    "exact-experience-id": "brief-lowercase-key"
+    "exact-experience-id": "short-lowercase-label"
   }}
 }}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -434,32 +425,22 @@ Surface topic or vaguely similar arithmetic is insufficient. Never merge
 prototypes merely to reach a minimum support count, and never mix
 experience_type values.
 
-Define each merged cluster once with a unique lowercase ASCII
-merged_cluster_key. Then return one assignments object whose keys are the exact
-supplied prototype_id values and whose values are merged_cluster_key values.
-Every supplied ID must occur exactly once as an assignments key, every value
-must name a defined cluster, and every defined cluster must be used. Preserve
-an unmatched prototype as a singleton. This assignment-map shape is mandatory;
-do not emit member arrays or rejected IDs. Preserve grounded distinctions.
-Titles and descriptions must contain no digits, equations, answer fragments,
-or instance-specific details."""
+Return only one assignments object whose keys are the exact supplied
+prototype_id values and whose values are short lowercase ASCII cluster labels.
+Use the same label exactly when prototypes share both the failure mechanism and
+the repair operator; otherwise use different labels. Every supplied ID must
+occur exactly once as an assignments key. Preserve an unmatched prototype with
+its own singleton label. This assignment-only shape is mandatory: do not emit
+cluster definitions, prose summaries, member arrays, or rejected IDs. Local
+code will inherit grounded summaries from the assigned prototypes."""
     user = f"""Provisional repair-cluster summaries:
 {json.dumps(compact, ensure_ascii=False, sort_keys=True)}
 
 Return exactly:
 {{
   "schema_version": "{CLUSTER_REDUCE_SCHEMA}",
-  "cluster_definitions": [
-    {{
-      "merged_cluster_key": "brief-lowercase-key",
-      "title": "brief reusable title",
-      "failure_mechanism": "shared grounded mechanism",
-      "repair_operator": "shared corrective operator",
-      "scope_summary": "when the repair is applicable"
-    }}
-  ],
   "assignments": {{
-    "exact-prototype-id": "brief-lowercase-key"
+    "exact-prototype-id": "short-lowercase-label"
   }}
 }}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -471,24 +452,12 @@ def _nonempty_string(owner: str, value: Any) -> str:
     return value.strip()
 
 
-def _cluster_summary(raw: Mapping[str, Any], *, owner: str) -> dict[str, str]:
-    return {
-        field: validate_v4_card_text(f"{owner}.{field}", raw.get(field))
-        for field in (
-            "title",
-            "failure_mechanism",
-            "repair_operator",
-            "scope_summary",
-        )
-    }
-
-
 def _local_cluster_key(owner: str, value: Any) -> str:
     key = _nonempty_string(owner, value)
     if not _LOCAL_CLUSTER_KEY_RE.fullmatch(key):
         raise ValueError(
             f"{owner} must be lowercase ASCII starting with a letter and contain "
-            "only letters, digits, underscores, or hyphens"
+            "at most sixty four letters, digits, underscores, or hyphens"
         )
     return key
 
@@ -497,29 +466,16 @@ def _parse_assignment_groups(
     payload: Mapping[str, Any],
     *,
     expected_ids: set[str],
-    definition_key_field: str,
     stage: str,
-) -> tuple[dict[str, dict[str, str]], dict[str, tuple[str, ...]]]:
+) -> dict[str, tuple[str, ...]]:
     """Validate a total one-to-one-input assignment map and reverse it locally."""
 
-    raw_definitions = payload.get("cluster_definitions")
-    if not isinstance(raw_definitions, list):
-        raise ValueError(f"V4 cluster-{stage} payload is missing cluster_definitions")
-    definitions: dict[str, dict[str, str]] = {}
-    for index, raw in enumerate(raw_definitions):
-        owner = f"cluster_definitions[{index}]"
-        if not isinstance(raw, Mapping):
-            raise ValueError(f"{owner} must be an object")
-        key = _local_cluster_key(
-            f"{owner}.{definition_key_field}",
-            raw.get(definition_key_field),
+    unexpected_fields = set(payload) - {"schema_version", "assignments"}
+    if unexpected_fields:
+        raise ValueError(
+            f"V4 cluster-{stage} assignment-only payload contains unexpected fields: "
+            f"{sorted(str(field) for field in unexpected_fields)[:3]}"
         )
-        if key in definitions:
-            raise ValueError(
-                f"V4 cluster-{stage} contains duplicate cluster key: {key}"
-            )
-        definitions[key] = _cluster_summary(raw, owner=owner)
-
     raw_assignments = payload.get("assignments")
     if not isinstance(raw_assignments, Mapping):
         raise ValueError(f"V4 cluster-{stage} payload is missing assignments")
@@ -541,27 +497,62 @@ def _parse_assignment_groups(
             f"missing_count={len(missing)} first_missing={sorted(missing)[:3]} "
             f"extra_count={len(extra)} first_extra={sorted(extra)[:3]}"
         )
-    unknown_cluster_keys = set(assignments.values()) - set(definitions)
-    if unknown_cluster_keys:
-        raise ValueError(
-            f"V4 cluster-{stage} assignments reference undefined cluster keys: "
-            f"count={len(unknown_cluster_keys)} "
-            f"first={sorted(unknown_cluster_keys)[:3]}"
-        )
-    unused_cluster_keys = set(definitions) - set(assignments.values())
-    if unused_cluster_keys:
-        raise ValueError(
-            f"V4 cluster-{stage} contains unused cluster definitions: "
-            f"count={len(unused_cluster_keys)} "
-            f"first={sorted(unused_cluster_keys)[:3]}"
-        )
 
-    grouped: dict[str, list[str]] = {key: [] for key in definitions}
+    grouped: dict[str, list[str]] = {}
     for input_id, cluster_key in assignments.items():
-        grouped[cluster_key].append(input_id)
-    return definitions, {
+        grouped.setdefault(cluster_key, []).append(input_id)
+    return {
         key: tuple(sorted(member_ids))
         for key, member_ids in grouped.items()
+    }
+
+
+def _signature_group_summary(
+    members: Sequence[str],
+    *,
+    signature_by_id: Mapping[str, V4RepairSignature],
+) -> dict[str, str]:
+    """Inherit a grounded deterministic summary without teacher regeneration."""
+
+    representative = min(
+        (signature_by_id[experience_id] for experience_id in members),
+        key=lambda item: (
+            " ".join(item.repair_operator.lower().split()),
+            " ".join(item.failure_mechanism.lower().split()),
+            " ".join(item.problem_structure.lower().split()),
+            item.experience_id,
+        ),
+    )
+    return {
+        "title": representative.repair_operator,
+        "failure_mechanism": representative.failure_mechanism,
+        "repair_operator": representative.repair_operator,
+        "scope_summary": representative.problem_structure,
+    }
+
+
+def _prototype_group_summary(
+    prototype_ids: Sequence[str],
+    *,
+    prototype_by_id: Mapping[str, Mapping[str, Any]],
+) -> dict[str, str]:
+    """Inherit the most stable grounded prototype summary after a reduce merge."""
+
+    representative = min(
+        (prototype_by_id[prototype_id] for prototype_id in prototype_ids),
+        key=_semantic_sort_key,
+    )
+    return {
+        field: validate_v4_card_text(
+            f"prototype[{representative['prototype_id']}].{field}",
+            representative[field],
+        )
+        for field in (
+            "title",
+            "failure_mechanism",
+            "repair_operator",
+            "scope_summary",
+        )
     }
 
 
@@ -607,10 +598,9 @@ def parse_cluster_map_payload(
     expected_ids = set(signature_by_id)
     if any(not item.applicable for item in signatures):
         raise ValueError("V4 cluster-map input must contain applicable signatures only")
-    definitions, groups = _parse_assignment_groups(
+    groups = _parse_assignment_groups(
         payload,
         expected_ids=expected_ids,
-        definition_key_field="local_cluster_key",
         stage="map",
     )
 
@@ -629,7 +619,10 @@ def parse_cluster_map_payload(
                 unit_id=unit_id,
                 index=index,
                 experience_type=next(iter(experience_types)),
-                summary=definitions[cluster_key],
+                summary=_signature_group_summary(
+                    members,
+                    signature_by_id=signature_by_id,
+                ),
                 member_experience_ids=members,
             )
         )
@@ -660,10 +653,9 @@ def parse_cluster_reduce_payload(
     ]
     if len(set(input_members)) != len(input_members):
         raise ValueError("V4 cluster-reduce input has overlapping memberships")
-    definitions, groups = _parse_assignment_groups(
+    groups = _parse_assignment_groups(
         payload,
         expected_ids=expected_ids,
-        definition_key_field="merged_cluster_key",
         stage="reduce",
     )
 
@@ -692,7 +684,10 @@ def parse_cluster_reduce_payload(
                 unit_id=unit_id,
                 index=index,
                 experience_type=next(iter(experience_types)),
-                summary=definitions[cluster_key],
+                summary=_prototype_group_summary(
+                    prototype_ids,
+                    prototype_by_id=prototype_by_id,
+                ),
                 member_experience_ids=members,
             )
         )

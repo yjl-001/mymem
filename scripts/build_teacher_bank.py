@@ -461,6 +461,7 @@ class TeacherClient:
         }
         ordinary_failures = 0
         proxy_failures = 0
+        last_invalid_reason: str | None = None
 
         while True:
             try:
@@ -527,9 +528,16 @@ class TeacherClient:
             if not response.ok:
                 status = response.status_code
                 response.close()
+                retry_context = (
+                    " while retrying after an invalid response "
+                    f"({last_invalid_reason})"
+                    if last_invalid_reason is not None
+                    else ""
+                )
                 raise RuntimeError(
-                    f"Teacher API returned non-retryable HTTP {status}; check API key, "
-                    "balance, model name, and request parameters."
+                    f"Teacher API returned non-retryable HTTP {status}{retry_context}; "
+                    "check API key, balance, model name, and request parameters. "
+                    "Checkpointed records remain resumable."
                 )
 
             content: Any = None
@@ -549,20 +557,35 @@ class TeacherClient:
                     if expose_parser_error and isinstance(exc, ValueError) and str(exc)
                     else type(exc).__name__
                 )
+                last_invalid_reason = reason
                 if repair_parser_errors and isinstance(content, str) and content.strip():
-                    body["messages"] = [
-                        *original_messages,
-                        {"role": "assistant", "content": content},
-                        {
-                            "role": "user",
-                            "content": (
-                                "The previous JSON object failed local validation: "
-                                f"{reason}. Return a corrected JSON object only. Preserve "
-                                "the requested schema and change every field implicated by "
-                                "the validation error."
-                            ),
-                        },
-                    ]
+                    if isinstance(exc, json.JSONDecodeError):
+                        body["messages"] = [
+                            *original_messages,
+                            {
+                                "role": "user",
+                                "content": (
+                                    "The previous response was malformed or truncated JSON: "
+                                    f"{reason}. Regenerate the complete compact JSON object "
+                                    "from scratch. Preserve the requested schema, return JSON "
+                                    "only, and do not add prose or optional fields."
+                                ),
+                            },
+                        ]
+                    else:
+                        body["messages"] = [
+                            *original_messages,
+                            {"role": "assistant", "content": content},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "The previous JSON object failed local validation: "
+                                    f"{reason}. Return a corrected JSON object only. Preserve "
+                                    "the requested schema and change every field implicated by "
+                                    "the validation error."
+                                ),
+                            },
+                        ]
                 print(
                     f"[{request_label}] invalid API response ({reason}) "
                     f"(retry {ordinary_failures}/{self.retries - 1}); waiting {delay}s...",

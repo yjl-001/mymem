@@ -49,7 +49,7 @@ V4_MAX_ACTIVE_STEPS = 32
 
 V4_SIGNATURE_PROMPT_VERSION = "memgen-v4-repair-signature-deepseek-v1"
 V4_CLUSTER_PROMPT_VERSION = (
-    "memgen-v4-repair-cluster-deepseek-v3-assignment-map"
+    "memgen-v4-repair-cluster-deepseek-v4-assignment-only"
 )
 V4_CARD_PROMPT_VERSION = "memgen-v4-process-card-deepseek-v2-bounded-evidence"
 V4_CARD_REVIEW_PROMPT_VERSION = (

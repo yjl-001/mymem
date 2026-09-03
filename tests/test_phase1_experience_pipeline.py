@@ -659,6 +659,75 @@ class TeacherClientTests(unittest.TestCase):
             retry_messages[-1]["content"],
         )
 
+    def test_truncated_json_retry_does_not_echo_large_invalid_response(self) -> None:
+        truncated_content = '{"assignments":{"experience-a":"cluster-a"'
+        valid_content = '{"assignments":{"experience-a":"cluster-a"}}'
+        session = FakeSession(
+            [
+                FakeResponse(
+                    200,
+                    {"choices": [{"message": {"content": truncated_content}}]},
+                ),
+                FakeResponse(
+                    200,
+                    {"choices": [{"message": {"content": valid_content}}]},
+                ),
+            ]
+        )
+        sleeps: list[float] = []
+
+        with teacher_client(session, sleeps) as client:
+            result = client.call(
+                [{"role": "user", "content": "Return compact assignments."}],
+                response_parser=json.loads,
+                request_label="v4-cluster-map",
+                expose_parser_error=True,
+                repair_parser_errors=True,
+            )
+
+        self.assertEqual(
+            result,
+            {"assignments": {"experience-a": "cluster-a"}},
+        )
+        retry_messages = session.post_json_bodies[1]["messages"]
+        self.assertEqual(len(retry_messages), 2)
+        self.assertEqual(retry_messages[0]["role"], "user")
+        self.assertEqual(retry_messages[1]["role"], "user")
+        self.assertIn(
+            "Regenerate the complete compact JSON",
+            retry_messages[1]["content"],
+        )
+        self.assertNotIn(truncated_content, json.dumps(retry_messages))
+        self.assertEqual(sleeps, [1])
+
+    def test_http_denial_after_invalid_response_reports_retry_context(self) -> None:
+        truncated_content = '{"assignments":{"experience-a":"cluster-a"'
+        session = FakeSession(
+            [
+                FakeResponse(
+                    200,
+                    {"choices": [{"message": {"content": truncated_content}}]},
+                ),
+                FakeResponse(403),
+            ]
+        )
+
+        with teacher_client(session, []) as client:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "HTTP 403 while retrying after an invalid response",
+            ) as raised:
+                client.call(
+                    [{"role": "user", "content": "Return compact assignments."}],
+                    response_parser=json.loads,
+                    request_label="v4-cluster-map",
+                    expose_parser_error=True,
+                    repair_parser_errors=True,
+                )
+
+        self.assertIn("Checkpointed records remain resumable", str(raised.exception))
+        self.assertNotIn("top-secret-api-key", str(raised.exception))
+
     def test_invalid_response_exhaustion_has_distinct_exception(self) -> None:
         content = json.dumps({"invalid": True})
         session = FakeSession(

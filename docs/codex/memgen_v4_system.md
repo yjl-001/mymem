@@ -71,18 +71,23 @@ signature。网络故障、代理重试耗尽、鉴权、余额或不可重试 H
 `repair_signatures.jsonl` 的 `generation_status` 区分正常教师输出与受控拒绝，最终 manifest 的
 `teacher_invalid_signature_ids` 汇总后者。
 
+若失败原因是 JSON 本身被截断或语法不完整，修正请求不会把可能很长的残缺输出再次塞回上下文，而是基于原始
+prompt 要求重新生成完整、紧凑的 JSON；语义/schema 校验失败仍携带原输出做定向修正。
+
 聚类不再把全部 signature 塞入一个 API 请求。map 默认按 `experience_type` 隔离、语义排序后每批最多四十八
 条；每个 shard 必须精确覆盖本批输入，但局部簇可以少于五条，避免为了过早满足 runtime support 而误合并。
 map/reduce 都必须把暂时无法匹配的输入保留成 singleton，禁止因它在当前物理 batch 内缺少近邻就提前拒绝；
 只有完成全局摘要归并后仍不足五个独立 construction problems 的最终簇才进入 rejected 集合。
 reduce 请求只携带局部簇的 process 摘要和 support count，不携带展开后的成员，默认每批最多四十八个
 prototype；每轮在本地递归展开 membership，再做下一轮摘要归并，直到每个 `experience_type` 都完成一次
-全局有界归并。map/reduce 的教师输出采用唯一 assignment map：模型只定义一次 cluster 摘要，再返回
-`input_id -> cluster_key` 字典；成员数组由本地代码反向展开。每个输入 ID 必须恰好是字典中的一个 key，所有
-cluster key 必须已定义且被实际使用，同时原始 JSON 的重复 object key 也会被拒绝。这使同一个 experience 或
-prototype 无法被同时列入多个簇，而不是在冲突发生后猜测保留哪一个归属。任何一次 map/reduce 都必须完整、
-不重叠地覆盖输入，否则拒绝响应并定向重试。若在冻结轮数内无法达到全局归并条件，构造失败关闭，不把局部
-结果冒充全局 bank。
+全局有界归并。map/reduce 的教师输出采用 assignment-only map，只返回 `input_id -> cluster_label` 字典，不再
+为几十个 singleton 重复生成 title、mechanism、operator 和 scope。这些 prototype 摘要从簇内已验证
+signature 或前一轮 prototype 中确定性继承，最终 process card 仍由五到十个原始 construction examples 独立
+合成。这样既把最坏情况下的响应从数万字符压缩到几千字符，避免撞到模型输出 token 上限，也减少聚类阶段再
+生成一遍过程文本带来的漂移。每个输入 ID 必须恰好是字典中的一个 key，cluster label 必须是规范化小写 ASCII，
+同时原始 JSON 的重复 object key 也会被拒绝。这使同一个 experience 或 prototype 无法被同时列入多个簇，
+而不是在冲突发生后猜测保留哪一个归属。任何一次 map/reduce 都必须完整、不重叠地覆盖输入，否则拒绝响应并
+定向重试。若在冻结轮数内无法达到全局归并条件，构造失败关闭，不把局部结果冒充全局 bank。
 
 map/reduce 分别逐请求写入 `cluster_map_shards.jsonl` 与 `cluster_reduce_batches.jsonl`；记录绑定模型、URL、
 prompt version、输入 hash、输出 hash 和自身 record hash，`--resume` 可从失败单元继续。每个请求还设有二十万
