@@ -97,6 +97,20 @@ runner 可通过 `MEMGEN_V4_CLUSTER_MAP_BATCH_SIZE` 与
 `MEMGEN_V4_CLUSTER_REDUCE_BATCH_SIZE` 显式缩小默认 batch；改变 batch size 会改变 clustering profile，已有
 不匹配的 map/reduce 单元不会被错误复用。
 
+若 bounded reduce 收缩缓慢，可在不继续调用教师的情况下运行只读诊断器：
+
+```bash
+python scripts/inspect_v4_cluster_progress.py \
+  --construction-dir "$V4_OUTPUT/offline/construction"
+```
+
+诊断器按原始确定性 batch 顺序验证并重放 signature、map 和已完整完成的 reduce round，不加载模型或 GPU，
+不修改任何 checkpoint，只写入独立的 `reduce_progress_report.json`。报告包含逐轮 retention/reduction ratio、
+按 `experience_type` 的 prototype 数、按独立 sample 数计算的 support histogram、全部五例以上候选、最大簇、
+singleton/小簇的确定性样本，以及只用于诊断而不决定 merge 的词级 Jaccard 近重复统计。若最后一轮只完成了
+部分 batch，报告停在前一完整 round，并单独列出当前 round 的已完成、缺失 unit 数。所有输入文件记录路径与
+SHA256，报告自身也带逻辑 SHA256；任何 cluster-unit hash、prompt、teacher 或重建输入绑定不一致都会失败关闭。
+
 cluster 不按题目故事、对象或宽泛数学主题划分。一个正式 runtime bank 至少含五个不同 sample ID。本地使用
 signature process 字段的最大最小词集距离，从每个最终簇确定性选择五到十个 representative examples，覆盖
 结构变化且避免把全部成员重新放进 card 请求。少于五个、机制混杂、无法落到单一 repair operator 的组被
