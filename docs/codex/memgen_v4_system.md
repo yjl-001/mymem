@@ -1,4 +1,4 @@
-# MemGen V4.1：MI 风格 repair bank 与单层在线 selector
+# MemGen V4.2：低成本 MI 风格 repair bank 与单层在线 selector
 
 V4 延续 V3 已确认的研究方向，不修改 V3.5 的冻结实现。它针对 V3.8 暴露的首要瓶颈——大多数失败 query
 在旧 bank、旧 value 和 persistent-to-EOS 注入组合下没有 helpful memory——重新构造 bank/value，并把
@@ -19,18 +19,24 @@ V4 当前只研究 GSM8K，固定：
 阶段一：离线构造 bank
 
 已认证 V4 repair signatures（不重新生成）
-  └─ DeepSeek V4 Flash：规范化为受控 repair atom
-       ├─ reasoning process：进入候选聚类
-       ├─ answer serialization：归档，禁止进入 target bank
-       └─ unusable：归档，不强制分配
-            └─ 固定 revision 的 BGE embedding：仅召回跨 type 候选边
-                 └─ DeepSeek：逐候选对判断 mechanism/action/applicability
-                      └─ 本地 complete-link：簇内每一对 seed 必须有正边
-                           └─ 五到十个独立 examples 的 coherence audit
-                                ├─ target：official solution + verified success
-                                └─ reference：paired verified failure
-                                     └─ 独立 card review
-                                          └─ target/reference 编译 layer-24 side-KV
+  └─ 本地确定性角色边界
+       ├─ source non-applicable：归档，不强制分配
+       ├─ verified format_compliance：serialization 归档
+       └─ 其余 applicable signatures：直接形成 local repair atoms
+            └─ 固定 revision 的 BGE，一次编码三个独立视角
+                 ├─ failure mechanism + decision point
+                 ├─ repair + verification operator
+                 └─ problem structure + decision point
+                      └─ joint mutual-kNN 召回
+                           └─ 三个视角分别通过绝对阈值才产生正边
+                                └─ 本地 complete-link：簇内每一对都必须有正边
+                                     └─ 至少五个不同 sample 才成为 synthesis candidate
+                                          └─ 停止并输出零 API preflight
+
+显式批准后的低频步骤（不属于本地聚类命令）
+  └─ DeepSeek 按 candidate 批量做 coherence audit + target/reference synthesis
+       └─ 独立 card review
+            └─ target/reference 编译 layer-24 side-KV
 
 同一批 construction pairs
   └─ failure trajectory 第一次 entropy+risk joint gate
@@ -53,6 +59,33 @@ V4 当前只研究 GSM8K，固定：
 bank 工件的组成部分，不单独定义新的研究阶段。
 
 ## 2. Construction evidence 与聚类
+
+### 2.1 当前 V4.2 本地聚类
+
+V4.2 将 DeepSeek 从逐 experience canonicalization、逐 pair 判断和逐 candidate audit 的热路径中移除。它复用
+已经付费完成并认证的 V4 `repair_signatures.jsonl`；`build_v4_2_local_clusters.py` 不读取
+`DEEPSEEK_API_KEY`、不构造 teacher client，也不会自动进入 card synthesis。source profile 中保留的 teacher
+字段只用于验证历史 signature 的 provenance，不代表本轮发生 API 调用。
+
+每个 applicable、非 `format_compliance` signature 形成一个 immutable atom，并生成三个独立文本视角：
+mechanism、repair、applicability。三个视角由同一个固定 revision 的
+`BAAI/bge-small-en-v1.5` 分别编码和 L2 normalize。加权 joint cosine 只决定 mutual top-k 邻居；一条边最终
+还必须同时满足 mechanism、repair、applicability 三个绝对阈值。默认参数为 `k=32`、阈值
+`0.82/0.82/0.70`、权重 `0.45/0.45/0.10`。与 V4.1 不同，这里的本地相似度是候选 membership 的直接证据；
+因此阈值进入 authenticated profile，不能在同一输出目录静默改变。
+
+正边图使用确定性的 greedy complete-link partition。节点只有与组内所有已有成员都有正边时才能加入，所以
+A-B 与 B-C 不会在缺少 A-C 时被传递合并。`source_experience_type` 只记录 provenance，既不切断邻居搜索，也
+不作为分组边界。每个 group 至少包含五个不同 `sample_id` 才成为 candidate；同题多个 contrast 不重复计算
+support。每个 candidate 固定选五个不同 sample 的代表：先选 medoid，再做 farthest-first 覆盖。其余 group
+明确归入 unsupported archive，不会被强制合并。
+
+本地聚类结束只产生“可送去合成”的 candidate，不产生可在线加载的 bank。`local_cluster_plan.json` 明确设置
+`qualified_for_online_use: false`；`api_preflight_report.json` 记录 candidate 数、未来批量 synthesis 的请求数
+上界、代表证据字符数与粗略 token 估计、候选数量 guardrail，以及本轮 `external_api_calls_made: 0`。若 candidate 数
+超过 guardrail，后续付费步骤必须保持阻塞，先本地检查阈值和最大簇。
+
+### 2.2 冻结的 V4.1 路径（仅作历史对照）
 
 V4.1 不再续跑旧的 bounded map-reduce，也不重新调用已经完成的 5318 条 signature。输入仍不是 V3 teacher
 bank 或旧 memory，而是 Phase-1 原始 verifier-backed contrast pairs、完整的
@@ -216,6 +249,19 @@ OUTPUT_ROOT/
     rejected_clusters.jsonl
     bank_records.jsonl
     bank_manifest.json
+  offline/construction_v4_2_local/
+    construction_profile.json
+    local_atoms.jsonl
+    mechanism_embeddings.npy
+    repair_embeddings.npy
+    applicability_embeddings.npy
+    multiview_embeddings_manifest.json
+    positive_edges.jsonl
+    positive_edge_manifest.json
+    local_clusters.jsonl
+    cluster_review_packets.jsonl
+    local_cluster_plan.json
+    api_preflight_report.json
   offline/side_kv/
     v4_side_kv.safetensors
     v4_side_kv_manifest.json
@@ -231,22 +277,37 @@ OUTPUT_ROOT/
     v4_report.json
 ```
 
-建议先完成 V4.1 聚类。它复用 `offline/construction` 中已经生成的 signature，不读取旧 map/reduce：
+当前建议先完成 V4.2 本地聚类。它复用 `offline/construction` 中已经生成的 signature，不读取旧 map/reduce，
+也不需要设置 DeepSeek key：
 
 ```bash
-export DEEPSEEK_API_KEY='...'
-export MEMGEN_V4_CUDA_VISIBLE_DEVICES=0
-
-bash scripts/experiments/gsm8k/run_v4_system.sh \
-  --stage construct-cluster \
+python scripts/build_v4_2_local_clusters.py \
+  --experiences "$PHASE1_DIR/verified_experiences.jsonl" \
+  --split-manifest "$PHASE1_DIR/split_manifest.json" \
+  --source-signatures "$V4_SOURCE_DIR/repair_signatures.jsonl" \
+  --source-construction-profile "$V4_SOURCE_DIR/construction_profile.json" \
+  --output-dir "$OUTPUT_ROOT/offline/construction_v4_2_local" \
+  --dataset-revision main \
+  --embedding-device cuda \
   --resume \
-  "$PHASE1_DIR" \
-  "$E0_DIR" \
-  "$RISK_ARTIFACT" \
-  "$OUTPUT_ROOT/v4"
+  2>&1 | tee "$OUTPUT_ROOT/v4_2_local_cluster.log"
 ```
 
-检查 `construction_v4_1/cluster_plan.json` 后，再构造 card：
+完成后先检查 compact preflight，不能把 candidate 当成正式 bank：
+
+```bash
+jq '{status, external_api_calls_made, api_key_read,
+     qualified_candidate_count, planned_initial_synthesis_requests,
+     max_api_candidates, within_candidate_guardrail,
+     local_graph_diagnostics}' \
+  "$OUTPUT_ROOT/offline/construction_v4_2_local/api_preflight_report.json"
+```
+
+只有检查 candidate 规模和语义样本之后，才应另行实现并显式启动 candidate-level synthesis。现有
+`run_v4_system.sh --stage construct-cards` 消费的是 V4.1 `cluster_plan.json`，不能读取 V4.2 local plan。
+
+以下 V4.1 付费命令保留为历史复现实验，不是当前推荐路径。检查
+`construction_v4_1/cluster_plan.json` 后，再构造 card：
 
 ```bash
 bash scripts/experiments/gsm8k/run_v4_system.sh \
