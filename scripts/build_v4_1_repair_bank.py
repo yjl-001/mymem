@@ -396,11 +396,36 @@ def _parse_canonical_payload(
     if set(values) != expected:
         raise ValueError("V4.1 canonical payload does not cover its exact input")
     by_id = {item.experience_id: item for item in signatures}
+    normalized_atoms: dict[str, dict[str, Any]] = {}
     for experience_id, value in values.items():
         if not isinstance(value, Mapping):
             raise ValueError("V4.1 canonical atom must be an object")
-        parse_v4_1_canonical_atom(value, signature=by_id[experience_id])
-    return payload
+        atom = parse_v4_1_canonical_atom(value, signature=by_id[experience_id])
+        normalized = {
+            key: atom.to_dict()[key]
+            for key in (
+                "memory_role",
+                "state_scope",
+                "mechanism_family",
+                "repair_family",
+                "applicability_family",
+                "failure_transition",
+                "repair_action",
+                "applicability_condition",
+                "verification_action",
+                "exclusion_reason",
+            )
+        }
+        normalized["normalization_flags"] = [
+            key
+            for key in normalized
+            if key != "normalization_flags" and value.get(key) != normalized[key]
+        ]
+        normalized_atoms[experience_id] = normalized
+    return {
+        "schema_version": V4_1_CANONICAL_PAYLOAD_SCHEMA,
+        "atoms": normalized_atoms,
+    }
 
 
 def _fallback_unusable_atom(signature: V4RepairSignature) -> V41CanonicalRepairAtom:
@@ -506,6 +531,22 @@ def _checkpoint_record(
     return record
 
 
+def _store_unit_record(
+    path: Path,
+    records: dict[str, dict[str, Any]],
+    record: dict[str, Any],
+) -> None:
+    """Durably append a new unit or replace one incompatible unit in place."""
+
+    unit_id = str(record["unit_id"])
+    replacing = unit_id in records
+    records[unit_id] = record
+    if replacing:
+        _write_jsonl(path, (records[key] for key in sorted(records)))
+    else:
+        _append_jsonl(path, record)
+
+
 def canonicalize_signatures(
     signatures: Sequence[V4RepairSignature],
     *,
@@ -529,7 +570,10 @@ def canonicalize_signatures(
             prompt_version=V4_1_CANONICAL_PROMPT_VERSION,
             input_sha256=input_sha256,
             args=args,
-        ):
+        ) and record.get("generation_status") in {
+            "teacher_validated",
+            "deterministic_unusable_after_normalized_invalid_teacher_response",
+        }:
             payload = dict(record["payload"])
             _parse_canonical_payload(
                 json.dumps(payload, ensure_ascii=False), signatures=batch
@@ -567,7 +611,9 @@ def canonicalize_signatures(
                     "schema_version": V4_1_CANONICAL_PAYLOAD_SCHEMA,
                     "atoms": {batch[0].experience_id: atom.to_dict()},
                 }
-                status = "deterministic_unusable_after_invalid_teacher_response"
+                status = (
+                    "deterministic_unusable_after_normalized_invalid_teacher_response"
+                )
             else:
                 status = "teacher_validated"
             record = _checkpoint_record(
@@ -579,8 +625,7 @@ def canonicalize_signatures(
                 args=args,
                 generation_status=status,
             )
-            _append_jsonl(checkpoint_path, record)
-            existing[unit_id] = record
+            _store_unit_record(checkpoint_path, existing, record)
         assert payload is not None
         by_id = {item.experience_id: item for item in batch}
         atoms.extend(
@@ -1063,8 +1108,7 @@ def judge_candidate_pairs(
                 args=args,
                 generation_status=status,
             )
-            _append_jsonl(checkpoint_path, record)
-            existing[unit_id] = record
+            _store_unit_record(checkpoint_path, existing, record)
         assert payload is not None
         by_id = {str(item["pair_id"]): item for item in batch}
         for pair_id in sorted(by_id):
@@ -1339,8 +1383,7 @@ def audit_candidates(
                 args=args,
                 generation_status=status,
             )
-            _append_jsonl(checkpoint_path, record)
-            existing[unit_id] = record
+            _store_unit_record(checkpoint_path, existing, record)
         assert audit is not None
         audit_summaries.append(
             {

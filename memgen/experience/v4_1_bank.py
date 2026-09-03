@@ -534,29 +534,51 @@ def parse_v4_1_canonical_atom(
 ) -> V41CanonicalRepairAtom:
     if payload.get("schema_version") not in {None, V4_1_CANONICAL_ATOM_SCHEMA}:
         raise ValueError("Unexpected V4.1 canonical atom payload schema")
+    memory_role = payload.get("memory_role")
+    if signature.experience_type == "format_compliance":
+        # The verifier has already established that the numeric answer is
+        # correct and only its final representation failed.  This deterministic
+        # safety boundary is stronger than the teacher's redundant role fields.
+        memory_role = "answer_serialization"
+    state_scope = payload.get("state_scope")
+    mechanism_family = payload.get("mechanism_family")
+    repair_family = payload.get("repair_family")
+    applicability_family = payload.get("applicability_family")
+    exclusion_reason = payload.get("exclusion_reason")
+    if memory_role == "reasoning_process":
+        # ``exclusion_reason`` is metadata, not semantic evidence.  Providers
+        # commonly emit an empty string or explanatory text instead of JSON
+        # null.  Canonicalize it locally rather than rejecting and splitting a
+        # sound semantic batch.
+        exclusion_reason = None
+    elif memory_role == "answer_serialization":
+        state_scope = "answer_serialization"
+        mechanism_family = "output_representation"
+        repair_family = "canonicalize_final_answer"
+        applicability_family = "answer_serialization"
+        exclusion_reason = "answer serialization is outside the reasoning process bank"
+    elif memory_role == "unusable":
+        state_scope = "other"
+        mechanism_family = "other"
+        repair_family = "other"
+        applicability_family = "other"
+        exclusion_reason = "the signature does not ground one reusable reasoning transition"
     atom = V41CanonicalRepairAtom(
         experience_id=signature.experience_id,
         sample_id=signature.sample_id,
         source_experience_type=signature.experience_type,
-        memory_role=payload.get("memory_role"),
-        state_scope=payload.get("state_scope"),
-        mechanism_family=payload.get("mechanism_family"),
-        repair_family=payload.get("repair_family"),
-        applicability_family=payload.get("applicability_family"),
+        memory_role=memory_role,
+        state_scope=state_scope,
+        mechanism_family=mechanism_family,
+        repair_family=repair_family,
+        applicability_family=applicability_family,
         failure_transition=payload.get("failure_transition"),
         repair_action=payload.get("repair_action"),
         applicability_condition=payload.get("applicability_condition"),
         verification_action=payload.get("verification_action"),
         source_signature_sha256=signature.signature_sha256,
-        exclusion_reason=payload.get("exclusion_reason"),
+        exclusion_reason=exclusion_reason,
     )
-    if (
-        signature.experience_type == "format_compliance"
-        and atom.memory_role != "answer_serialization"
-    ):
-        raise ValueError(
-            "Verifier-authenticated format-compliance signatures must be quarantined"
-        )
     return atom
 
 

@@ -96,6 +96,12 @@ serialization-free 和 leakage-free。多 seed candidate 被拒绝后，只允�
 以较弱阈值强行合并。支持不足、audit 拒绝、serialization、unusable 与旧 signature non-applicable 五类都在
 `cluster_plan.json` 中显式归档，所有源 signature 必须恰好归入一个终态。
 
+`exclusion_reason` 和 excluded-role 的类别字段属于冗余控制元数据，不作为 repair 语义证据。不同兼容 API
+provider 可能对 reasoning atom 返回空字符串而非 JSON null，或给 excluded atom 返回 null。V4.1 parser 会在
+本地确定性规范化这些字段：reasoning 清空 exclusion reason，answer serialization 固定到专用隔离类别，
+unusable 固定到 `other` 类别；规范化字段列表写入 canonical checkpoint。failure transition、repair action、
+applicability、verification、受控角色和实例泄漏检查仍保持严格，不能通过规范化绕过。
+
 canonical、pair 和 audit API 单元分别追加到独立 JSONL checkpoint；`--resume` 只复用 prompt、teacher、输入
 和 payload hash 全部一致的单元。一个批次若反复返回截断或 schema 错误，会递归二分；仍失败的 singleton 被
 确定性归档，其他条目继续。HTTP 402/403、代理耗尽或网络错误仍失败关闭，但此前 checkpoint 保留。BGE 向量

@@ -27,6 +27,7 @@ from memgen.experience.v4_1_bank import (
     parse_v4_1_canonical_atom,
 )
 from scripts.build_v4_1_repair_bank import (
+    _parse_canonical_payload,
     audit_candidates,
     build_candidate_pairs,
     build_cluster_plan,
@@ -135,7 +136,7 @@ class V41BankTests(unittest.TestCase):
                 }
             )
 
-    def test_verified_format_compliance_cannot_be_relabelled_as_reasoning(self) -> None:
+    def test_verified_format_compliance_is_deterministically_quarantined(self) -> None:
         source = signature("format", experience_type="format_compliance")
         reasoning_payload = atom("format").to_dict()
         for field in (
@@ -146,8 +147,59 @@ class V41BankTests(unittest.TestCase):
             "schema_version",
         ):
             reasoning_payload.pop(field)
-        with self.assertRaisesRegex(ValueError, "format-compliance"):
-            parse_v4_1_canonical_atom(reasoning_payload, signature=source)
+        normalized = parse_v4_1_canonical_atom(reasoning_payload, signature=source)
+        self.assertEqual(normalized.memory_role, "answer_serialization")
+        self.assertEqual(normalized.state_scope, "answer_serialization")
+        self.assertEqual(normalized.mechanism_family, "output_representation")
+        self.assertIsNotNone(normalized.exclusion_reason)
+
+    def test_redundant_exclusion_metadata_is_normalized_without_weakening_semantics(self) -> None:
+        source = signature("reasoning")
+        payload = atom("reasoning").to_dict()
+        for field in (
+            "experience_id",
+            "sample_id",
+            "source_experience_type",
+            "source_signature_sha256",
+            "schema_version",
+        ):
+            payload.pop(field)
+        payload["exclusion_reason"] = "this field should have been null"
+        normalized = parse_v4_1_canonical_atom(payload, signature=source)
+        self.assertEqual(normalized.memory_role, "reasoning_process")
+        self.assertIsNone(normalized.exclusion_reason)
+
+        payload["memory_role"] = "unusable"
+        payload["exclusion_reason"] = None
+        unusable = parse_v4_1_canonical_atom(payload, signature=source)
+        self.assertEqual(unusable.memory_role, "unusable")
+        self.assertEqual(unusable.repair_family, "other")
+        self.assertIsNotNone(unusable.exclusion_reason)
+
+    def test_canonical_batch_parser_returns_auditable_normalized_payload(self) -> None:
+        source = signature("reasoning")
+        value = atom("reasoning").to_dict()
+        for field in (
+            "experience_id",
+            "sample_id",
+            "source_experience_type",
+            "source_signature_sha256",
+            "schema_version",
+        ):
+            value.pop(field)
+        value["exclusion_reason"] = "redundant provider explanation"
+        parsed = _parse_canonical_payload(
+            json.dumps(
+                {
+                    "schema_version": "memgen-v4.1-canonical-repair-batch-v1",
+                    "atoms": {source.experience_id: value},
+                }
+            ),
+            signatures=(source,),
+        )
+        normalized = parsed["atoms"][source.experience_id]
+        self.assertIsNone(normalized["exclusion_reason"])
+        self.assertIn("exclusion_reason", normalized["normalization_flags"])
 
     def test_exact_seed_can_cross_source_experience_types(self) -> None:
         atoms = (
