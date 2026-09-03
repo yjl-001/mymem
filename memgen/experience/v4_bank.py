@@ -48,9 +48,11 @@ V4_RECOVERY_LOW_TOKEN_COUNT = 2
 V4_MAX_ACTIVE_STEPS = 32
 
 V4_SIGNATURE_PROMPT_VERSION = "memgen-v4-repair-signature-deepseek-v1"
-V4_CLUSTER_PROMPT_VERSION = "memgen-v4-repair-cluster-deepseek-v1"
-V4_CARD_PROMPT_VERSION = "memgen-v4-process-card-deepseek-v1"
-V4_CARD_REVIEW_PROMPT_VERSION = "memgen-v4-process-card-review-deepseek-v1"
+V4_CLUSTER_PROMPT_VERSION = "memgen-v4-repair-cluster-deepseek-v2-map-reduce"
+V4_CARD_PROMPT_VERSION = "memgen-v4-process-card-deepseek-v2-bounded-evidence"
+V4_CARD_REVIEW_PROMPT_VERSION = (
+    "memgen-v4-process-card-review-deepseek-v2-bounded-evidence"
+)
 
 _IDENTIFIER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _INSTANCE_LITERAL_PATTERNS = {
@@ -501,6 +503,8 @@ def parse_v4_cluster_plan(
 
     if len(set(assigned)) != len(assigned):
         raise ValueError("An experience was assigned to multiple V4 clusters")
+    if set(assigned) & set(rejected_ids):
+        raise ValueError("A clustered V4 experience was also marked rejected")
     covered = set(assigned) | set(rejected_ids)
     if covered != applicable_ids:
         missing = sorted(applicable_ids - covered)
@@ -709,6 +713,7 @@ __all__ = [
     "parse_v4_cluster_plan",
     "parse_v4_process_card",
     "parse_v4_repair_signature",
+    "validate_v4_card_text",
     "v4_bank_id",
     "v4_card_leakage_reasons",
 ]

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from memgen.experience.phase1 import canonical_json_sha256, text_sha256
 from memgen.experience.v4_bank import (
@@ -20,9 +24,19 @@ from memgen.experience.v4_bank import (
     parse_v4_repair_signature,
 )
 from scripts.build_v4_repair_bank import (
+    CLUSTER_MAP_SCHEMA,
+    CLUSTER_REDUCE_SCHEMA,
+    _bounded_batches,
+    _merge_exact_prototypes,
     _rejected_signature_after_invalid_response,
+    _signature_sort_key,
     attach_official_solutions,
+    build_cluster_plan_map_reduce,
     cluster_messages,
+    cluster_reduce_messages,
+    finalize_cluster_payload,
+    parse_cluster_map_payload,
+    parse_cluster_reduce_payload,
     process_card_messages,
     repair_signature_messages,
 )
@@ -177,6 +191,9 @@ class V4BankContractTests(unittest.TestCase):
         self.assertEqual(rejected, ("experience-f",))
         payload["rejected_experience_ids"] = []
         with self.assertRaisesRegex(ValueError, "coverage mismatch"):
+            parse_v4_cluster_plan(payload, signatures=signatures)
+        payload["rejected_experience_ids"] = ["experience-a", "experience-f"]
+        with self.assertRaisesRegex(ValueError, "also marked rejected"):
             parse_v4_cluster_plan(payload, signatures=signatures)
         payload["schema_version"] = "wrong"
         with self.assertRaisesRegex(ValueError, "cluster-plan"):
@@ -346,6 +363,305 @@ class V4BankContractTests(unittest.TestCase):
         normalized_card_system = " ".join(card_prompt[0]["content"].split())
         self.assertIn("official solutions", normalized_card_system)
         self.assertIn("undesired process", normalized_card_system)
+
+    def test_cluster_map_reduce_expands_members_and_enforces_coverage(self) -> None:
+        signatures = tuple(signature(suffix) for suffix in "abcdef")
+        map_payload = {
+            "schema_version": CLUSTER_MAP_SCHEMA,
+            "clusters": [
+                {
+                    "title": "Preserve dependent updates",
+                    "failure_mechanism": "an intermediate state is discarded too early",
+                    "repair_operator": "carry each state into the next update",
+                    "scope_summary": "later changes depend on the preceding state",
+                    "member_experience_ids": [
+                        "experience-a",
+                        "experience-b",
+                        "experience-c",
+                    ],
+                },
+                {
+                    "title": "Preserve chained state",
+                    "failure_mechanism": "a dependent state is dropped before reuse",
+                    "repair_operator": "retain each state for the following update",
+                    "scope_summary": "successive changes consume updated state",
+                    "member_experience_ids": [
+                        "experience-d",
+                        "experience-e",
+                        "experience-f",
+                    ],
+                },
+            ],
+            "rejected_experience_ids": [],
+        }
+        prototypes, rejected = parse_cluster_map_payload(
+            map_payload,
+            signatures=signatures,
+            unit_id="map-fixture",
+        )
+        self.assertEqual(len(prototypes), 2)
+        self.assertEqual(rejected, ())
+        unsupported_payload = finalize_cluster_payload(
+            prototypes,
+            rejected_experience_ids=(),
+            signatures=signatures,
+        )
+        unsupported_clusters, unsupported_rejected = parse_v4_cluster_plan(
+            unsupported_payload,
+            signatures=signatures,
+        )
+        self.assertEqual(unsupported_clusters, ())
+        self.assertEqual(
+            set(unsupported_rejected),
+            {item.experience_id for item in signatures},
+        )
+
+        reduce_payload = {
+            "schema_version": CLUSTER_REDUCE_SCHEMA,
+            "clusters": [
+                {
+                    "title": "Preserve dependent state updates",
+                    "failure_mechanism": "an intermediate state is discarded too early",
+                    "repair_operator": "carry each state into the next update",
+                    "scope_summary": "later changes depend on the preceding state",
+                    "member_prototype_ids": [
+                        item["prototype_id"] for item in prototypes
+                    ],
+                }
+            ],
+            "rejected_prototype_ids": [],
+        }
+        merged, rejected_prototypes = parse_cluster_reduce_payload(
+            reduce_payload,
+            prototypes=prototypes,
+            unit_id="reduce-fixture",
+        )
+        self.assertEqual(rejected_prototypes, ())
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(len(merged[0]["member_experience_ids"]), 6)
+
+        final_payload = finalize_cluster_payload(
+            merged,
+            rejected_experience_ids=(),
+            signatures=signatures,
+        )
+        clusters, final_rejected = parse_v4_cluster_plan(
+            final_payload,
+            signatures=signatures,
+        )
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(len(clusters[0].representative_experience_ids), 6)
+        self.assertEqual(final_rejected, ())
+
+        map_payload["rejected_experience_ids"] = ["experience-a"]
+        with self.assertRaisesRegex(ValueError, "singleton prototypes"):
+            parse_cluster_map_payload(
+                map_payload,
+                signatures=signatures,
+                unit_id="map-overlap",
+            )
+
+    def test_cluster_requests_are_physically_bounded(self) -> None:
+        signatures = tuple(signature(f"item-{index}") for index in range(137))
+        batches = _bounded_batches(
+            signatures,
+            batch_size=48,
+            key=_signature_sort_key,
+        )
+        self.assertEqual(sum(len(batch) for batch in batches), len(signatures))
+        self.assertEqual([len(batch) for batch in batches], [48, 48, 41])
+        self.assertTrue(all(len(batch) <= 48 for batch in batches))
+        self.assertLess(len(cluster_messages(batches[0])[1]["content"]), 200_000)
+
+        map_payload = {
+            "schema_version": CLUSTER_MAP_SCHEMA,
+            "clusters": [
+                {
+                    "title": "Preserve dependent updates",
+                    "failure_mechanism": "an intermediate state is discarded too early",
+                    "repair_operator": "carry each state into the next update",
+                    "scope_summary": "later changes depend on the preceding state",
+                    "member_experience_ids": [
+                        item.experience_id for item in batches[0]
+                    ],
+                }
+            ],
+            "rejected_experience_ids": [],
+        }
+        prototypes, _ = parse_cluster_map_payload(
+            map_payload,
+            signatures=batches[0],
+            unit_id="bounded-map",
+        )
+        self.assertLess(
+            len(cluster_reduce_messages(prototypes)[1]["content"]),
+            200_000,
+        )
+
+    def test_process_card_prompt_uses_only_bounded_representatives(self) -> None:
+        signatures = tuple(signature(suffix) for suffix in "abcdef")
+        value = V4RepairCluster(
+            cluster_key="bounded-evidence",
+            title="Preserve dependent state updates",
+            experience_type="answer_correctness",
+            failure_mechanism="an intermediate state is discarded too early",
+            repair_operator="carry each state into the next update",
+            scope_summary="later changes depend on the preceding state",
+            member_experience_ids=tuple(item.experience_id for item in signatures),
+            representative_experience_ids=tuple(
+                item.experience_id for item in signatures[:5]
+            ),
+        )
+        examples_by_id = {
+            item.experience_id: {
+                "experience_id": item.experience_id,
+                "sample_id": item.sample_id,
+                "question": "question text",
+                "official_solution": "official solution",
+                "verified_success_trajectory": "successful process",
+                "verified_failure_trajectory": "failed process",
+                "reference_verifier": {"reward": 0.0},
+            }
+            for item in signatures
+        }
+        messages = process_card_messages(
+            value,
+            signatures_by_id={item.experience_id: item for item in signatures},
+            examples_by_id=examples_by_id,
+        )
+        self.assertIn("experience-e", messages[1]["content"])
+        self.assertNotIn("experience-f", messages[1]["content"])
+        self.assertIn('\"support_count\": 6', messages[1]["content"])
+
+    def test_map_reduce_checkpoints_resume_without_reissuing_requests(self) -> None:
+        signatures = tuple(signature(suffix) for suffix in "abcdef")
+
+        def map_payload(member_ids: list[str]) -> dict:
+            return {
+                "schema_version": CLUSTER_MAP_SCHEMA,
+                "clusters": [
+                    {
+                        "title": "Preserve dependent updates",
+                        "failure_mechanism": (
+                            "an intermediate state is discarded too early"
+                        ),
+                        "repair_operator": "carry each state into the next update",
+                        "scope_summary": "later changes depend on the preceding state",
+                        "member_experience_ids": member_ids,
+                    }
+                ],
+                "rejected_experience_ids": [],
+            }
+
+        class FakeClusterClient:
+            def __init__(self, responses: list[dict]):
+                self.responses = list(responses)
+                self.call_count = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def call(self, _messages, *, response_parser, **_kwargs):
+                self.call_count += 1
+                return response_parser(
+                    json.dumps(self.responses.pop(0), sort_keys=True)
+                )
+
+        args = SimpleNamespace(
+            cluster_map_batch_size=3,
+            cluster_reduce_batch_size=10,
+            cluster_max_tokens=8000,
+            resume=False,
+            model="deepseek-v4-flash",
+            base_url="https://api.example.test",
+            temperature=0.0,
+            thinking="disabled",
+        )
+        first_map_payload = map_payload(
+            ["experience-a", "experience-b", "experience-c"]
+        )
+        second_map_payload = map_payload(
+            ["experience-d", "experience-e", "experience-f"]
+        )
+        second_map_payload["clusters"][0].update(
+            {
+                "title": "Preserve chained state",
+                "failure_mechanism": "a dependent state is dropped before reuse",
+                "repair_operator": "retain each state for the following update",
+                "scope_summary": "successive changes consume updated state",
+            }
+        )
+        first_prototype = parse_cluster_map_payload(
+            first_map_payload,
+            signatures=signatures[:3],
+            unit_id="map-answer_correctness-00000",
+        )[0][0]
+        second_prototype = parse_cluster_map_payload(
+            second_map_payload,
+            signatures=signatures[3:],
+            unit_id="map-answer_correctness-00001",
+        )[0][0]
+        post_map_prototypes = _merge_exact_prototypes(
+            [first_prototype, second_prototype],
+            unit_id="post-map",
+        )
+        reduce_payload = {
+            "schema_version": CLUSTER_REDUCE_SCHEMA,
+            "clusters": [
+                {
+                    "title": "Preserve dependent state updates",
+                    "failure_mechanism": "an intermediate state is discarded too early",
+                    "repair_operator": "carry each state into the next update",
+                    "scope_summary": "later changes depend on the preceding state",
+                    "member_prototype_ids": [
+                        item["prototype_id"] for item in post_map_prototypes
+                    ],
+                }
+            ],
+            "rejected_prototype_ids": [],
+        }
+        first_client = FakeClusterClient(
+            [first_map_payload, second_map_payload, reduce_payload]
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            map_path = Path(temp_dir) / "cluster_map_shards.jsonl"
+            reduce_path = Path(temp_dir) / "cluster_reduce_batches.jsonl"
+            with patch(
+                "scripts.build_v4_repair_bank._client",
+                return_value=first_client,
+            ):
+                first_payload, first_diagnostics = build_cluster_plan_map_reduce(
+                    signatures,
+                    args=args,
+                    api_key="fixture-key",
+                    map_checkpoint_path=map_path,
+                    reduce_checkpoint_path=reduce_path,
+                )
+            self.assertEqual(first_client.call_count, 3)
+            self.assertEqual(first_diagnostics["new_map_request_count"], 2)
+            self.assertEqual(first_diagnostics["new_reduce_request_count"], 1)
+            self.assertEqual(len(first_payload["clusters"]), 1)
+
+            args.resume = True
+            resumed_client = FakeClusterClient([])
+            with patch(
+                "scripts.build_v4_repair_bank._client",
+                return_value=resumed_client,
+            ):
+                resumed_payload, resumed_diagnostics = build_cluster_plan_map_reduce(
+                    signatures,
+                    args=args,
+                    api_key="fixture-key",
+                    map_checkpoint_path=map_path,
+                    reduce_checkpoint_path=reduce_path,
+                )
+            self.assertEqual(resumed_client.call_count, 0)
+            self.assertEqual(resumed_diagnostics["new_map_request_count"], 0)
+            self.assertEqual(resumed_diagnostics["new_reduce_request_count"], 0)
+            self.assertEqual(resumed_payload, first_payload)
 
 
 if __name__ == "__main__":

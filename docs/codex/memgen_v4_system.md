@@ -20,7 +20,8 @@ V4 当前只研究 GSM8K，固定：
 
 raw verifier-backed bank-source pairs + official GSM8K solution
   └─ DeepSeek V4 Flash：逐 pair 抽象 repair signature
-       └─ 按 failure mechanism + repair operator 聚类
+       └─ 有界 map shards：按 failure mechanism + repair operator 产生局部簇
+            └─ 有界 reduce rounds：只归并局部簇摘要并在本地展开完整 membership
             ├─ 至少五个独立 construction problem
             ├─ target process card：official solution + verified success
             └─ reference process card：paired verified failure
@@ -59,7 +60,7 @@ model、base URL、prompt version、construction input hash 与输出 hash，但
 独立调用：
 
 1. 每个 contrast pair 抽象一个 instance-free repair signature；
-2. 全局按 `failure_mechanism + repair_operator` 聚类；
+2. 通过有界 map-reduce 全局按 `failure_mechanism + repair_operator` 聚类；
 3. 每个 cluster 合成 target/reference process card；
 4. 对已经生成的 card 做只审核、不改写的 semantic review。
 
@@ -70,9 +71,28 @@ signature。网络故障、代理重试耗尽、鉴权、余额或不可重试 H
 `repair_signatures.jsonl` 的 `generation_status` 区分正常教师输出与受控拒绝，最终 manifest 的
 `teacher_invalid_signature_ids` 汇总后者。
 
-cluster 不按题目故事、对象或宽泛数学主题划分。一个正式 runtime bank 至少含五个不同 sample ID；DeepSeek
-从中选择五到十个独立 representative examples 覆盖结构变化。少于五个、机制混杂、无法落到单一 repair
-operator 的组被拒绝，不通过合并弱相关 singleton 凑数。
+聚类不再把全部 signature 塞入一个 API 请求。map 默认按 `experience_type` 隔离、语义排序后每批最多四十八
+条；每个 shard 必须精确覆盖本批输入，但局部簇可以少于五条，避免为了过早满足 runtime support 而误合并。
+map/reduce 都必须把暂时无法匹配的输入保留成 singleton，禁止因它在当前物理 batch 内缺少近邻就提前拒绝；
+只有完成全局摘要归并后仍不足五个独立 construction problems 的最终簇才进入 rejected 集合。
+reduce 请求只携带局部簇的 process 摘要和 support count，不携带展开后的成员，默认每批最多四十八个
+prototype；每轮在本地递归展开 membership，再做下一轮摘要归并，直到每个 `experience_type` 都完成一次
+全局有界归并。任何一次 map/reduce 都必须完整、不重叠地覆盖输入，否则拒绝响应并定向重试。若在冻结轮数
+内无法达到全局归并条件，构造失败关闭，不把局部结果冒充全局 bank。
+
+map/reduce 分别逐请求写入 `cluster_map_shards.jsonl` 与 `cluster_reduce_batches.jsonl`；记录绑定模型、URL、
+prompt version、输入 hash、输出 hash 和自身 record hash，`--resume` 可从失败单元继续。每个请求还设有二十万
+字符的本地硬上限，超过时在发往 API 前失败并提示缩小 batch，避免再次由网关以不透明的 HTTP 状态拒绝。
+最终 `cluster_plan.json` 仍由原有严格 parser 检查所有 applicable signature 的完整覆盖。
+runner 可通过 `MEMGEN_V4_CLUSTER_MAP_BATCH_SIZE` 与
+`MEMGEN_V4_CLUSTER_REDUCE_BATCH_SIZE` 显式缩小默认 batch；改变 batch size 会改变 clustering profile，已有
+不匹配的 map/reduce 单元不会被错误复用。
+
+cluster 不按题目故事、对象或宽泛数学主题划分。一个正式 runtime bank 至少含五个不同 sample ID。本地使用
+signature process 字段的最大最小词集距离，从每个最终簇确定性选择五到十个 representative examples，覆盖
+结构变化且避免把全部成员重新放进 card 请求。少于五个、机制混杂、无法落到单一 repair operator 的组被
+拒绝，不通过合并弱相关 singleton 凑数。card synthesis 与独立 review 只接收这批 representatives 的
+signatures 和 construction evidence，同时保留最终簇的总 support count。
 
 所有 signature/card 字段必须是 process-only 文本，确定性检查禁止数字、boxed answer、分式、显式方程和
 GSM8K answer marker。target 卡只保留适用范围、诊断、修复动作、验证和禁用边界；reference 卡只描述重复
@@ -157,6 +177,8 @@ direct side-KV 卸载后，过去 token 已形成的 model cache 仍然保留其
 OUTPUT_ROOT/
   offline/construction/
     repair_signatures.jsonl
+    cluster_map_shards.jsonl
+    cluster_reduce_batches.jsonl
     cluster_plan.json
     process_cards.jsonl
     card_reviews.jsonl

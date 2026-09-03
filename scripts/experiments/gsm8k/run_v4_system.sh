@@ -56,7 +56,16 @@ RISK_ARTIFACT="${POSITIONAL[2]}"
 OUTPUT_ROOT="${POSITIONAL[3]}"
 DEVICE="${MEMGEN_V4_DEVICE:-cuda}"
 DTYPE="${MEMGEN_V4_DTYPE:-bfloat16}"
+CLUSTER_MAP_BATCH_SIZE="${MEMGEN_V4_CLUSTER_MAP_BATCH_SIZE:-48}"
+CLUSTER_REDUCE_BATCH_SIZE="${MEMGEN_V4_CLUSTER_REDUCE_BATCH_SIZE:-48}"
 export CUDA_VISIBLE_DEVICES="${MEMGEN_V4_CUDA_VISIBLE_DEVICES:-0}"
+
+for VALUE in "$CLUSTER_MAP_BATCH_SIZE" "$CLUSTER_REDUCE_BATCH_SIZE"; do
+  if ! [[ "$VALUE" =~ ^[1-9][0-9]*$ ]]; then
+    echo "V4 cluster batch sizes must be positive integers" >&2
+    exit 2
+  fi
+done
 
 SPLIT_MANIFEST="$PHASE1_DIR/split_manifest.json"
 EXPERIENCES="$PHASE1_DIR/verified_experiences.jsonl"
@@ -90,6 +99,8 @@ if [[ "$STAGE" == "construct" || "$STAGE" == "offline" || "$STAGE" == "all" ]]; 
     --split-manifest "$SPLIT_MANIFEST" \
     --output-dir "$CONSTRUCTION_DIR" \
     --dataset-revision main \
+    --cluster-map-batch-size "$CLUSTER_MAP_BATCH_SIZE" \
+    --cluster-reduce-batch-size "$CLUSTER_REDUCE_BATCH_SIZE" \
     "${RESUME_ARGS[@]}"
 fi
 

@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Any, Iterable, Mapping, Sequence
@@ -59,6 +60,7 @@ from memgen.experience.v4_bank import (
     parse_v4_cluster_plan,
     parse_v4_process_card,
     parse_v4_repair_signature,
+    validate_v4_card_text,
 )
 from scripts.build_teacher_bank import TeacherClient, TeacherInvalidResponseError
 
@@ -66,6 +68,13 @@ from scripts.build_teacher_bank import TeacherClient, TeacherInvalidResponseErro
 SIGNATURE_RECORD_SCHEMA = "memgen-v4-repair-signature-record-v1"
 CARD_RECORD_SCHEMA = "memgen-v4-process-card-record-v1"
 REVIEW_RECORD_SCHEMA = "memgen-v4-process-card-review-record-v1"
+CLUSTER_MAP_SCHEMA = "memgen-v4-repair-cluster-map-v1"
+CLUSTER_REDUCE_SCHEMA = "memgen-v4-repair-cluster-reduce-v1"
+CLUSTER_UNIT_RECORD_SCHEMA = "memgen-v4-repair-cluster-unit-record-v1"
+DEFAULT_CLUSTER_MAP_BATCH_SIZE = 48
+DEFAULT_CLUSTER_REDUCE_BATCH_SIZE = 48
+MAX_CLUSTER_REQUEST_CHARACTERS = 200_000
+MAX_CLUSTER_REDUCE_ROUNDS = 8
 
 
 def utc_now() -> str:
@@ -116,6 +125,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--signature-max-tokens", type=int, default=900)
     parser.add_argument("--cluster-max-tokens", type=int, default=8000)
+    parser.add_argument(
+        "--cluster-map-batch-size",
+        type=int,
+        default=DEFAULT_CLUSTER_MAP_BATCH_SIZE,
+    )
+    parser.add_argument(
+        "--cluster-reduce-batch-size",
+        type=int,
+        default=DEFAULT_CLUSTER_REDUCE_BATCH_SIZE,
+    )
     parser.add_argument("--card-max-tokens", type=int, default=2200)
     parser.add_argument("--review-max-tokens", type=int, default=1400)
     parser.add_argument("--retries", type=int, default=3)
@@ -341,40 +360,525 @@ rejected."""
 
 def cluster_messages(signatures: Sequence[V4RepairSignature]) -> list[dict[str, str]]:
     eligible = [item.to_dict() for item in signatures if item.applicable]
-    system = """You are the offline repair-cluster curator for MemGen V4.
-Return JSON only. Group repair signatures by the conjunction of failure
-mechanism and repair operator. Surface story, object names, and broad GSM8K
-topic are metadata, not cluster keys.
+    system = """You are the bounded map step of the offline repair-cluster
+curator for MemGen V4. Return JSON only. Group the supplied repair signatures
+by the conjunction of failure mechanism and repair operator. Surface story,
+object names, and broad GSM8K topic are metadata, not cluster keys.
 
-Do not mix experience_type values. Every admitted runtime cluster must contain
-at least five distinct experience IDs. Select between five and ten
-representatives per cluster, covering the cluster's structural variation.
-Assign every supplied experience exactly once: either to one admitted cluster
-or to rejected_experience_ids. Reject diffuse or ambiguous groups rather than
-creating singleton memories. Cluster titles and descriptions must contain no
-digits, equations, answer fragments, or instance-specific details. cluster_key
-must use lowercase ASCII letters plus hyphen or underscore."""
-    user = f"""Repair signatures:
+This is a provisional shard, not final runtime-bank admission. A provisional
+cluster may contain one or more signatures; preserve an unmatched signature as
+a singleton instead of rejecting it or merging weakly related items. Do not
+mix experience_type values. Assign every supplied experience exactly once to
+one provisional cluster. rejected_experience_ids must be empty. Titles and
+descriptions must contain no digits, equations, answer fragments, or
+instance-specific details."""
+    user = f"""Repair-signature shard:
 {json.dumps(eligible, ensure_ascii=False, sort_keys=True)}
 
 Return exactly:
 {{
-  "schema_version": "{V4_CLUSTER_PLAN_SCHEMA}",
+  "schema_version": "{CLUSTER_MAP_SCHEMA}",
   "clusters": [
     {{
-      "cluster_key": "canonical-key",
       "title": "brief reusable title",
       "failure_mechanism": "shared grounded mechanism",
       "repair_operator": "shared corrective operator",
       "scope_summary": "when the repair is applicable",
-      "member_experience_ids": ["..."],
-      "representative_experience_ids": ["..."]
+      "member_experience_ids": ["..."]
     }}
   ],
-  "rejected_experience_ids": ["..."],
-  "rejection_notes": {{"experience-id": "brief reason"}}
+  "rejected_experience_ids": ["..."]
 }}"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def cluster_reduce_messages(
+    prototypes: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    compact = [
+        {
+            "prototype_id": item["prototype_id"],
+            "experience_type": item["experience_type"],
+            "title": item["title"],
+            "failure_mechanism": item["failure_mechanism"],
+            "repair_operator": item["repair_operator"],
+            "scope_summary": item["scope_summary"],
+            "support_count": len(item["member_experience_ids"]),
+        }
+        for item in prototypes
+    ]
+    system = """You are the bounded reduce step of the offline repair-cluster
+curator for MemGen V4. Return JSON only. Merge provisional prototypes exactly
+when they express the same failure mechanism and the same repair operator.
+Surface topic or vaguely similar arithmetic is insufficient. Never merge
+prototypes merely to reach a minimum support count, and never mix
+experience_type values.
+
+Assign every supplied prototype exactly once to one merged cluster. Preserve
+an unmatched prototype as a singleton; rejected_prototype_ids must be empty.
+Preserve grounded distinctions. Titles and descriptions must contain no
+digits, equations, answer fragments, or instance-specific details."""
+    user = f"""Provisional repair-cluster summaries:
+{json.dumps(compact, ensure_ascii=False, sort_keys=True)}
+
+Return exactly:
+{{
+  "schema_version": "{CLUSTER_REDUCE_SCHEMA}",
+  "clusters": [
+    {{
+      "title": "brief reusable title",
+      "failure_mechanism": "shared grounded mechanism",
+      "repair_operator": "shared corrective operator",
+      "scope_summary": "when the repair is applicable",
+      "member_prototype_ids": ["..."]
+    }}
+  ],
+  "rejected_prototype_ids": ["..."]
+}}"""
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _nonempty_string(owner: str, value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{owner} must be a non-empty string")
+    return value.strip()
+
+
+def _unique_string_list(
+    owner: str, value: Any, *, allow_empty: bool = False
+) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"{owner} must be an array")
+    result = tuple(
+        _nonempty_string(f"{owner}[]", item)
+        for item in value
+    )
+    if not allow_empty and not result:
+        raise ValueError(f"{owner} must not be empty")
+    if len(set(result)) != len(result):
+        raise ValueError(f"{owner} contains duplicates")
+    return result
+
+
+def _cluster_summary(raw: Mapping[str, Any], *, owner: str) -> dict[str, str]:
+    return {
+        field: validate_v4_card_text(f"{owner}.{field}", raw.get(field))
+        for field in (
+            "title",
+            "failure_mechanism",
+            "repair_operator",
+            "scope_summary",
+        )
+    }
+
+
+def _make_prototype(
+    *,
+    stage: str,
+    unit_id: str,
+    index: int,
+    experience_type: str,
+    summary: Mapping[str, str],
+    member_experience_ids: Sequence[str],
+) -> dict[str, Any]:
+    members = tuple(sorted(member_experience_ids))
+    logical = {
+        "stage": stage,
+        "unit_id": unit_id,
+        "index": index,
+        "experience_type": experience_type,
+        "summary": dict(summary),
+        "member_experience_ids": list(members),
+    }
+    return {
+        "prototype_id": f"prototype-{canonical_json_sha256(logical)[:20]}",
+        "experience_type": experience_type,
+        **summary,
+        "member_experience_ids": members,
+    }
+
+
+def parse_cluster_map_payload(
+    payload: Mapping[str, Any],
+    *,
+    signatures: Sequence[V4RepairSignature],
+    unit_id: str,
+) -> tuple[tuple[dict[str, Any], ...], tuple[str, ...]]:
+    """Validate exact bounded-shard coverage and construct local prototypes."""
+
+    if payload.get("schema_version") != CLUSTER_MAP_SCHEMA:
+        raise ValueError("Unexpected V4 cluster-map payload schema")
+    raw_clusters = payload.get("clusters")
+    if not isinstance(raw_clusters, list):
+        raise ValueError("V4 cluster-map payload is missing clusters")
+    rejected = _unique_string_list(
+        "rejected_experience_ids",
+        payload.get("rejected_experience_ids"),
+        allow_empty=True,
+    )
+    if rejected:
+        raise ValueError(
+            "V4 cluster-map must preserve unmatched signatures as singleton prototypes"
+        )
+    signature_by_id = {item.experience_id: item for item in signatures}
+    if len(signature_by_id) != len(signatures):
+        raise ValueError("V4 cluster-map input contains duplicate signatures")
+    expected_ids = set(signature_by_id)
+    if any(not item.applicable for item in signatures):
+        raise ValueError("V4 cluster-map input must contain applicable signatures only")
+
+    prototypes: list[dict[str, Any]] = []
+    assigned: list[str] = []
+    for index, raw in enumerate(raw_clusters):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"clusters[{index}] must be an object")
+        members = _unique_string_list(
+            f"clusters[{index}].member_experience_ids",
+            raw.get("member_experience_ids"),
+        )
+        unknown = set(members) - expected_ids
+        if unknown:
+            raise ValueError(
+                "V4 cluster-map contains unknown IDs: "
+                f"count={len(unknown)} first={sorted(unknown)[:3]}"
+            )
+        experience_types = {
+            signature_by_id[experience_id].experience_type
+            for experience_id in members
+        }
+        if len(experience_types) != 1:
+            raise ValueError("V4 cluster-map cluster mixes experience types")
+        prototypes.append(
+            _make_prototype(
+                stage="map",
+                unit_id=unit_id,
+                index=index,
+                experience_type=next(iter(experience_types)),
+                summary=_cluster_summary(raw, owner=f"clusters[{index}]"),
+                member_experience_ids=members,
+            )
+        )
+        assigned.extend(members)
+
+    if len(set(assigned)) != len(assigned):
+        raise ValueError("V4 cluster-map assigned an experience more than once")
+    covered = set(assigned) | set(rejected)
+    if set(assigned) & set(rejected) or covered != expected_ids:
+        missing = expected_ids - covered
+        extra = covered - expected_ids
+        raise ValueError(
+            "V4 cluster-map coverage mismatch: "
+            f"missing_count={len(missing)} extra_count={len(extra)}"
+        )
+    return tuple(prototypes), rejected
+
+
+def parse_cluster_reduce_payload(
+    payload: Mapping[str, Any],
+    *,
+    prototypes: Sequence[Mapping[str, Any]],
+    unit_id: str,
+) -> tuple[tuple[dict[str, Any], ...], tuple[str, ...]]:
+    """Validate prototype coverage and expand merged transitive memberships."""
+
+    if payload.get("schema_version") != CLUSTER_REDUCE_SCHEMA:
+        raise ValueError("Unexpected V4 cluster-reduce payload schema")
+    raw_clusters = payload.get("clusters")
+    if not isinstance(raw_clusters, list):
+        raise ValueError("V4 cluster-reduce payload is missing clusters")
+    rejected = _unique_string_list(
+        "rejected_prototype_ids",
+        payload.get("rejected_prototype_ids"),
+        allow_empty=True,
+    )
+    if rejected:
+        raise ValueError(
+            "V4 cluster-reduce must preserve unmatched prototype singletons"
+        )
+    prototype_by_id = {
+        str(item["prototype_id"]): item
+        for item in prototypes
+    }
+    if len(prototype_by_id) != len(prototypes):
+        raise ValueError("V4 cluster-reduce input contains duplicate prototype IDs")
+    expected_ids = set(prototype_by_id)
+    input_members = [
+        str(experience_id)
+        for prototype in prototypes
+        for experience_id in prototype["member_experience_ids"]
+    ]
+    if len(set(input_members)) != len(input_members):
+        raise ValueError("V4 cluster-reduce input has overlapping memberships")
+
+    merged: list[dict[str, Any]] = []
+    assigned: list[str] = []
+    expanded_members: list[str] = []
+    for index, raw in enumerate(raw_clusters):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"clusters[{index}] must be an object")
+        prototype_ids = _unique_string_list(
+            f"clusters[{index}].member_prototype_ids",
+            raw.get("member_prototype_ids"),
+        )
+        unknown = set(prototype_ids) - expected_ids
+        if unknown:
+            raise ValueError(
+                "V4 cluster-reduce contains unknown prototype IDs: "
+                f"count={len(unknown)} first={sorted(unknown)[:3]}"
+            )
+        experience_types = {
+            str(prototype_by_id[prototype_id]["experience_type"])
+            for prototype_id in prototype_ids
+        }
+        if len(experience_types) != 1:
+            raise ValueError("V4 cluster-reduce cluster mixes experience types")
+        members = sorted(
+            {
+                str(experience_id)
+                for prototype_id in prototype_ids
+                for experience_id in prototype_by_id[prototype_id][
+                    "member_experience_ids"
+                ]
+            }
+        )
+        merged.append(
+            _make_prototype(
+                stage="reduce",
+                unit_id=unit_id,
+                index=index,
+                experience_type=next(iter(experience_types)),
+                summary=_cluster_summary(raw, owner=f"clusters[{index}]"),
+                member_experience_ids=members,
+            )
+        )
+        assigned.extend(prototype_ids)
+        expanded_members.extend(members)
+
+    if len(set(assigned)) != len(assigned):
+        raise ValueError("V4 cluster-reduce assigned a prototype more than once")
+    if len(set(expanded_members)) != len(expanded_members):
+        raise ValueError("V4 cluster-reduce produced overlapping experience memberships")
+    covered = set(assigned) | set(rejected)
+    if set(assigned) & set(rejected) or covered != expected_ids:
+        missing = expected_ids - covered
+        extra = covered - expected_ids
+        raise ValueError(
+            "V4 cluster-reduce coverage mismatch: "
+            f"missing_count={len(missing)} extra_count={len(extra)}"
+        )
+    return tuple(merged), rejected
+
+
+def _semantic_sort_key(item: Mapping[str, Any]) -> tuple[str, ...]:
+    def normalize(value: Any) -> str:
+        return " ".join(str(value).lower().split())
+
+    return (
+        str(item["experience_type"]),
+        normalize(item["repair_operator"]),
+        normalize(item["failure_mechanism"]),
+        normalize(item.get("scope_summary", item.get("problem_structure", ""))),
+        str(item.get("prototype_id", item.get("experience_id", ""))),
+    )
+
+
+def _bounded_batches(
+    values: Sequence[Any],
+    *,
+    batch_size: int,
+    key: Any,
+) -> tuple[tuple[Any, ...], ...]:
+    if batch_size <= 0:
+        raise ValueError("V4 cluster batch size must be positive")
+    by_type: dict[str, list[Any]] = {}
+    for value in values:
+        experience_type = (
+            value.experience_type
+            if isinstance(value, V4RepairSignature)
+            else value["experience_type"]
+        )
+        by_type.setdefault(str(experience_type), []).append(value)
+    batches: list[tuple[Any, ...]] = []
+    for experience_type in sorted(by_type):
+        ordered = sorted(by_type[experience_type], key=key)
+        batches.extend(
+            tuple(ordered[start : start + batch_size])
+            for start in range(0, len(ordered), batch_size)
+        )
+    return tuple(batches)
+
+
+def _signature_sort_key(item: V4RepairSignature) -> tuple[str, ...]:
+    return _semantic_sort_key(item.to_dict())
+
+
+def _normalized_summary_key(item: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        " ".join(str(item[field]).lower().split())
+        for field in (
+            "experience_type",
+            "failure_mechanism",
+            "repair_operator",
+        )
+    )
+
+
+def _merge_exact_prototypes(
+    prototypes: Sequence[Mapping[str, Any]], *, unit_id: str
+) -> tuple[dict[str, Any], ...]:
+    groups: dict[tuple[str, ...], list[Mapping[str, Any]]] = {}
+    for prototype in prototypes:
+        groups.setdefault(_normalized_summary_key(prototype), []).append(prototype)
+    result: list[dict[str, Any]] = []
+    for index, key in enumerate(sorted(groups)):
+        group = groups[key]
+        first = min(group, key=lambda item: str(item["prototype_id"]))
+        members = sorted(
+            {
+                str(experience_id)
+                for item in group
+                for experience_id in item["member_experience_ids"]
+            }
+        )
+        result.append(
+            _make_prototype(
+                stage="exact",
+                unit_id=unit_id,
+                index=index,
+                experience_type=str(first["experience_type"]),
+                summary={
+                    field: str(first[field])
+                    for field in (
+                        "title",
+                        "failure_mechanism",
+                        "repair_operator",
+                        "scope_summary",
+                    )
+                },
+                member_experience_ids=members,
+            )
+        )
+    return tuple(result)
+
+
+def _signature_tokens(signature: V4RepairSignature) -> frozenset[str]:
+    return frozenset(
+        re.findall(
+            r"[a-z]+",
+            " ".join(
+                (
+                    signature.problem_structure,
+                    signature.decision_point,
+                    signature.failure_mechanism,
+                    signature.repair_operator,
+                )
+            ).lower(),
+        )
+    )
+
+
+def _diverse_representatives(
+    member_ids: Sequence[str],
+    *,
+    signatures_by_id: Mapping[str, V4RepairSignature],
+) -> tuple[str, ...]:
+    candidates = sorted(member_ids)
+    limit = min(V4_MAX_CONSTRUCTION_EXAMPLES, len(candidates))
+    token_sets = {
+        experience_id: _signature_tokens(signatures_by_id[experience_id])
+        for experience_id in candidates
+    }
+    selected = [candidates[0]]
+    while len(selected) < limit:
+        remaining = [item for item in candidates if item not in selected]
+
+        def minimum_distance(experience_id: str) -> float:
+            distances = []
+            for selected_id in selected:
+                union = token_sets[experience_id] | token_sets[selected_id]
+                overlap = token_sets[experience_id] & token_sets[selected_id]
+                distances.append(1.0 - (len(overlap) / len(union) if union else 1.0))
+            return min(distances)
+
+        selected.append(
+            min(
+                remaining,
+                key=lambda experience_id: (
+                    -minimum_distance(experience_id),
+                    experience_id,
+                ),
+            )
+        )
+    return tuple(selected)
+
+
+def finalize_cluster_payload(
+    prototypes: Sequence[Mapping[str, Any]],
+    *,
+    rejected_experience_ids: Sequence[str],
+    signatures: Sequence[V4RepairSignature],
+) -> dict[str, Any]:
+    """Expand prototypes locally and enforce formal five-problem admission."""
+
+    signatures_by_id = {item.experience_id: item for item in signatures}
+    applicable_ids = {
+        item.experience_id for item in signatures if item.applicable
+    }
+    rejected = set(rejected_experience_ids)
+    final_clusters: list[dict[str, Any]] = []
+    cluster_keys: set[str] = set()
+    for prototype in _merge_exact_prototypes(prototypes, unit_id="final"):
+        members = tuple(sorted(str(item) for item in prototype["member_experience_ids"]))
+        distinct_samples = {
+            signatures_by_id[experience_id].sample_id
+            for experience_id in members
+        }
+        if len(distinct_samples) < V4_MIN_CONSTRUCTION_EXAMPLES:
+            rejected.update(members)
+            continue
+        cluster_digest = canonical_json_sha256(
+            {
+                "experience_type": prototype["experience_type"],
+                "failure_mechanism": prototype["failure_mechanism"],
+                "repair_operator": prototype["repair_operator"],
+                "members": list(members),
+            }
+        )
+        cluster_key = f"repair-{cluster_digest[:20]}"
+        if cluster_key in cluster_keys:
+            raise ValueError("V4 deterministic final cluster-key collision")
+        cluster_keys.add(cluster_key)
+        final_clusters.append(
+            {
+                "cluster_key": cluster_key,
+                "title": prototype["title"],
+                "failure_mechanism": prototype["failure_mechanism"],
+                "repair_operator": prototype["repair_operator"],
+                "scope_summary": prototype["scope_summary"],
+                "member_experience_ids": list(members),
+                "representative_experience_ids": list(
+                    _diverse_representatives(
+                        members,
+                        signatures_by_id=signatures_by_id,
+                    )
+                ),
+            }
+        )
+    assigned = {
+        experience_id
+        for cluster in final_clusters
+        for experience_id in cluster["member_experience_ids"]
+    }
+    missing = applicable_ids - assigned - rejected
+    if missing:
+        raise ValueError(
+            f"V4 map-reduce finalization lost {len(missing)} applicable signatures"
+        )
+    return {
+        "schema_version": V4_CLUSTER_PLAN_SCHEMA,
+        "clusters": sorted(final_clusters, key=lambda item: item["cluster_key"]),
+        "rejected_experience_ids": sorted(rejected),
+    }
 
 
 def _representative_evidence(
@@ -403,6 +907,21 @@ def _representative_evidence(
     return result
 
 
+def _bounded_cluster_description(cluster: V4RepairCluster) -> dict[str, Any]:
+    return {
+        "cluster_key": cluster.cluster_key,
+        "title": cluster.title,
+        "experience_type": cluster.experience_type,
+        "failure_mechanism": cluster.failure_mechanism,
+        "repair_operator": cluster.repair_operator,
+        "scope_summary": cluster.scope_summary,
+        "support_count": len(cluster.member_experience_ids),
+        "representative_experience_ids": list(
+            cluster.representative_experience_ids
+        ),
+    }
+
+
 def process_card_messages(
     cluster: V4RepairCluster,
     *,
@@ -411,7 +930,7 @@ def process_card_messages(
 ) -> list[dict[str, str]]:
     signatures = [
         signatures_by_id[experience_id].to_dict()
-        for experience_id in cluster.member_experience_ids
+        for experience_id in cluster.representative_experience_ids
     ]
     evidence = _representative_evidence(cluster, examples_by_id=examples_by_id)
     system = """You are the offline process-card synthesizer for MemGen V4.
@@ -426,10 +945,10 @@ question text, names, story details, answers, numbers, equations, constants,
 source-specific formulas, and solution-order traces. Every output text field
 must contain no digits. Keep method selection, corrective action, applicability
 boundaries, and verification. Do not combine multiple unrelated repairs."""
-    user = f"""Frozen cluster:
-{json.dumps(cluster.to_dict(), ensure_ascii=False, sort_keys=True)}
+    user = f"""Frozen cluster summary:
+{json.dumps(_bounded_cluster_description(cluster), ensure_ascii=False, sort_keys=True)}
 
-All member signatures:
+Representative signatures:
 {json.dumps(signatures, ensure_ascii=False, sort_keys=True)}
 
 Representative construction evidence:
@@ -465,7 +984,7 @@ def card_review_messages(
 ) -> list[dict[str, str]]:
     signatures = [
         signatures_by_id[experience_id].to_dict()
-        for experience_id in cluster.member_experience_ids
+        for experience_id in cluster.representative_experience_ids
     ]
     evidence = _representative_evidence(cluster, examples_by_id=examples_by_id)
     system = """You are a strict offline auditor for a MemGen V4 process card.
@@ -476,10 +995,10 @@ and target/reference express a real contrast. Reject any question-specific
 detail, answer, number, equation, unsupported mechanism, or disguised wrong
 instruction. Approve exactly when every component check is true; approved
 reviews must have no issues, rejected reviews must list at least one issue."""
-    user = f"""Cluster:
-{json.dumps(cluster.to_dict(), ensure_ascii=False, sort_keys=True)}
+    user = f"""Cluster summary:
+{json.dumps(_bounded_cluster_description(cluster), ensure_ascii=False, sort_keys=True)}
 
-Member signatures:
+Representative signatures:
 {json.dumps(signatures, ensure_ascii=False, sort_keys=True)}
 
 Representative evidence:
@@ -546,6 +1065,339 @@ def _client(args: argparse.Namespace, *, api_key: str, max_tokens: int) -> Teach
         read_timeout_seconds=args.read_timeout_seconds,
         thinking=args.thinking,
     )
+
+
+def _load_cluster_unit_records(path: Path) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    if not path.is_file():
+        return result
+    for record in iter_jsonl(path):
+        if record.get("schema_version") != CLUSTER_UNIT_RECORD_SCHEMA:
+            raise ValueError(f"Unexpected V4 cluster-unit record schema in {path}")
+        unit_id = _nonempty_string("cluster unit_id", record.get("unit_id"))
+        if unit_id in result:
+            raise ValueError(f"Duplicate V4 cluster unit in {path}: {unit_id}")
+        stored_hash = record.get("record_sha256")
+        logical = {
+            key: value
+            for key, value in record.items()
+            if key != "record_sha256"
+        }
+        if stored_hash != canonical_json_sha256(logical):
+            raise ValueError(f"V4 cluster-unit record hash mismatch: {unit_id}")
+        if record.get("payload_sha256") != canonical_json_sha256(
+            record.get("payload")
+        ):
+            raise ValueError(f"V4 cluster-unit payload hash mismatch: {unit_id}")
+        result[unit_id] = record
+    return result
+
+
+def _cluster_unit_matches(
+    record: Mapping[str, Any],
+    *,
+    stage: str,
+    unit_id: str,
+    construction_input_sha256: str,
+    args: argparse.Namespace,
+) -> bool:
+    return bool(
+        record.get("stage") == stage
+        and record.get("unit_id") == unit_id
+        and record.get("prompt_version") == V4_CLUSTER_PROMPT_VERSION
+        and record.get("construction_input_sha256")
+        == construction_input_sha256
+        and record.get("teacher", {}).get("model") == args.model
+        and record.get("teacher", {}).get("base_url") == args.base_url
+        and record.get("teacher", {}).get("temperature") == args.temperature
+        and record.get("teacher", {}).get("thinking") == args.thinking
+        and isinstance(record.get("payload"), Mapping)
+    )
+
+
+def _call_cluster_unit(
+    *,
+    stage: str,
+    unit_id: str,
+    input_value: Any,
+    messages: list[dict[str, str]],
+    response_parser: Any,
+    existing_records: Mapping[str, Mapping[str, Any]],
+    checkpoint_path: Path,
+    client: TeacherClient,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    construction_input_sha256 = canonical_json_sha256(input_value)
+    existing = existing_records.get(unit_id)
+    if existing is not None and _cluster_unit_matches(
+        existing,
+        stage=stage,
+        unit_id=unit_id,
+        construction_input_sha256=construction_input_sha256,
+        args=args,
+    ):
+        payload = dict(existing["payload"])
+        response_parser(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        _append_jsonl(checkpoint_path, existing)
+        return payload
+
+    request_characters = sum(len(message["content"]) for message in messages)
+    if request_characters > MAX_CLUSTER_REQUEST_CHARACTERS:
+        raise ValueError(
+            f"V4 {stage} unit {unit_id} has {request_characters} prompt characters; "
+            "lower the corresponding cluster batch size"
+        )
+    payload = client.call(
+        messages,
+        response_parser=response_parser,
+        request_label=f"v4-cluster-{stage}",
+        expose_parser_error=True,
+        repair_parser_errors=True,
+    )
+    record = {
+        "schema_version": CLUSTER_UNIT_RECORD_SCHEMA,
+        "prompt_version": V4_CLUSTER_PROMPT_VERSION,
+        "stage": stage,
+        "unit_id": unit_id,
+        "created_at": utc_now(),
+        "teacher": {
+            "model": args.model,
+            "base_url": args.base_url,
+            "temperature": args.temperature,
+            "thinking": args.thinking,
+        },
+        "construction_input_sha256": construction_input_sha256,
+        "request_character_count": request_characters,
+        "payload": payload,
+        "payload_sha256": canonical_json_sha256(payload),
+    }
+    record["record_sha256"] = canonical_json_sha256(record)
+    _append_jsonl(checkpoint_path, record)
+    return payload
+
+
+def build_cluster_plan_map_reduce(
+    signatures: Sequence[V4RepairSignature],
+    *,
+    args: argparse.Namespace,
+    api_key: str,
+    map_checkpoint_path: Path,
+    reduce_checkpoint_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a globally reduced plan without an unbounded API request."""
+
+    eligible = tuple(item for item in signatures if item.applicable)
+    map_batches = _bounded_batches(
+        eligible,
+        batch_size=args.cluster_map_batch_size,
+        key=_signature_sort_key,
+    )
+    existing_map = (
+        _load_cluster_unit_records(map_checkpoint_path)
+        if args.resume
+        else {}
+    )
+    existing_reduce = (
+        _load_cluster_unit_records(reduce_checkpoint_path)
+        if args.resume
+        else {}
+    )
+    _write_jsonl(map_checkpoint_path, ())
+    _write_jsonl(reduce_checkpoint_path, ())
+
+    prototypes: list[dict[str, Any]] = []
+    rejected_experience_ids: set[str] = set()
+    map_request_count = 0
+    reduce_request_count = 0
+    round_diagnostics: list[dict[str, Any]] = []
+    with _client(
+        args,
+        api_key=api_key,
+        max_tokens=args.cluster_max_tokens,
+    ) as cluster_client:
+        for batch_index, batch in enumerate(map_batches):
+            experience_type = batch[0].experience_type
+            unit_id = f"map-{experience_type}-{batch_index:05d}"
+            messages = cluster_messages(batch)
+
+            def parse_map_response(
+                content: str,
+                *,
+                current_batch: tuple[V4RepairSignature, ...] = batch,
+                current_unit_id: str = unit_id,
+            ) -> dict[str, Any]:
+                candidate = _parse_json_object(content)
+                parse_cluster_map_payload(
+                    candidate,
+                    signatures=current_batch,
+                    unit_id=current_unit_id,
+                )
+                return candidate
+
+            payload = _call_cluster_unit(
+                stage="map",
+                unit_id=unit_id,
+                input_value=[item.to_dict() for item in batch],
+                messages=messages,
+                response_parser=parse_map_response,
+                existing_records=existing_map,
+                checkpoint_path=map_checkpoint_path,
+                client=cluster_client,
+                args=args,
+            )
+            local_prototypes, rejected = parse_cluster_map_payload(
+                payload,
+                signatures=batch,
+                unit_id=unit_id,
+            )
+            prototypes.extend(local_prototypes)
+            rejected_experience_ids.update(rejected)
+            if unit_id not in existing_map:
+                map_request_count += 1
+            print(
+                f"[v4-bank] cluster map {batch_index + 1}/{len(map_batches)} "
+                f"input={len(batch)} prototypes={len(local_prototypes)} "
+                f"rejected={len(rejected)}",
+                flush=True,
+            )
+
+        prototypes = list(
+            _merge_exact_prototypes(prototypes, unit_id="post-map")
+        )
+        globally_reduced = not prototypes
+        for round_index in range(MAX_CLUSTER_REDUCE_ROUNDS):
+            if not prototypes:
+                globally_reduced = True
+                break
+            counts_by_type: dict[str, int] = {}
+            for prototype in prototypes:
+                counts_by_type[str(prototype["experience_type"])] = (
+                    counts_by_type.get(str(prototype["experience_type"]), 0) + 1
+                )
+            round_is_global = all(
+                count <= args.cluster_reduce_batch_size
+                for count in counts_by_type.values()
+            )
+            reduce_batches = _bounded_batches(
+                prototypes,
+                batch_size=args.cluster_reduce_batch_size,
+                key=_semantic_sort_key,
+            )
+            next_prototypes: list[dict[str, Any]] = []
+            before_count = len(prototypes)
+            round_rejected_count = 0
+            for batch_index, batch in enumerate(reduce_batches):
+                if len(batch) == 1:
+                    next_prototypes.append(dict(batch[0]))
+                    continue
+                experience_type = str(batch[0]["experience_type"])
+                unit_id = (
+                    f"reduce-{round_index:02d}-{experience_type}-{batch_index:05d}"
+                )
+                messages = cluster_reduce_messages(batch)
+
+                def parse_reduce_response(
+                    content: str,
+                    *,
+                    current_batch: tuple[Mapping[str, Any], ...] = batch,
+                    current_unit_id: str = unit_id,
+                ) -> dict[str, Any]:
+                    candidate = _parse_json_object(content)
+                    parse_cluster_reduce_payload(
+                        candidate,
+                        prototypes=current_batch,
+                        unit_id=current_unit_id,
+                    )
+                    return candidate
+
+                payload = _call_cluster_unit(
+                    stage="reduce",
+                    unit_id=unit_id,
+                    input_value=[dict(item) for item in batch],
+                    messages=messages,
+                    response_parser=parse_reduce_response,
+                    existing_records=existing_reduce,
+                    checkpoint_path=reduce_checkpoint_path,
+                    client=cluster_client,
+                    args=args,
+                )
+                merged, rejected_prototype_ids = parse_cluster_reduce_payload(
+                    payload,
+                    prototypes=batch,
+                    unit_id=unit_id,
+                )
+                prototype_by_id = {
+                    str(item["prototype_id"]): item
+                    for item in batch
+                }
+                for prototype_id in rejected_prototype_ids:
+                    rejected_experience_ids.update(
+                        str(item)
+                        for item in prototype_by_id[prototype_id][
+                            "member_experience_ids"
+                        ]
+                    )
+                round_rejected_count += len(rejected_prototype_ids)
+                next_prototypes.extend(merged)
+                if unit_id not in existing_reduce:
+                    reduce_request_count += 1
+
+            prototypes = list(
+                _merge_exact_prototypes(
+                    next_prototypes,
+                    unit_id=f"post-reduce-{round_index:02d}",
+                )
+            )
+            round_diagnostics.append(
+                {
+                    "round": round_index,
+                    "input_prototype_count": before_count,
+                    "output_prototype_count": len(prototypes),
+                    "batch_count": len(reduce_batches),
+                    "rejected_prototype_count": round_rejected_count,
+                    "global_within_experience_type": round_is_global,
+                }
+            )
+            print(
+                f"[v4-bank] cluster reduce round={round_index} "
+                f"input={before_count} output={len(prototypes)} "
+                f"global={round_is_global}",
+                flush=True,
+            )
+            if round_is_global:
+                globally_reduced = True
+                break
+            if len(prototypes) >= before_count:
+                break
+
+    if not globally_reduced:
+        raise RuntimeError(
+            "V4 cluster reduction did not reach one bounded global batch per "
+            "experience type; lower the map batch size only if responses were "
+            "over-grouped, or raise --cluster-reduce-batch-size within the request cap"
+        )
+    payload = finalize_cluster_payload(
+        prototypes,
+        rejected_experience_ids=sorted(rejected_experience_ids),
+        signatures=signatures,
+    )
+    parse_v4_cluster_plan(payload, signatures=signatures)
+    diagnostics = {
+        "method": "bounded_map_reduce",
+        "map_batch_size": args.cluster_map_batch_size,
+        "reduce_batch_size": args.cluster_reduce_batch_size,
+        "max_request_characters": MAX_CLUSTER_REQUEST_CHARACTERS,
+        "map_unit_count": len(map_batches),
+        "new_map_request_count": map_request_count,
+        "new_reduce_request_count": reduce_request_count,
+        "final_prototype_count": len(prototypes),
+        "final_cluster_count": len(payload["clusters"]),
+        "final_rejected_experience_count": len(
+            payload["rejected_experience_ids"]
+        ),
+        "rounds": round_diagnostics,
+    }
+    return payload, diagnostics
 
 
 def _signature_record(
@@ -659,6 +1511,8 @@ def _validate_frozen_cli(args: argparse.Namespace) -> V4ConstructionProfile:
     for owner, value in (
         ("signature-max-tokens", args.signature_max_tokens),
         ("cluster-max-tokens", args.cluster_max_tokens),
+        ("cluster-map-batch-size", args.cluster_map_batch_size),
+        ("cluster-reduce-batch-size", args.cluster_reduce_batch_size),
         ("card-max-tokens", args.card_max_tokens),
         ("review-max-tokens", args.review_max_tokens),
     ):
@@ -712,6 +1566,8 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     signatures_path = output_dir / "repair_signatures.jsonl"
     cluster_path = output_dir / "cluster_plan.json"
+    cluster_map_path = output_dir / "cluster_map_shards.jsonl"
+    cluster_reduce_path = output_dir / "cluster_reduce_batches.jsonl"
     cards_path = output_dir / "process_cards.jsonl"
     reviews_path = output_dir / "card_reviews.jsonl"
     rejected_path = output_dir / "rejected_clusters.jsonl"
@@ -735,6 +1591,13 @@ def main() -> None:
                 "cluster": V4_CLUSTER_PROMPT_VERSION,
                 "card": V4_CARD_PROMPT_VERSION,
                 "review": V4_CARD_REVIEW_PROMPT_VERSION,
+            },
+            "clustering": {
+                "method": "bounded_map_reduce",
+                "map_batch_size": args.cluster_map_batch_size,
+                "reduce_batch_size": args.cluster_reduce_batch_size,
+                "max_request_characters": MAX_CLUSTER_REQUEST_CHARACTERS,
+                "max_reduce_rounds": MAX_CLUSTER_REDUCE_ROUNDS,
             },
         },
     )
@@ -772,6 +1635,12 @@ def main() -> None:
                 )
                 if record.get("signature_sha256") == signature.signature_sha256:
                     compatible_signatures[experience_id] = record
+    if args.resume:
+        print(
+            f"[v4-bank] resume kept {len(compatible_signatures)} "
+            "compatible signatures",
+            flush=True,
+        )
 
     signature_records: list[dict[str, Any]] = []
     # Compatible resume records are already held in memory. Rebuild the ordered
@@ -865,6 +1734,7 @@ def main() -> None:
         [item.to_dict() for item in signatures if item.applicable]
     )
     cluster_payload: dict[str, Any] | None = None
+    cluster_diagnostics: dict[str, Any] | None = None
     if args.resume and cluster_path.is_file():
         stored = json.loads(cluster_path.read_text(encoding="utf-8"))
         if (
@@ -876,6 +1746,18 @@ def main() -> None:
             and stored.get("teacher", {}).get("thinking") == args.thinking
             and stored.get("construction_input_sha256") == cluster_input_sha256
             and isinstance(stored.get("payload"), dict)
+            and stored.get("map_reduce", {}).get("method")
+            == "bounded_map_reduce"
+            and stored.get("map_reduce", {}).get("map_batch_size")
+            == args.cluster_map_batch_size
+            and stored.get("map_reduce", {}).get("reduce_batch_size")
+            == args.cluster_reduce_batch_size
+            and cluster_map_path.is_file()
+            and cluster_reduce_path.is_file()
+            and stored.get("intermediate_artifacts", {}).get("map_sha256")
+            == file_sha256(cluster_map_path)
+            and stored.get("intermediate_artifacts", {}).get("reduce_sha256")
+            == file_sha256(cluster_reduce_path)
             and stored.get("record_sha256")
             == canonical_json_sha256(
                 {key: value for key, value in stored.items() if key != "record_sha256"}
@@ -883,22 +1765,17 @@ def main() -> None:
         ):
             parse_v4_cluster_plan(stored["payload"], signatures=signatures)
             cluster_payload = stored["payload"]
+            stored_diagnostics = stored.get("map_reduce")
+            if isinstance(stored_diagnostics, Mapping):
+                cluster_diagnostics = dict(stored_diagnostics)
     if cluster_payload is None:
-        def parse_cluster_response(content: str) -> dict[str, Any]:
-            candidate = _parse_json_object(content)
-            parse_v4_cluster_plan(candidate, signatures=signatures)
-            return candidate
-
-        with _client(
-            args, api_key=api_key, max_tokens=args.cluster_max_tokens
-        ) as cluster_client:
-            cluster_payload = cluster_client.call(
-                cluster_messages(signatures),
-                response_parser=parse_cluster_response,
-                request_label="v4-cluster",
-                expose_parser_error=True,
-                repair_parser_errors=True,
-            )
+        cluster_payload, cluster_diagnostics = build_cluster_plan_map_reduce(
+            signatures,
+            args=args,
+            api_key=api_key,
+            map_checkpoint_path=cluster_map_path,
+            reduce_checkpoint_path=cluster_reduce_path,
+        )
         clusters, rejected_ids = parse_v4_cluster_plan(
             cluster_payload, signatures=signatures
         )
@@ -916,6 +1793,13 @@ def main() -> None:
             "payload": cluster_payload,
             "cluster_count": len(clusters),
             "rejected_experience_ids": list(rejected_ids),
+            "map_reduce": cluster_diagnostics,
+            "intermediate_artifacts": {
+                "map_path": str(cluster_map_path.resolve()),
+                "map_sha256": file_sha256(cluster_map_path),
+                "reduce_path": str(cluster_reduce_path.resolve()),
+                "reduce_sha256": file_sha256(cluster_reduce_path),
+            },
         }
         cluster_record["record_sha256"] = canonical_json_sha256(cluster_record)
         _write_json(cluster_path, cluster_record)
@@ -1117,6 +2001,11 @@ def main() -> None:
                 == "deterministic_rejection_after_invalid_teacher_response"
             ],
             "cluster_input_sha256": cluster_input_sha256,
+            "cluster_plan_path": str(cluster_path.resolve()),
+            "cluster_plan_sha256": file_sha256(cluster_path),
+            "cluster_map_shards_sha256": file_sha256(cluster_map_path),
+            "cluster_reduce_batches_sha256": file_sha256(cluster_reduce_path),
+            "cluster_map_reduce": cluster_diagnostics,
             "rejected_signature_ids": list(rejected_ids),
             "repository": _repository_state(),
         },
@@ -1130,6 +2019,13 @@ def main() -> None:
                 "cluster": V4_CLUSTER_PROMPT_VERSION,
                 "card": V4_CARD_PROMPT_VERSION,
                 "review": V4_CARD_REVIEW_PROMPT_VERSION,
+            },
+            "clustering": {
+                "method": "bounded_map_reduce",
+                "map_batch_size": args.cluster_map_batch_size,
+                "reduce_batch_size": args.cluster_reduce_batch_size,
+                "max_request_characters": MAX_CLUSTER_REQUEST_CHARACTERS,
+                "max_reduce_rounds": MAX_CLUSTER_REDUCE_ROUNDS,
             },
         },
     )
