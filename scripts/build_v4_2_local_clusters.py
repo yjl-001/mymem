@@ -969,6 +969,12 @@ def build_cluster_plan(
         "diagnostics": {
             "source_signature_count": len(signatures),
             "local_reasoning_atom_count": len(atoms),
+            "source_nonapplicable_archive_count": len(
+                archive["source_nonapplicable_experience_ids"]
+            ),
+            "answer_serialization_archive_count": len(
+                archive["answer_serialization_experience_ids"]
+            ),
             "complete_link_group_count": len(groups),
             "qualified_cluster_count": len(candidates),
             "qualified_member_count": sum(

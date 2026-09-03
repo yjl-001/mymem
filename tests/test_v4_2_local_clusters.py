@@ -346,6 +346,12 @@ class V42LocalClusterTests(unittest.TestCase):
         self.assertFalse(plan["qualified_for_online_use"])
         self.assertEqual(plan["external_api_calls"], 0)
         self.assertEqual(plan["diagnostics"]["qualified_cluster_count"], 1)
+        self.assertEqual(
+            plan["diagnostics"]["source_nonapplicable_archive_count"], 1
+        )
+        self.assertEqual(
+            plan["diagnostics"]["answer_serialization_archive_count"], 1
+        )
         self.assertEqual(len(plan["artifacts"]), 10)
         self.assertIn("plan_sha256", plan)
 
