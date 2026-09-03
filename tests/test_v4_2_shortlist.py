@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -401,6 +404,48 @@ class V42ShortlistTests(unittest.TestCase):
                 side_effect=AssertionError("completed resume must be reused"),
             ), patch("sys.argv", [*shortlist_argv, "--resume"]):
                 shortlist_builder.main()
+
+            audit_dir = root / "audit"
+            environment = os.environ.copy()
+            environment.pop("DEEPSEEK_API_KEY", None)
+            environment.update(
+                {
+                    "MEMGEN_PYTHON_BIN": sys.executable,
+                    "MEMGEN_V4_2_LOCAL_DIR": str(local_dir),
+                    "MEMGEN_V4_2_SHORTLIST_DIR": str(shortlist_dir),
+                    "MEMGEN_V4_2_AUDIT_DIR": str(audit_dir),
+                }
+            )
+            completed = subprocess.run(
+                ["bash", str(Path(__file__).resolve().parents[1] / "test.sh")],
+                cwd=Path(__file__).resolve().parents[1],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+            self.assertIn("[v4.2-test] PASS", completed.stdout)
+            test_report = json.loads(
+                (audit_dir / "v4_2_shortlist_test_report.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(test_report["status"], "PASS")
+            self.assertEqual(
+                test_report["summary"]["selected_synthesis_candidate_count"],
+                1,
+            )
+            self.assertTrue(
+                test_report["assertions"]["authenticated_resume_passed"]
+            )
+            self.assertEqual(
+                test_report["assertions"]["external_api_calls_made"], 0
+            )
 
 
 if __name__ == "__main__":
