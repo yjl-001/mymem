@@ -267,6 +267,11 @@ def embed_view_texts(
         from transformers import AutoModel, AutoTokenizer
     except ImportError as exc:  # pragma: no cover - exercised on GPU server
         raise RuntimeError("V4.2 embedding requires torch and transformers") from exc
+    print(
+        f"[v4.2-local] embedding model load model={profile.embedding_model} "
+        f"revision={profile.embedding_revision} device={device}",
+        flush=True,
+    )
     tokenizer = AutoTokenizer.from_pretrained(
         profile.embedding_model,
         revision=profile.embedding_revision,
@@ -281,8 +286,11 @@ def embed_view_texts(
     by_view = _view_texts(atoms)
     flat_texts = [text for name in EMBEDDING_VIEW_NAMES for text in by_view[name]]
     rows: list[np.ndarray] = []
+    batch_count = math.ceil(len(flat_texts) / batch_size)
     with torch.inference_mode():
-        for start in range(0, len(flat_texts), batch_size):
+        for batch_index, start in enumerate(
+            range(0, len(flat_texts), batch_size), start=1
+        ):
             encoded = tokenizer(
                 flat_texts[start : start + batch_size],
                 padding=True,
@@ -294,6 +302,12 @@ def embed_view_texts(
             hidden = model(**encoded).last_hidden_state[:, 0]
             hidden = torch.nn.functional.normalize(hidden.float(), p=2, dim=1)
             rows.append(hidden.cpu().numpy().astype(np.float32, copy=False))
+            if batch_index == 1 or batch_index % 10 == 0 or batch_index == batch_count:
+                print(
+                    f"[v4.2-local] embedding batches "
+                    f"{batch_index}/{batch_count}",
+                    flush=True,
+                )
     flat = np.concatenate(rows, axis=0)
     expected_rows = len(atoms) * len(EMBEDDING_VIEW_NAMES)
     if flat.ndim != 2 or flat.shape[0] != expected_rows:
@@ -1071,6 +1085,13 @@ def main() -> None:
         profile=profile,
         output_dir=output_dir,
         args=args,
+    )
+    print(
+        f"[v4.2-local] graph start atoms={len(atoms)} "
+        f"neighbors={profile.neighbor_count} "
+        f"thresholds={profile.mechanism_threshold}/"
+        f"{profile.repair_threshold}/{profile.applicability_threshold}",
+        flush=True,
     )
     edges, edge_diagnostics, joint_embeddings = build_multiview_positive_edges(
         atoms,
