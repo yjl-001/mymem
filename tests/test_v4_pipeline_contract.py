@@ -10,6 +10,48 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class V4PipelineContractTests(unittest.TestCase):
+    def test_construction_support_accepts_local_direct_evidence_order(self) -> None:
+        records = [
+            {
+                "bank_id": "bank-a",
+                "construction": {
+                    "experience_ids": ["experience-b", "experience-a"],
+                    "sample_ids": ["sample-b", "sample-a"],
+                },
+                "cluster": {
+                    "member_experience_ids": ["experience-b", "experience-a"]
+                },
+            }
+        ]
+        membership = anchor_compiler._construction_bank_membership(
+            records=records,
+            experience_by_id={
+                "experience-a": {"sample_id": "sample-a"},
+                "experience-b": {"sample_id": "sample-b"},
+            },
+        )
+        self.assertEqual(
+            membership,
+            {"experience-a": "bank-a", "experience-b": "bank-a"},
+        )
+
+    def test_construction_support_still_rejects_real_membership_drift(self) -> None:
+        records = [
+            {
+                "bank_id": "bank-a",
+                "construction": {
+                    "experience_ids": ["experience-a"],
+                    "sample_ids": ["wrong-sample"],
+                },
+                "cluster": {"member_experience_ids": ["experience-a"]},
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "sample support drifted"):
+            anchor_compiler._construction_bank_membership(
+                records=records,
+                experience_by_id={"experience-a": {"sample_id": "sample-a"}},
+            )
+
     def test_progress_alignment_is_endpoint_preserving(self) -> None:
         self.assertEqual(
             anchor_compiler._normalized_progress_rank(

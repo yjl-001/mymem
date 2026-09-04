@@ -412,6 +412,56 @@ def _model_context_limit(model: Any) -> int | None:
     return min(values) if values else None
 
 
+def _construction_bank_membership(
+    *,
+    records: Sequence[Mapping[str, Any]],
+    experience_by_id: Mapping[str, Mapping[str, Any]],
+) -> dict[str, str]:
+    """Authenticate construction support without imposing an order convention.
+
+    V4/V4.1/semantic records canonicalize ``sample_ids`` by sorting, whereas
+    V4.2 local-direct records preserve evidence order.  The selector only
+    needs exact set membership; positional pairing is recovered directly from
+    each authenticated experience ID.
+    """
+
+    construction_bank_by_experience: dict[str, str] = {}
+    for record in records:
+        bank_id = str(record["bank_id"])
+        construction_ids = [
+            str(value) for value in record["construction"]["experience_ids"]
+        ]
+        cluster_ids = [
+            str(value) for value in record["cluster"]["member_experience_ids"]
+        ]
+        if construction_ids != cluster_ids:
+            raise ValueError("V4 selector construction and cluster memberships differ")
+        missing_ids = [
+            experience_id
+            for experience_id in construction_ids
+            if experience_id not in experience_by_id
+        ]
+        if missing_ids:
+            raise ValueError("V4 selector lost a construction experience")
+        recorded_sample_ids = record["construction"].get("sample_ids")
+        if (
+            not isinstance(recorded_sample_ids, list)
+            or len(set(recorded_sample_ids)) != len(recorded_sample_ids)
+        ):
+            raise ValueError("V4 selector construction sample support drifted")
+        expected_sample_ids = [
+            str(experience_by_id[experience_id]["sample_id"])
+            for experience_id in construction_ids
+        ]
+        if sorted(expected_sample_ids) != sorted(str(item) for item in recorded_sample_ids):
+            raise ValueError("V4 selector construction sample support drifted")
+        for experience_id in construction_ids:
+            if experience_id in construction_bank_by_experience:
+                raise ValueError("A V4 construction experience belongs to multiple banks")
+            construction_bank_by_experience[experience_id] = bank_id
+    return construction_bank_by_experience
+
+
 def main() -> None:
     args = parse_args()
     if not math.isclose(args.max_unsafe_rate, MAX_UNSAFE_RATE, rel_tol=0.0, abs_tol=1e-12):
@@ -470,6 +520,10 @@ def main() -> None:
         raise ValueError("V4 selector experiences differ from bank construction")
     if construction_manifest["inputs"].get("split_manifest_sha256") != file_sha256(args.split_manifest):
         raise ValueError("V4 selector split manifest differs from bank construction")
+    construction_bank_by_experience = _construction_bank_membership(
+        records=records,
+        experience_by_id=experience_by_id,
+    )
 
     side_loader = V4SideKVBankLoader(manifest_path=args.side_kv_manifest)
     side_ids = side_loader.bank_ids
@@ -523,31 +577,6 @@ def main() -> None:
         raise ValueError("V4 selector reasoner/tokenizer revision drifted")
 
     context_limit = args.max_sequence_length or _model_context_limit(model)
-    construction_bank_by_experience: dict[str, str] = {}
-    for record in records:
-        bank_id = str(record["bank_id"])
-        construction_ids = [
-            str(value) for value in record["construction"]["experience_ids"]
-        ]
-        cluster_ids = [
-            str(value) for value in record["cluster"]["member_experience_ids"]
-        ]
-        if construction_ids != cluster_ids:
-            raise ValueError("V4 selector construction and cluster memberships differ")
-        expected_sample_ids = sorted(
-            str(experience_by_id[experience_id]["sample_id"])
-            for experience_id in construction_ids
-            if experience_id in experience_by_id
-        )
-        if expected_sample_ids != record["construction"]["sample_ids"]:
-            raise ValueError("V4 selector construction sample support drifted")
-        for experience_id in construction_ids:
-            experience_id = str(experience_id)
-            if experience_id in construction_bank_by_experience:
-                raise ValueError("A V4 construction experience belongs to multiple banks")
-            if experience_id not in experience_by_id:
-                raise ValueError("V4 selector lost a construction experience")
-            construction_bank_by_experience[experience_id] = bank_id
 
     gate_construction = risk_artifact["construction"]
     gate_risk = risk_artifact["risk_gate"]
