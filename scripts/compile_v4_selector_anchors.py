@@ -111,6 +111,85 @@ def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> int:
     return count
 
 
+def _write_selector_diagnostics(
+    *,
+    output_dir: Path,
+    calibration_rows: Sequence[Mapping[str, Any]],
+    calibration_report: Mapping[str, Any],
+    skipped: Sequence[Mapping[str, Any]],
+    rejected_banks: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Persist answer-blind diagnostics before any qualification exception."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "calibration_rows": output_dir / "v4_selector_calibration_rows.jsonl",
+        "calibration_report": output_dir / "v4_selector_calibration_report.json",
+        "skipped_experiences": output_dir / "v4_selector_skipped_experiences.json",
+        "rejected_banks": output_dir / "v4_selector_rejected_banks.json",
+    }
+    _write_jsonl(paths["calibration_rows"], calibration_rows)
+    _write_json(paths["calibration_report"], calibration_report)
+    _write_json(paths["skipped_experiences"], list(skipped))
+    _write_json(paths["rejected_banks"], list(rejected_banks))
+    return {
+        name: {
+            "path": path.name,
+            "sha256": file_sha256(path),
+        }
+        for name, path in paths.items()
+    }
+
+
+def _write_selector_failure_report(
+    *,
+    output_dir: Path,
+    status: str,
+    failure_reason: str,
+    source_bank_ids: Sequence[str],
+    qualified_bank_ids: Sequence[str],
+    source_anchor_count: int,
+    skipped_experience_count: int,
+    rejected_bank_count: int,
+    calibration_report: Mapping[str, Any],
+    diagnostic_artifacts: Mapping[str, Mapping[str, Any]],
+    provenance: Mapping[str, Any],
+) -> Path:
+    """Write a non-runtime failure report while withholding selector tensors."""
+
+    for stale_name in (
+        "v4_selector_anchors.safetensors",
+        "v4_selector_anchor_manifest.json",
+    ):
+        stale_path = output_dir / stale_name
+        if stale_path.is_file():
+            stale_path.unlink()
+    report = {
+        "schema_version": "memgen-v4-selector-anchor-compile-report-v1",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "qualified_for_online_use": False,
+        "failure_reason": failure_reason,
+        "source_bank_count": len(source_bank_ids),
+        "source_bank_ids": list(source_bank_ids),
+        "qualified_bank_count": len(qualified_bank_ids),
+        "qualified_bank_ids": list(qualified_bank_ids),
+        "source_anchor_count": source_anchor_count,
+        "skipped_experience_count": skipped_experience_count,
+        "rejected_bank_count": rejected_bank_count,
+        "calibration": dict(calibration_report),
+        "provenance": dict(provenance),
+        "artifacts": {
+            **{name: dict(value) for name, value in diagnostic_artifacts.items()},
+            "anchor_tensor": None,
+            "anchor_manifest": None,
+        },
+    }
+    report_path = output_dir / "v4_selector_anchor_compile_report.json"
+    _write_json(report_path, report)
+    return report_path
+
+
 def _git_revision() -> str | None:
     try:
         return subprocess.check_output(
@@ -476,6 +555,7 @@ def main() -> None:
     ):
         if not path.is_file():
             raise FileNotFoundError(path)
+    output_dir = args.output_dir.expanduser().resolve()
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -548,6 +628,25 @@ def main() -> None:
     for field in ("model_name", "model_revision", "tokenizer_revision"):
         if risk_artifact.get("reasoner", {}).get(field) != reasoner.get(field):
             raise ValueError("V4 selector gate and side-KV reasoner provenance differ")
+    diagnostic_provenance = {
+        "compiler_git_revision": _git_revision(),
+        "implementation_sha256": v4_selector_implementation_hashes(),
+        "reasoner": dict(reasoner),
+        "inputs": {
+            "experiences_sha256": file_sha256(args.experiences),
+            "split_manifest_sha256": file_sha256(args.split_manifest),
+            "bank_records_sha256": file_sha256(args.bank_records),
+            "bank_manifest_sha256": file_sha256(args.bank_manifest),
+            "bank_manifest_logical_sha256": construction_manifest[
+                "manifest_sha256"
+            ],
+            "side_kv_manifest_sha256": file_sha256(args.side_kv_manifest),
+            "side_kv_manifest_logical_sha256": side_loader.manifest[
+                "manifest_sha256"
+            ],
+            "token_risk_artifact_sha256": file_sha256(args.token_risk_artifact),
+        },
+    }
 
     tokenizer = AutoTokenizer.from_pretrained(
         reasoner["model_name"], revision=reasoner["tokenizer_revision"]
@@ -709,6 +808,33 @@ def main() -> None:
         if bank_id not in qualified
     ]
     if len(qualified) < 2:
+        calibration_report = {
+            "schema_version": "memgen-v4-selector-threshold-calibration-v1",
+            "status": "not_run_insufficient_qualified_anchor_banks",
+            "qualified": False,
+            "failure_reason": "fewer_than_two_banks_with_five_failure_gate_anchors",
+        }
+        diagnostic_artifacts = _write_selector_diagnostics(
+            output_dir=output_dir,
+            calibration_rows=(),
+            calibration_report=calibration_report,
+            skipped=skipped,
+            rejected_banks=rejected_banks,
+        )
+        report_path = _write_selector_failure_report(
+            output_dir=output_dir,
+            status="selector_anchor_source_qualification_failed",
+            failure_reason=calibration_report["failure_reason"],
+            source_bank_ids=side_ids,
+            qualified_bank_ids=sorted(qualified),
+            source_anchor_count=sum(len(values) for values in qualified.values()),
+            skipped_experience_count=len(skipped),
+            rejected_bank_count=len(rejected_banks),
+            calibration_report=calibration_report,
+            diagnostic_artifacts=diagnostic_artifacts,
+            provenance=diagnostic_provenance,
+        )
+        print(f"[v4-selector-anchor] diagnostics={report_path}", flush=True)
         raise RuntimeError(
             "V4 online selector requires at least two banks with five failure-gate anchors"
         )
@@ -734,8 +860,67 @@ def main() -> None:
                     anchors_by_bank=qualified,
                 )
             )
-    absolute, margin, calibration_report = _calibrate_thresholds(calibration_rows)
+    try:
+        absolute, margin, calibration_report = _calibrate_thresholds(calibration_rows)
+    except RuntimeError as exc:
+        if str(exc) != "V4 selector threshold grid has no safe candidate":
+            raise
+        calibration_report = {
+            "schema_version": "memgen-v4-selector-threshold-calibration-v1",
+            "status": "failed_no_safe_threshold_pair",
+            "qualified": False,
+            "failure_reason": "no_threshold_pair_satisfies_dual_unsafe_caps",
+            "failure_query_count": sum(
+                row["query_kind"] == "failure" for row in calibration_rows
+            ),
+            "success_query_count": sum(
+                row["query_kind"] == "success" for row in calibration_rows
+            ),
+        }
+        diagnostic_artifacts = _write_selector_diagnostics(
+            output_dir=output_dir,
+            calibration_rows=calibration_rows,
+            calibration_report=calibration_report,
+            skipped=skipped,
+            rejected_banks=rejected_banks,
+        )
+        report_path = _write_selector_failure_report(
+            output_dir=output_dir,
+            status="selector_anchor_calibration_failed",
+            failure_reason=calibration_report["failure_reason"],
+            source_bank_ids=side_ids,
+            qualified_bank_ids=sorted(qualified),
+            source_anchor_count=sum(len(values) for values in qualified.values()),
+            skipped_experience_count=len(skipped),
+            rejected_bank_count=len(rejected_banks),
+            calibration_report=calibration_report,
+            diagnostic_artifacts=diagnostic_artifacts,
+            provenance=diagnostic_provenance,
+        )
+        print(f"[v4-selector-anchor] diagnostics={report_path}", flush=True)
+        raise
+    diagnostic_artifacts = _write_selector_diagnostics(
+        output_dir=output_dir,
+        calibration_rows=calibration_rows,
+        calibration_report=calibration_report,
+        skipped=skipped,
+        rejected_banks=rejected_banks,
+    )
     if calibration_report["qualified"] is not True:
+        report_path = _write_selector_failure_report(
+            output_dir=output_dir,
+            status="selector_anchor_calibration_failed",
+            failure_reason="at_least_one_bank_has_no_correct_loo_selection",
+            source_bank_ids=side_ids,
+            qualified_bank_ids=sorted(qualified),
+            source_anchor_count=sum(len(values) for values in qualified.values()),
+            skipped_experience_count=len(skipped),
+            rejected_bank_count=len(rejected_banks),
+            calibration_report=calibration_report,
+            diagnostic_artifacts=diagnostic_artifacts,
+            provenance=diagnostic_provenance,
+        )
+        print(f"[v4-selector-anchor] diagnostics={report_path}", flush=True)
         raise RuntimeError(
             "V4 selector calibration has no correct leave-one-out selection for at least one bank"
         )
@@ -866,7 +1051,6 @@ def main() -> None:
         anchor_metadata=metadata,
         provenance=provenance,
     )
-    output_dir = args.output_dir.expanduser().resolve()
     tensor_path, anchor_manifest_path = artifact.save(output_dir)
     reloaded = V4SelectorAnchorBankLoader(
         manifest_path=anchor_manifest_path,
@@ -878,10 +1062,6 @@ def main() -> None:
     if tuple(bank.bank_id for bank in reloaded.banks) != tuple(sorted(qualified)):
         raise ValueError("V4 selector anchor reload coverage drifted")
 
-    _write_jsonl(output_dir / "v4_selector_calibration_rows.jsonl", calibration_rows)
-    _write_json(output_dir / "v4_selector_calibration_report.json", calibration_report)
-    _write_json(output_dir / "v4_selector_skipped_experiences.json", skipped)
-    _write_json(output_dir / "v4_selector_rejected_banks.json", rejected_banks)
     report = {
         "schema_version": "memgen-v4-selector-anchor-compile-report-v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -903,9 +1083,11 @@ def main() -> None:
                 "logical_sha256": reloaded.manifest["manifest_sha256"],
             },
             "calibration_rows": {
-                "path": "v4_selector_calibration_rows.jsonl",
-                "sha256": file_sha256(output_dir / "v4_selector_calibration_rows.jsonl"),
+                **diagnostic_artifacts["calibration_rows"],
             },
+            "calibration_report": diagnostic_artifacts["calibration_report"],
+            "skipped_experiences": diagnostic_artifacts["skipped_experiences"],
+            "rejected_banks": diagnostic_artifacts["rejected_banks"],
         },
     }
     report_path = output_dir / "v4_selector_anchor_compile_report.json"

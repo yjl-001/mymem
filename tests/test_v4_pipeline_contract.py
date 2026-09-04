@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import tempfile
 import unittest
 
 import scripts.compile_v4_selector_anchors as anchor_compiler
@@ -10,6 +12,57 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class V4PipelineContractTests(unittest.TestCase):
+    def test_selector_failure_persists_diagnostics_and_withholds_runtime_artifacts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = Path(temporary_dir)
+            stale_tensor = output_dir / "v4_selector_anchors.safetensors"
+            stale_manifest = output_dir / "v4_selector_anchor_manifest.json"
+            stale_tensor.write_bytes(b"stale")
+            stale_manifest.write_text("{}\n", encoding="utf-8")
+            calibration_report = {
+                "qualified": False,
+                "per_bank": {
+                    "bank-a": {
+                        "failure_query_count": 5,
+                        "correct_selected_count": 0,
+                    }
+                },
+            }
+            diagnostics = anchor_compiler._write_selector_diagnostics(
+                output_dir=output_dir,
+                calibration_rows=[{"query_kind": "failure"}],
+                calibration_report=calibration_report,
+                skipped=[{"experience_id": "experience-z", "reason": "no_gate"}],
+                rejected_banks=[{"bank_id": "bank-z", "anchor_count": 4}],
+            )
+            report_path = anchor_compiler._write_selector_failure_report(
+                output_dir=output_dir,
+                status="selector_anchor_calibration_failed",
+                failure_reason="at_least_one_bank_has_no_correct_loo_selection",
+                source_bank_ids=["bank-a", "bank-z"],
+                qualified_bank_ids=["bank-a"],
+                source_anchor_count=5,
+                skipped_experience_count=1,
+                rejected_bank_count=1,
+                calibration_report=calibration_report,
+                diagnostic_artifacts=diagnostics,
+                provenance={"compiler_git_revision": "test"},
+            )
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "selector_anchor_calibration_failed")
+            self.assertFalse(report["qualified_for_online_use"])
+            self.assertEqual(report["qualified_bank_ids"], ["bank-a"])
+            self.assertEqual(report["artifacts"]["anchor_tensor"], None)
+            self.assertEqual(report["artifacts"]["anchor_manifest"], None)
+            for artifact in diagnostics.values():
+                self.assertTrue((output_dir / artifact["path"]).is_file())
+                self.assertEqual(len(artifact["sha256"]), 64)
+            self.assertFalse(stale_tensor.exists())
+            self.assertFalse(stale_manifest.exists())
+
     def test_construction_support_accepts_local_direct_evidence_order(self) -> None:
         records = [
             {
