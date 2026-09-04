@@ -447,15 +447,17 @@ elif [[ "$SEMANTIC_STAGE" == "local-direct" ]]; then
   [[ "$MEDOID_COUNT" == "$BANK_RECORD_COUNT" ]] \
     || fail "local-direct medoid count differs from bank count"
   jq -e -s '
-    all(.[].construction.distinct_sample_count >= 5)
-    and all(.[].roles == {
-      "target_online_injectable": true,
-      "reference_online_injectable": false,
-      "auxiliary": null
-    })
-    and all(.[].local_direct_admission.semantic_audit_performed == false)
-    and all(.[].local_direct_admission.independent_review_performed == false)
-    and all(.[].compiler_contract.layer_number == 24)
+    all(.[];
+      .construction.distinct_sample_count >= 5
+      and .roles == {
+        "target_online_injectable": true,
+        "reference_online_injectable": false,
+        "auxiliary": null
+      }
+      and .local_direct_admission.semantic_audit_performed == false
+      and .local_direct_admission.independent_review_performed == false
+      and .compiler_contract.layer_number == 24
+    )
   ' "$BANK_RECORDS" >/dev/null \
     || fail "V4.2 local-direct bank records did not pass"
   echo "[v4.2-test] LOCAL-DIRECT PASS bank_records=$BANK_RECORD_COUNT api_calls=0"

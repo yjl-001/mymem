@@ -114,6 +114,11 @@ def signature(index: int) -> V4RepairSignature:
 
 
 class V42LocalDirectBankTests(unittest.TestCase):
+    def test_test_sh_uses_the_jq_generator_condition_form(self) -> None:
+        source = (ROOT / "test.sh").read_text(encoding="utf-8")
+        self.assertIn("all(.[];", source)
+        self.assertNotIn("all(.[].construction", source)
+
     def test_profile_truthfully_marks_the_unreviewed_provisional_route(self) -> None:
         profile = V42LocalDirectProfile()
         self.assertEqual(profile.admission_basis, "authenticated_local_shortlist")
