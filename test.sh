@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Authenticate and inspect the API-free V4.2 high-quality bank shortlist.
+# Authenticate V4.2 inputs and build the zero-API provisional local-direct bank.
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,12 +12,14 @@ SHORTLIST_DIR="${MEMGEN_V4_2_SHORTLIST_DIR:-$OUTPUT_ROOT/offline/construction_v4
 AUDIT_DIR="${MEMGEN_V4_2_AUDIT_DIR:-$SHORTLIST_DIR/audit}"
 SOURCE_DIR="${MEMGEN_V4_SOURCE_DIR:-$OUTPUT_ROOT/offline/construction}"
 SEMANTIC_DIR="${MEMGEN_V4_2_SEMANTIC_DIR:-$OUTPUT_ROOT/offline/construction_v4_2_semantic}"
+LOCAL_DIRECT_DIR="${MEMGEN_V4_2_LOCAL_DIRECT_DIR:-$OUTPUT_ROOT/offline/construction_v4_2_local_direct}"
 SEMANTIC_POLICY="${MEMGEN_V4_2_SEMANTIC_POLICY:-$REPO_ROOT/configs/experiments/gsm8k/v4_2_semantic_policy.json}"
-SEMANTIC_STAGE="${MEMGEN_V4_2_STAGE:-preflight}"
+SEMANTIC_STAGE="${MEMGEN_V4_2_STAGE:-local-direct}"
 SKIP_SEMANTIC="${MEMGEN_V4_2_SKIP_SEMANTIC:-0}"
 REPORT_PATH="$AUDIT_DIR/v4_2_shortlist_test_report.json"
 LOG_PATH="$AUDIT_DIR/v4_2_shortlist_test.log"
 SEMANTIC_LOG_PATH="$SEMANTIC_DIR/v4_2_semantic_${SEMANTIC_STAGE}.log"
+LOCAL_DIRECT_LOG_PATH="$LOCAL_DIRECT_DIR/v4_2_local_direct.log"
 
 mkdir -p "$AUDIT_DIR"
 : > "$LOG_PATH"
@@ -31,14 +33,14 @@ command -v "$PYTHON_BIN" >/dev/null 2>&1 \
   || fail "Python executable not found: $PYTHON_BIN"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 case "$SEMANTIC_STAGE" in
-  preflight) ;;
+  preflight | local-direct) ;;
   paid)
     [[ "${MEMGEN_V4_2_APPROVE_PAID_STAGE:-0}" == "1" ]] \
       || fail "paid stage requires MEMGEN_V4_2_APPROVE_PAID_STAGE=1"
     [[ -n "${DEEPSEEK_API_KEY:-}" ]] \
       || fail "paid stage requires DEEPSEEK_API_KEY"
     ;;
-  *) fail "MEMGEN_V4_2_STAGE must be preflight or paid" ;;
+  *) fail "MEMGEN_V4_2_STAGE must be preflight, local-direct, or paid" ;;
 esac
 
 for REQUIRED in \
@@ -296,6 +298,10 @@ done
 SEMANTIC_ENTRYPOINT="$REPO_ROOT/scripts/build_v4_2_semantic_bank.py"
 [[ -s "$SEMANTIC_ENTRYPOINT" ]] || fail "missing semantic-bank entrypoint"
 mkdir -p "$SEMANTIC_DIR"
+SEMANTIC_BUILD_STAGE="$SEMANTIC_STAGE"
+if [[ "$SEMANTIC_BUILD_STAGE" == "local-direct" ]]; then
+  SEMANTIC_BUILD_STAGE="preflight"
+fi
 SEMANTIC_COMMAND=(
   "$PYTHON_BIN" "$SEMANTIC_ENTRYPOINT"
   --experiences "$PHASE1_DIR/verified_experiences.jsonl"
@@ -307,10 +313,10 @@ SEMANTIC_COMMAND=(
   --semantic-policy "$SEMANTIC_POLICY"
   --output-dir "$SEMANTIC_DIR"
   --dataset-revision main
-  --stage "$SEMANTIC_STAGE"
+  --stage "$SEMANTIC_BUILD_STAGE"
   --resume
 )
-if [[ "$SEMANTIC_STAGE" == "paid" ]]; then
+if [[ "$SEMANTIC_BUILD_STAGE" == "paid" ]]; then
   SEMANTIC_COMMAND+=(--approve-paid-stage)
   "${SEMANTIC_COMMAND[@]}" 2>&1 | tee "$SEMANTIC_LOG_PATH"
 else
@@ -366,9 +372,99 @@ if [[ "$SEMANTIC_STAGE" == "paid" ]]; then
   echo "[v4.2-test] PAID PASS bank_records=$BANK_RECORD_COUNT"
   echo "[v4.2-test] paid_report=$PAID_REPORT"
   echo "[v4.2-test] bank_manifest=$BANK_MANIFEST"
+elif [[ "$SEMANTIC_STAGE" == "local-direct" ]]; then
+  LOCAL_DIRECT_ENTRYPOINT="$REPO_ROOT/scripts/build_v4_2_local_direct_bank.py"
+  [[ -s "$LOCAL_DIRECT_ENTRYPOINT" ]] \
+    || fail "missing V4.2 local-direct bank entrypoint"
+  mkdir -p "$LOCAL_DIRECT_DIR"
+  (
+    unset DEEPSEEK_API_KEY || true
+    "$PYTHON_BIN" "$LOCAL_DIRECT_ENTRYPOINT" \
+      --experiences "$PHASE1_DIR/verified_experiences.jsonl" \
+      --split-manifest "$PHASE1_DIR/split_manifest.json" \
+      --source-signatures "$SOURCE_DIR/repair_signatures.jsonl" \
+      --source-construction-profile "$SOURCE_DIR/construction_profile.json" \
+      --local-construction-dir "$LOCAL_DIR" \
+      --shortlist-dir "$SHORTLIST_DIR" \
+      --semantic-preflight-dir "$SEMANTIC_DIR" \
+      --semantic-policy "$SEMANTIC_POLICY" \
+      --output-dir "$LOCAL_DIRECT_DIR" \
+      --dataset-revision main \
+      --resume
+  ) 2>&1 | tee "$LOCAL_DIRECT_LOG_PATH"
+
+  LOCAL_DIRECT_REPORT="$LOCAL_DIRECT_DIR/local_direct_report.json"
+  BANK_MANIFEST="$LOCAL_DIRECT_DIR/bank_manifest.json"
+  BANK_RECORDS="$LOCAL_DIRECT_DIR/bank_records.jsonl"
+  MEDOID_SELECTIONS="$LOCAL_DIRECT_DIR/medoid_selections.jsonl"
+  for REQUIRED in \
+    "$LOCAL_DIRECT_REPORT" \
+    "$BANK_MANIFEST" \
+    "$BANK_RECORDS" \
+    "$MEDOID_SELECTIONS"; do
+    [[ -s "$REQUIRED" ]] \
+      || fail "missing local-direct bank artifact: $REQUIRED"
+  done
+  jq -e --slurpfile preflight "$SEMANTIC_PREFLIGHT" '
+    .status == "local_direct_bank_constructed_not_tensor_compiled"
+    and .quality_tier == "provisional_local_direct"
+    and .qualified_for_online_use == false
+    and .admission_basis == "authenticated_local_shortlist"
+    and .semantic_audit_performed == false
+    and .independent_review_performed == false
+    and .api_key_read == false
+    and .external_api_calls_made == 0
+    and .bank_record_count == $preflight[0].planned_candidate_count
+    and .source_candidate_count == .bank_record_count
+    and .joint_medoid_count == .bank_record_count
+    and .evidence_count == $preflight[0].evidence_count
+    and .bank_record_count > 0
+    and .bank_record_count <= 32
+  ' "$LOCAL_DIRECT_REPORT" >/dev/null \
+    || fail "V4.2 local-direct report did not pass"
+  jq -e '
+    .schema_version == "memgen-v4.2-local-direct-bank-manifest-v1"
+    and .construction_version == "v4.2-local-direct"
+    and .status == "constructed_not_tensor_compiled"
+    and .quality_tier == "provisional_local_direct"
+    and .qualified_for_online_use == false
+    and .semantic_review.performed == false
+    and .semantic_review.reviewer == null
+    and .semantic_review.external_api_calls_made == 0
+    and .api_key_read == false
+    and .external_api_calls_made == 0
+    and .profile.injection_layer == 24
+    and .profile.relative_phase_delta == 0
+    and .profile.target_online_only == true
+    and .auxiliary_banks_materialized == false
+    and .record_count == (.bank_ids | length)
+  ' "$BANK_MANIFEST" >/dev/null \
+    || fail "V4.2 local-direct manifest did not pass"
+  BANK_RECORD_COUNT="$(wc -l < "$BANK_RECORDS" | tr -d ' ')"
+  MEDOID_COUNT="$(wc -l < "$MEDOID_SELECTIONS" | tr -d ' ')"
+  [[ "$BANK_RECORD_COUNT" == "$(jq -r '.record_count' "$BANK_MANIFEST")" ]] \
+    || fail "local-direct bank record count differs from manifest"
+  [[ "$MEDOID_COUNT" == "$BANK_RECORD_COUNT" ]] \
+    || fail "local-direct medoid count differs from bank count"
+  jq -e -s '
+    all(.[].construction.distinct_sample_count >= 5)
+    and all(.[].roles == {
+      "target_online_injectable": true,
+      "reference_online_injectable": false,
+      "auxiliary": null
+    })
+    and all(.[].local_direct_admission.semantic_audit_performed == false)
+    and all(.[].local_direct_admission.independent_review_performed == false)
+    and all(.[].compiler_contract.layer_number == 24)
+  ' "$BANK_RECORDS" >/dev/null \
+    || fail "V4.2 local-direct bank records did not pass"
+  echo "[v4.2-test] LOCAL-DIRECT PASS bank_records=$BANK_RECORD_COUNT api_calls=0"
+  echo "[v4.2-test] local_direct_report=$LOCAL_DIRECT_REPORT"
+  echo "[v4.2-test] bank_manifest=$BANK_MANIFEST"
+  echo "[v4.2-test] local_direct_log=$LOCAL_DIRECT_LOG_PATH"
 else
   echo "[v4.2-test] PREFLIGHT PASS api_key_read=false api_calls=0"
 fi
 echo "[v4.2-test] semantic_preflight=$SEMANTIC_PREFLIGHT"
 echo "[v4.2-test] semantic_log=$SEMANTIC_LOG_PATH"
-echo "[v4.2-test] send the semantic preflight report and, after paid mode, the paid report"
+echo "[v4.2-test] send the local-direct report or, after paid mode, the paid report"

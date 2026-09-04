@@ -36,12 +36,20 @@ V4 当前只研究 GSM8K，固定：
                                                ├─ support=5：仅保留高一致性且有增量多样性的候选
                                                ├─ 三视角 candidate-centroid NMS 去冗余
                                                └─ 最多 48 个进入 synthesis，runtime bank 最多 32 个
-                                                    └─ 停止并输出零 API preflight
+                                                    └─ 零 API semantic evidence preflight
+                                                         └─ 当前 local-direct 实验
+                                                              ├─ 接受 24 个已认证候选
+                                                              ├─ 三视图 joint medoid
+                                                              ├─ 既有 signature 确定性映射 target/reference
+                                                              └─ provisional bank，明确未做 semantic review
 
-显式批准后的低频步骤（不属于本地聚类命令）
-  └─ DeepSeek 按 candidate 批量做 coherence audit + target/reference synthesis
+可选回退（仅在 local-direct 实验不足时启用）
+  └─ DeepSeek 或人工/本地模型做 coherence audit + target/reference synthesis
        └─ 独立 card review
-            └─ target/reference 编译 layer-24 side-KV
+            └─ 经过语义认证的 tensor-free bank
+
+任一 tensor-free bank
+  └─ target/reference 编译 layer-24 side-KV
 
 同一批 construction pairs
   └─ failure trajectory 第一次 entropy+risk joint gate
@@ -108,12 +116,37 @@ greedy NMS，不使用传递闭包，因此 A 与 B、B 与 C 相似但 A 与 C 
 与已选集合的最大 joint similarity 从低到高做 farthest-first，以有限名额优先增加机制覆盖。
 
 进入后续 target/reference synthesis 的 candidate 硬上限为 48；未来正式 runtime bank 硬上限为 32。
-shortlist 输出仍设置 `qualified_for_online_use: false`，因为它只是付费合成的输入 basis，不是 process card 或
+shortlist 输出仍设置 `qualified_for_online_use: false`，因为它只是后续 bank 构造的输入 basis，不是 process card 或
 side-KV。传给未来 synthesis prompt 的每条代表证据只包含
 `problem_structure/decision_point/failure_mechanism/repair_operator/verification_operator` 五个语义字段；ID、hash、
 support 与筛选分数单独保存在 provenance 中，避免把实例标识和审计噪声塞进 teacher prompt。
 
-### 2.3 冻结的 V4.1 路径（仅作历史对照）
+### 2.3 当前 V4.2 local-direct 实验
+
+为先验证 bank、Side-KV、selector 与 gate 生命周期的主链路，当前默认不执行 DeepSeek 或 GLM 的逐 evidence
+语义审核。`build_v4_2_local_direct_bank.py` 接受 semantic preflight 中已经应用人工 policy 的 24 个候选与
+167 条 bounded evidence；这些候选已经通过三视图绝对阈值、complete-link、最少五个不同 sample、高质量
+shortlist 与 candidate-centroid 去冗余，但不能因此被称为经过语义认证的正式 bank。
+
+每个候选只在其五到八条 retained evidence 中选择一个确定性 joint medoid。对每个候选 evidence，分别计算它
+与其余 evidence 在 mechanism、repair、applicability 三个冻结 embedding view 中的平均 cosine，再按上游
+profile 的 `0.45/0.45/0.10` 权重求和；最高者成为 medoid，相同分数按 `experience_id` 升序决胜。target 的
+scope、diagnosis、action、verification 分别直接取 medoid signature 的 problem structure、decision point、
+repair operator 与 verification operator；reference 的 undesired pattern 和 failure mechanism 直接取 medoid
+failure mechanism。禁用边界与 target/reference contrast 只使用冻结的 process-only 模板，不请求模型改写。
+
+输出明确记录 `quality_tier: provisional_local_direct`、`semantic_audit_performed: false`、
+`independent_review_performed: false`、`external_api_calls_made: 0` 与 `api_key_read: false`。历史 source signature
+teacher 只作为上游 provenance 单独保存，不能被解释为本轮调用。每条 record 仍绑定原 candidate membership、
+semantic evidence packet、source signature、shortlist 与 policy hash；免费执行的 ID、distinct-sample、角色、
+泄漏规则、layer 与 canonical pre-RoPE 检查不省略。
+
+local-direct bank 是低成本 ablation，不是对语义质量的声明。它先进入 layer-24 Side-KV 编译与 selector-anchor
+资格过滤；没有至少五个不同 construction problem 的 failure gate anchors，或者 leave-one-problem-out 无法
+正确路由的 bank 仍不能在线使用。如果这条路线的 dev/test 因果结果不足，再回退到 DeepSeek、GLM 或人工
+semantic audit，而无需重做本地聚类与 shortlist。
+
+### 2.4 冻结的 V4.1 路径（仅作历史对照）
 
 V4.1 不再续跑旧的 bounded map-reduce，也不重新调用已经完成的 5318 条 signature。输入仍不是 V3 teacher
 bank 或旧 memory，而是 Phase-1 原始 verifier-backed contrast pairs、完整的
@@ -310,6 +343,12 @@ OUTPUT_ROOT/
     bank_records.jsonl                     # paid, tensor-free
     bank_manifest.json                     # paid, not yet runtime-qualified
     paid_stage_report.json                 # paid
+  offline/construction_v4_2_local_direct/
+    construction_profile.json              # zero API, explicitly unreviewed
+    medoid_selections.jsonl                 # deterministic three-view medoids
+    bank_records.jsonl                     # provisional tensor-free bank
+    bank_manifest.json                     # local-direct provenance and hashes
+    local_direct_report.json               # zero-API construction report
   offline/side_kv/
     v4_side_kv.safetensors
     v4_side_kv_manifest.json
@@ -409,7 +448,26 @@ python scripts/build_v4_2_semantic_bank.py \
 ```
 
 preflight 报告区分 nominal batch count、schema-invalid response 递归拆包后的逻辑请求上界，以及 short
-retry 的 HTTP 尝试上界。先检查 `api_preflight_report.json`；只有明确接受成本后才运行付费模式：
+retry 的 HTTP 尝试上界。当前默认直接从这个 authenticated evidence basis 构造 local-direct bank：
+
+```bash
+python scripts/build_v4_2_local_direct_bank.py \
+  --experiences "$PHASE1_DIR/verified_experiences.jsonl" \
+  --split-manifest "$PHASE1_DIR/split_manifest.json" \
+  --source-signatures "$V4_SOURCE_DIR/repair_signatures.jsonl" \
+  --source-construction-profile "$V4_SOURCE_DIR/construction_profile.json" \
+  --local-construction-dir "$OUTPUT_ROOT/offline/construction_v4_2_local" \
+  --shortlist-dir "$OUTPUT_ROOT/offline/construction_v4_2_shortlist" \
+  --semantic-preflight-dir "$OUTPUT_ROOT/offline/construction_v4_2_semantic" \
+  --semantic-policy configs/experiments/gsm8k/v4_2_semantic_policy.json \
+  --output-dir "$OUTPUT_ROOT/offline/construction_v4_2_local_direct" \
+  --dataset-revision main \
+  --resume
+```
+
+该命令不接受 model、base URL 或 API-key 参数，不创建 teacher client；输出 24 条 provisional bank records 时
+仍保持 `qualified_for_online_use: false`。若后续 local-direct 因果结果不足，才明确接受成本并运行以下可选付费
+模式：
 
 ```bash
 python scripts/build_v4_2_semantic_bank.py \
@@ -433,11 +491,14 @@ batch review。target 只来自官方解与 verified success；reference 只来�
 拒绝都不会生成正式 bank record。所有有效响应按 candidate checkpoint，HTTP `402/403` 后可用同一命令
 恢复。
 
-仓库根目录 `test.sh` 将 shortlist authentication 与 semantic preflight 合并成一条安全命令。默认调用为零
-API；只有同时指定 paid stage、显式批准变量和 key 才会调用 DeepSeek：
+仓库根目录 `test.sh` 将 shortlist authentication、semantic evidence preflight 与 local-direct bank 构造合并成
+一条安全命令。默认调用为零 API，并直接产生 provisional bank；`preflight` 可只检查输入，只有同时指定 paid
+stage、显式批准变量和 key 才会调用 DeepSeek：
 
 ```bash
 bash test.sh
+
+MEMGEN_V4_2_STAGE=preflight bash test.sh
 
 MEMGEN_V4_2_STAGE=paid \
 MEMGEN_V4_2_APPROVE_PAID_STAGE=1 \
@@ -445,10 +506,11 @@ DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
 bash test.sh
 ```
 
-如果自动发现到不止一个 Phase-1 目录，再显式设置 `MEMGEN_PHASE1_DIR`。V4.2 semantic manifest 仍标记为
-`constructed_not_tensor_compiled` 和 `qualified_for_online_use: false`；下一阶段才编译固定 layer 24 的
-target/reference side-KV 与单层 selector anchors。现有 `run_v4_system.sh --stage construct-cards` 消费的是
-V4.1 `cluster_plan.json`，不能读取 V4.2 semantic bank。
+如果自动发现到不止一个 Phase-1 目录，再显式设置 `MEMGEN_PHASE1_DIR`。local-direct manifest 使用独立 schema
+并明确标记 `provisional_local_direct`、`constructed_not_tensor_compiled` 和
+`qualified_for_online_use: false`；下一阶段才编译固定 layer 24 的 target/reference side-KV 与单层 selector
+anchors。现有 `run_v4_system.sh --stage construct-cards` 消费的是 V4.1 `cluster_plan.json`，不能读取 V4.2
+local-direct bank。
 
 以下 V4.1 付费命令保留为历史复现实验，不是当前推荐路径。检查
 `construction_v4_1/cluster_plan.json` 后，再构造 card：
