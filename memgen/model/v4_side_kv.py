@@ -34,6 +34,11 @@ from memgen.experience.v4_2_local_direct import (
     V42LocalDirectProfile,
     local_direct_implementation_hashes,
 )
+from memgen.experience.v4_2_curated import (
+    V4_2_CURATED_BANK_MANIFEST_SCHEMA,
+    V42CuratedProfile,
+    curated_implementation_hashes,
+)
 from memgen.model.side_kv import (
     DecoderLayerResolver,
     SideKVMemory,
@@ -79,6 +84,8 @@ def _v4_bank_implementation_hashes(
         )
     elif schema_version == V4_2_LOCAL_DIRECT_BANK_MANIFEST_SCHEMA:
         return local_direct_implementation_hashes(project_root)
+    elif schema_version == V4_2_CURATED_BANK_MANIFEST_SCHEMA:
+        return curated_implementation_hashes(project_root)
     else:
         raise ValueError("Unexpected tensor-free V4 bank manifest schema")
     return {relative: file_sha256(project_root / relative) for relative in paths}
@@ -182,6 +189,7 @@ def validate_v4_tensor_free_manifest(value: Mapping[str, Any]) -> None:
         V4_BANK_MANIFEST_SCHEMA,
         V4_1_BANK_MANIFEST_SCHEMA,
         V4_2_LOCAL_DIRECT_BANK_MANIFEST_SCHEMA,
+        V4_2_CURATED_BANK_MANIFEST_SCHEMA,
     }:
         raise ValueError("Unexpected tensor-free V4 bank manifest schema")
     stored = value.get("manifest_sha256")
@@ -202,8 +210,10 @@ def validate_v4_tensor_free_manifest(value: Mapping[str, Any]) -> None:
         profile = V4ConstructionProfile(**value.get("profile", {}))
     elif schema_version == V4_1_BANK_MANIFEST_SCHEMA:
         profile = V41ConstructionProfile(**value.get("profile", {}))
-    else:
+    elif schema_version == V4_2_LOCAL_DIRECT_BANK_MANIFEST_SCHEMA:
         profile = V42LocalDirectProfile(**value.get("profile", {}))
+    else:
+        profile = V42CuratedProfile(**value.get("profile", {}))
     if value.get("profile_sha256") != profile.profile_sha256:
         raise ValueError("V4 tensor-free construction profile hash mismatch")
     bank_ids = value.get("bank_ids")

@@ -1,0 +1,166 @@
+{
+  "decisions": [
+    {
+      "bank_id": "v42-local-direct-e0b57f9b9452ae02853f",
+      "decision": "conditional",
+      "reason": "The repair is coherent but its scope is narrowly tied to a future-age template.",
+      "semantic_category": "requested-entity state update"
+    },
+    {
+      "bank_id": "v42-local-direct-08f09abf7bee2d03527a",
+      "decision": "hard_reject",
+      "reason": "Trailing-zero and decimal cleanup is answer serialization, not a reasoning repair.",
+      "semantic_category": "answer serialization"
+    },
+    {
+      "bank_id": "v42-local-direct-1319a44334cd1c5921d7",
+      "decision": "quarantine",
+      "reason": "Recompute carefully or use a calculator is generic and not an executable mechanism-specific repair.",
+      "semantic_category": "generic arithmetic retry"
+    },
+    {
+      "bank_id": "v42-local-direct-2ab7f1f13e8140ebcd07",
+      "decision": "hard_reject",
+      "reason": "Removing a percent sign is verifier-specific answer serialization rather than reasoning repair.",
+      "semantic_category": "answer serialization"
+    },
+    {
+      "bank_id": "v42-local-direct-5d3d51c4a3ed2433b7ba",
+      "decision": "conditional",
+      "reason": "The omitted-revenue repair is coherent but retains a narrow multi-category profit scope.",
+      "semantic_category": "complete aggregation"
+    },
+    {
+      "bank_id": "v42-local-direct-e85bfcf09d3401a2b3df",
+      "decision": "hard_reject",
+      "reason": "Boxed-answer placement is answer serialization and may encourage premature answer emission.",
+      "semantic_category": "answer serialization"
+    },
+    {
+      "bank_id": "v42-local-direct-6f48a282bf80c76b6020",
+      "decision": "primary",
+      "reason": "The total-versus-single-unit discount failure is explicit, actionable, and locally verifiable.",
+      "semantic_category": "percentage base selection"
+    },
+    {
+      "bank_id": "v42-local-direct-da6cc415c2facc521172",
+      "decision": "primary",
+      "reason": "The remaining-distance repair correctly requires the remaining rather than total time.",
+      "semantic_category": "remaining-state denominator"
+    },
+    {
+      "bank_id": "v42-local-direct-a963d17d30a4a7b0a3b5",
+      "decision": "primary",
+      "reason": "The known-part to unit-part to requested-part procedure is reusable and verifiable.",
+      "semantic_category": "ratio scaling"
+    },
+    {
+      "bank_id": "v42-local-direct-6e31e02c696373d07778",
+      "decision": "primary",
+      "reason": "Each percentage operation explicitly identifies and verifies its current base.",
+      "semantic_category": "percentage base selection"
+    },
+    {
+      "bank_id": "v42-local-direct-0f1ada5f5f6427cc66ee",
+      "decision": "conditional",
+      "reason": "Count-versus-value unit consistency is coherent but expressed through a coin-specific scope.",
+      "semantic_category": "unit-valued quantity"
+    },
+    {
+      "bank_id": "v42-local-direct-6e9f612746ca7eff501f",
+      "decision": "primary",
+      "reason": "The total divided by per-container capacity repair has a clear inverse verification.",
+      "semantic_category": "capacity inversion"
+    },
+    {
+      "bank_id": "v42-local-direct-59fdfd9c885f2a395dd4",
+      "decision": "conditional",
+      "reason": "Accounting for every full group is coherent but tied to a groups-plus-remainder template.",
+      "semantic_category": "complete aggregation"
+    },
+    {
+      "bank_id": "v42-local-direct-7282e2348bca6fec402c",
+      "decision": "quarantine",
+      "reason": "The card has the weakest applicability and an overly narrow test-score plausibility boundary.",
+      "semantic_category": "target-average equation"
+    },
+    {
+      "bank_id": "v42-local-direct-f3202b32556e51c81cd4",
+      "decision": "primary",
+      "reason": "The per-day to per-week conversion identifies the rate unit and the correct scale direction.",
+      "semantic_category": "rate times duration"
+    },
+    {
+      "bank_id": "v42-local-direct-8740c1daf90997be335e",
+      "decision": "quarantine",
+      "reason": "Use the correct conversion factor is circular and lacks a procedure for choosing its direction.",
+      "semantic_category": "unit conversion"
+    },
+    {
+      "bank_id": "v42-local-direct-c5801aceeda1c59bfe63",
+      "decision": "primary",
+      "reason": "The chained-ratio repair explicitly carries the intermediate state into the next relation.",
+      "semantic_category": "chained-state update"
+    },
+    {
+      "bank_id": "v42-local-direct-6e68ccdd603bcbffda68",
+      "decision": "primary",
+      "reason": "The card repairs omission of quantity scaling after computing a per-unit duration.",
+      "semantic_category": "rate times count"
+    },
+    {
+      "bank_id": "v42-local-direct-2e4c0a16658d42c2240d",
+      "decision": "primary",
+      "reason": "Explicitly listing and combining every variable coefficient is actionable and exactly verifiable.",
+      "semantic_category": "algebraic aggregation"
+    },
+    {
+      "bank_id": "v42-local-direct-3e96dd310ac509422c1b",
+      "decision": "primary",
+      "reason": "The wage repair restores the omitted day-count factor before component aggregation.",
+      "semantic_category": "rate times duration"
+    },
+    {
+      "bank_id": "v42-local-direct-e9bccf623eb4496edd8d",
+      "decision": "conditional",
+      "reason": "A non-negative difference is sound only when the problem explicitly requests an absolute magnitude.",
+      "semantic_category": "requested magnitude"
+    },
+    {
+      "bank_id": "v42-local-direct-118aeafc5d7d9e5be93f",
+      "decision": "hard_reject",
+      "reason": "The reference incorrectly claims that sequentially subtracting the second transfer subtracts it twice.",
+      "semantic_category": "invalid target-reference contrast"
+    },
+    {
+      "bank_id": "v42-local-direct-2eef8fa381893120c524",
+      "decision": "conditional",
+      "reason": "Reporting an already-computed remaining quantity is coherent but narrowly scoped and lower-applicability.",
+      "semantic_category": "requested quantity interpretation"
+    },
+    {
+      "bank_id": "v42-local-direct-5e95ddd043802bc0dace",
+      "decision": "primary",
+      "reason": "The repair preserves the stated sequential operands and forbids an unstated fractional operation.",
+      "semantic_category": "declared-operation sequence"
+    }
+  ],
+  "expected_decision_counts": {
+    "conditional": 6,
+    "hard_reject": 4,
+    "primary": 11,
+    "quarantine": 3
+  },
+  "expected_retained_evidence_count": 116,
+  "expected_retained_record_count": 17,
+  "expected_source_evidence_count": 167,
+  "expected_source_record_count": 24,
+  "retained_decisions": [
+    "primary",
+    "conditional"
+  ],
+  "schema_version": "memgen-v4.2-local-curation-policy-v1",
+  "source_manifest_sha256": "d082563b3477df2b9bddd320bde41120a456488b02a2fade14d09c5abad33ab2",
+  "source_profile_sha256": "72e20a1158f6e67fed8bec4695cebbd563ded06bfb46ecacd9d6b6da57c19ff5",
+  "source_record_order_sha256": "1c758d960c222d416ed68acb9c8447907068553631d8ba85f0ffb4c2298eb56f"
+}

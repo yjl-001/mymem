@@ -349,6 +349,22 @@ OUTPUT_ROOT/
     bank_records.jsonl                     # provisional tensor-free bank
     bank_manifest.json                     # local-direct provenance and hashes
     local_direct_report.json               # zero-API construction report
+  offline/construction_v4_2_local_curated/
+    construction_profile.json              # frozen static-review claims
+    curation_decisions.jsonl               # all 24 retain/exclude decisions
+    bank_records.jsonl                     # 17 retained, rehashed records
+    bank_manifest.json                     # source/policy/code authenticated
+    curation_report.json                   # 24 -> 17 and 167 -> 116 summary
+  offline/side_kv_v4_2_local_curated/
+    v4_side_kv.safetensors                 # 17 target + 17 reference records
+    v4_side_kv_manifest.json
+    v4_side_kv_compile_report.json
+  offline/selector_v4_2_local_curated/
+    v4_selector_anchors.safetensors
+    v4_selector_anchor_manifest.json
+    v4_selector_calibration_rows.jsonl
+    v4_selector_calibration_report.json
+    v4_selector_anchor_compile_report.json
   offline/side_kv/
     v4_side_kv.safetensors
     v4_side_kv_manifest.json
@@ -511,6 +527,48 @@ bash test.sh
 `qualified_for_online_use: false`；下一阶段才编译固定 layer 24 的 target/reference side-KV 与单层 selector
 anchors。现有 `run_v4_system.sh --stage construct-cards` 消费的是 V4.1 `cluster_plan.json`，不能读取 V4.2
 local-direct bank。
+
+### 6.1 V4.2 local-direct 的静态高质量子集
+
+原始 24 条 local-direct bank 保留为完整 ablation，不直接覆盖或原地编辑。对其 process card 的静态检查将
+11 条标记为 `primary`、6 条标记为 `conditional`、3 条标记为 `quarantine`、4 条标记为
+`hard_reject`。当前主实验只保留前两类，共 17 条、116 条 distinct-sample construction evidence。
+
+该决策完整保存在
+`configs/experiments/gsm8k/v4_2_local_curation_policy.json`，并同时绑定原始 24 条 bank 的 manifest
+logical hash、profile hash、record-order hash、记录数和 evidence 数。提取命令会重新认证原始 manifest、
+construction profile、report 和每条 record hash；再为 17 条输出加入 curation provenance，并重新计算
+record hash 与 manifest hash。它不读取 API key、不运行 teacher，也不把本次静态 process-card 检查表述成
+完整 construction-evidence audit 或独立语义审查。因此输出仍是 `provisional_local_curated`，在 Side-KV 与
+selector-anchor 编译之前保持 `qualified_for_online_use: false`。
+
+只提取 17 条 tensor-free bank：
+
+```bash
+python scripts/curate_v4_2_local_direct_bank.py \
+  --source-dir "$OUTPUT_ROOT/offline/construction_v4_2_local_direct" \
+  --policy configs/experiments/gsm8k/v4_2_local_curation_policy.json \
+  --output-dir "$OUTPUT_ROOT/offline/construction_v4_2_local_curated" \
+  --resume
+```
+
+推荐用同一个入口顺序执行提取、固定 layer-24 target/reference Side-KV 编译和单层 selector-anchor 构造：
+
+```bash
+bash scripts/experiments/gsm8k/run_v4_2_curated_offline.sh \
+  --stage all \
+  "$PHASE1_DIR" \
+  "$E0_DIR" \
+  "$TOKEN_RISK_ARTIFACT" \
+  "$OUTPUT_ROOT"
+```
+
+也可以不传位置参数，改设 `MEMGEN_PHASE1_DIR`、`MEMGEN_E0_DIR`、
+`MEMGEN_TOKEN_RISK_ARTIFACT` 和 `MEMGEN_V4_OUTPUT_ROOT`；未设置时只有找到唯一匹配 artifact 才会自动
+继续。`--stage curate`、`--stage side-kv` 与 `--stage selector` 可单独重跑。Side-KV 必须输出 17 个
+target 和 17 个 reference，在线 loader 仍只暴露 target。selector 对每个 bank 至少要求五个 distinct
+failure gate anchors，并在 answer-blind LOO 校准中限制 success false-selection 与 failure misrouting；因此
+其最终 `qualified_bank_count` 可以小于 17，但任何不满足校准合同的情形都会 fail closed。
 
 以下 V4.1 付费命令保留为历史复现实验，不是当前推荐路径。检查
 `construction_v4_1/cluster_plan.json` 后，再构造 card：
