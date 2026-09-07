@@ -177,15 +177,31 @@ class V4PipelineContractTests(unittest.TestCase):
         self.assertIn("episode.apply_selection", source)
         self.assertIn("episode.observe_decoded_token", source)
 
-    def test_runner_keeps_offline_and_online_entry_points_explicit(self) -> None:
+    def test_curated_runner_exposes_only_the_active_offline_pipeline(self) -> None:
         source = (
-            ROOT / "scripts/experiments/gsm8k/run_v4_system.sh"
+            ROOT / "scripts/experiments/gsm8k/run_v4_2_curated_offline.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn("build_v4_1_repair_bank.py", source)
-        self.assertIn("repair_signatures.jsonl", source)
+        self.assertIn("curate_v4_2_local_direct_bank.py", source)
         self.assertIn("compile_v4_side_kv.py", source)
         self.assertIn("compile_v4_selector_anchors.py", source)
-        self.assertIn("evaluate_v4_experience_memory.py", source)
+        self.assertNotIn("build_v4_1_repair_bank.py", source)
+        self.assertNotIn("evaluate_v4_experience_memory.py", source)
+
+    def test_source_oracle_runner_is_offline_and_exposes_smoke_and_full(self) -> None:
+        source = (
+            ROOT
+            / "scripts/experiments/gsm8k/run_v4_source_oracle_audit.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("set -euo pipefail", source)
+        self.assertIn("--mode smoke|full", source)
+        self.assertIn("extract_v4_source_state_cache.py", source)
+        self.assertIn("audit_v4_source_state_cache.py", source)
+        self.assertIn("audit_v4_oracle_causal_utility.py", source)
+        self.assertIn(".counts.bank_count == 17", source)
+        self.assertIn(".counts.independent_sample_count == 116", source)
+        self.assertIn("unset DEEPSEEK_API_KEY GLM_API_KEY", source)
+        self.assertNotIn("evaluate_v4_experience_memory.py", source)
+        self.assertNotIn('"dev-test"', source)
         self.assertNotIn('"final-test"', source)
 
 

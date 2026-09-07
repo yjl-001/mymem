@@ -79,12 +79,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("bfloat16",), default="bfloat16")
     parser.add_argument("--max-sequence-length", type=int, default=0)
-    parser.add_argument(
-        "--max-unsafe-rate",
-        type=float,
-        default=MAX_UNSAFE_RATE,
-        help="Frozen upper bound for success false-selection and failure misrouting.",
-    )
     return parser.parse_args()
 
 
@@ -543,8 +537,6 @@ def _construction_bank_membership(
 
 def main() -> None:
     args = parse_args()
-    if not math.isclose(args.max_unsafe_rate, MAX_UNSAFE_RATE, rel_tol=0.0, abs_tol=1e-12):
-        raise ValueError("V4 initial selector calibration freezes max unsafe rate at 0.05")
     for path in (
         args.experiences,
         args.split_manifest,
