@@ -36,6 +36,10 @@ from memgen.experience.v4_oracle_audit import (
     validate_result_against_plan,
 )
 from memgen.experience.v4_source_state import load_source_state_cache
+from memgen.experience.v4_question_recovery import (
+    load_recovered_source_experiences,
+    validate_question_recovery_manifest,
+)
 from scripts.build_v4_repair_bank import _validate_split_manifest, load_v4_experiences
 from scripts.compile_v4_selector_anchors import _tokenize_trajectory
 
@@ -49,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bank-manifest", type=Path, required=True)
     parser.add_argument("--side-kv-manifest", type=Path, required=True)
     parser.add_argument("--token-risk-artifact", type=Path, required=True)
+    parser.add_argument(
+        "--question-recovery-manifest",
+        type=Path,
+        help="Explicit semantic-packet replay lineage used by the source-state cache.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dataset-revision", default="main")
     parser.add_argument("--device", default="cuda")
@@ -217,6 +226,29 @@ def _build_profile(
         "audit_interpretation": "optimistic_source_positive_control_and_mechanism_qualification",
         "qualified_for_online_use": False,
     }
+    if args.question_recovery_manifest is not None:
+        recovery = validate_question_recovery_manifest(
+            args.question_recovery_manifest
+        )
+        material["inputs"].update(
+            {
+                "question_recovery_manifest_path": str(
+                    args.question_recovery_manifest.resolve()
+                ),
+                "question_recovery_manifest_sha256": file_sha256(
+                    args.question_recovery_manifest
+                ),
+            }
+        )
+        material["question_recovery"] = {
+            "manifest_logical_sha256": recovery["manifest_sha256"],
+            "original_phase1_file_recovery_claim": False,
+            "original_risk_artifact_recovery_claim": False,
+            "same_source_question": True,
+            "same_source_success_trajectory": True,
+            "same_source_failure_trajectory": True,
+            "held_out_generalization_claim": False,
+        }
     return {
         **material,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -241,6 +273,41 @@ def _validate_input_bindings(args: argparse.Namespace, cache: Any) -> None:
             raise FileNotFoundError(path)
         if inputs.get(field) != file_sha256(path):
             raise ValueError(f"V4 oracle input differs from source-state cache: {field}")
+    cache_recovery = cache.manifest.get("provenance", {}).get("question_recovery")
+    if args.question_recovery_manifest is None:
+        if cache_recovery is not None:
+            raise ValueError("Recovery source-state cache requires its recovery manifest")
+    else:
+        recovery = validate_question_recovery_manifest(
+            args.question_recovery_manifest
+        )
+        if (
+            inputs.get("question_recovery_manifest_sha256")
+            != file_sha256(args.question_recovery_manifest)
+            or not isinstance(cache_recovery, Mapping)
+            or cache_recovery.get("manifest_logical_sha256")
+            != recovery["manifest_sha256"]
+        ):
+            raise ValueError("V4 oracle recovery lineage differs from source-state cache")
+
+
+def _apply_recovery_report_claims(
+    report: dict[str, Any], *, enabled: bool
+) -> dict[str, Any]:
+    if not enabled:
+        return report
+    report.pop("report_sha256", None)
+    report["question_recovery"] = {
+        "original_phase1_file_recovery_claim": False,
+        "original_risk_artifact_recovery_claim": False,
+        "same_source_question": True,
+        "same_source_success_trajectory": True,
+        "same_source_failure_trajectory": True,
+        "held_out_generalization_claim": False,
+        "external_api_calls_made": 0,
+    }
+    report["report_sha256"] = _logical_hash(report, "report_sha256")
+    return report
 
 
 def main() -> None:
@@ -307,9 +374,15 @@ def main() -> None:
     split_manifest = _validate_split_manifest(
         args.split_manifest, dataset_revision=args.dataset_revision
     )
-    experiences = load_v4_experiences(
-        args.experiences, split_manifest=split_manifest
-    )
+    if args.question_recovery_manifest is not None:
+        experiences = load_recovered_source_experiences(
+            args.question_recovery_manifest,
+            experiences_path=args.experiences,
+        )
+    else:
+        experiences = load_v4_experiences(
+            args.experiences, split_manifest=split_manifest
+        )
     experience_by_id = {str(item["experience_id"]): item for item in experiences}
     role_loader = V4OfflineSideKVRoleBankLoader(
         manifest_path=args.side_kv_manifest
@@ -472,8 +545,11 @@ def main() -> None:
                 if value in result_by_case
             ]
             _write_jsonl(results_path, ordered_rows)
-            progress = aggregate_oracle_results(
-                plan=plan, rows=ordered_rows, profile_sha256=profile_sha256
+            progress = _apply_recovery_report_claims(
+                aggregate_oracle_results(
+                    plan=plan, rows=ordered_rows, profile_sha256=profile_sha256
+                ),
+                enabled=args.question_recovery_manifest is not None,
             )
             _write_json(report_path, progress)
             print(
@@ -488,8 +564,11 @@ def main() -> None:
         controller.close()
 
     rows = [result_by_case[case_id] for case_id in expected_case_ids]
-    report = aggregate_oracle_results(
-        plan=plan, rows=rows, profile_sha256=profile_sha256
+    report = _apply_recovery_report_claims(
+        aggregate_oracle_results(
+            plan=plan, rows=rows, profile_sha256=profile_sha256
+        ),
+        enabled=args.question_recovery_manifest is not None,
     )
     if not report["complete"]:
         raise RuntimeError("V4 oracle audit did not complete its case plan")

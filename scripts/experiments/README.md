@@ -22,6 +22,80 @@ cp scripts/experiments/gsm8k/e1.server.env.example \
 
 ## 当前经验记忆流程
 
+### 优先：从 semantic packet 零付费恢复当前 V4 source evidence
+
+如果下面的文件仍存在：
+
+```text
+offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl
+```
+
+当前 curated 17-bank 使用的 116 条原题、success/failure 原始轨迹和 verifier 证据可以直接恢复，不需要调用
+DeepSeek，也不需要重新生成 bank 或 Side-KV。服务器 smoke：
+
+```bash
+bash scripts/experiments/gsm8k/run_v4_question_recovery.sh \
+  --mode smoke \
+  --stage all \
+  gsm8k-v4-packet-replay-20260907-r1 \
+  /data/memgen-runs/v4/offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl \
+  /data/memgen-runs/v4/offline/construction_v4_2_local_curated \
+  /data/memgen-runs/v4/offline/side_kv_v4_2_local_curated \
+  /data/memgen-runs
+```
+
+smoke 通过后用同一个 `RECOVERY_ID` 运行 full；risk 会复用，cache/oracle 写入独立的 full 目录：
+
+```bash
+bash scripts/experiments/gsm8k/run_v4_question_recovery.sh \
+  --mode full \
+  --stage all \
+  gsm8k-v4-packet-replay-20260907-r1 \
+  /data/memgen-runs/v4/offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl \
+  /data/memgen-runs/v4/offline/construction_v4_2_local_curated \
+  /data/memgen-runs/v4/offline/side_kv_v4_2_local_curated \
+  /data/memgen-runs
+```
+
+该入口只访问公开 GSM8K 和本地 Qwen，显式清除付费 provider keys。新 risk 使用全部 116 条 packet replay
+轨迹并保持正式 qualification 门槛；smoke 只缩小 cache/oracle。输出明确声明它不是旧 Phase-1 文件或旧 risk
+artifact 的 byte-identical 恢复，也不是 held-out 泛化实验。
+
+### 备选：全新 Phase-1 / risk 数据与唯一血缘
+
+仅当 semantic packet 也已丢失，并且明确接受新的付费 teacher/reviewer 调用时，才使用本节。Phase-1 与 risk
+不再建议以两个散落目录传给后续实验。需要重新构造时，先选一个永久不复用的
+`LINEAGE_ID`，一次性写入固定根目录：
+
+```bash
+bash scripts/experiments/gsm8k/run_phase1_risk_lineage.sh \
+  --stage all \
+  --allow-paid-phase1 \
+  --bank-manifest /data/memgen-runs/v4/offline/construction_v4_2_local_curated/bank_manifest.json \
+  --side-kv-manifest /data/memgen-runs/v4/offline/side_kv_v4_2_local_curated/v4_side_kv_manifest.json \
+  gsm8k-v4-phase1-20260907-r1 \
+  /data/memgen-runs
+```
+
+`--allow-paid-phase1` 是必需的显式确认，因为完整 Phase-1 会执行 teacher/reviewer API 调用；risk
+阶段本身不调用外部教师。脚本不会进入 V4 selector、source-state、oracle、dev-test 或 final-test。
+
+成功后只使用该 lineage 内生成的环境文件，不再手填两个路径：
+
+```bash
+source /data/memgen-runs/lineages/gsm8k/gsm8k-v4-phase1-20260907-r1/USE_THIS_LINEAGE.env
+```
+
+同目录的 `phase1_risk_lineage_manifest.json` 绑定完整 Phase-1、V3.4 risk evidence/report/artifact
+的 SHA，并记录其与指定 V4 bank/Side-KV 的逐项兼容性。sealed lineage 不允许原地改写；任何输入变化都必须
+换新的 `LINEAGE_ID`。
+
+特别注意：重新采样得到的新 Phase-1 通常**不兼容**旧 V4 bank。旧 bank 绑定的是原
+`verified_experiences.jsonl` 和 `split_manifest.json` 的文件级 SHA；即使配置和样本 ID 相同，也不能把
+新文件当成原文件。manifest 若报告
+`incompatible_rebuild_or_original_data_recovery_required`，必须恢复原始 Phase-1，或从新 lineage 重建
+下游 bank/Side-KV；不能直接运行 V4 cache/oracle。
+
 1. 构造 verifier-backed Phase 1 bank：
 
 ```bash

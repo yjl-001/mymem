@@ -12,6 +12,8 @@ CALLER_RUN_TAG_SET="${MEMGEN_RUN_TAG+x}"
 CALLER_RUN_TAG="${MEMGEN_RUN_TAG:-}"
 CALLER_TEACHER_LIMIT_SET="${MEMGEN_PHASE1_TEACHER_LIMIT+x}"
 CALLER_TEACHER_LIMIT="${MEMGEN_PHASE1_TEACHER_LIMIT:-}"
+CALLER_OUTPUT_DIR_SET="${MEMGEN_PHASE1_OUTPUT_DIR+x}"
+CALLER_OUTPUT_DIR="${MEMGEN_PHASE1_OUTPUT_DIR:-}"
 
 if [[ ! -f "$SERVER_ENV" ]]; then
   echo "Missing $SERVER_ENV. Copy scripts/experiments/server.env.example and fill it in." >&2
@@ -25,14 +27,18 @@ fi
 if [[ -n "$CALLER_TEACHER_LIMIT_SET" ]]; then
   export MEMGEN_PHASE1_TEACHER_LIMIT="$CALLER_TEACHER_LIMIT"
 fi
+if [[ -n "$CALLER_OUTPUT_DIR_SET" ]]; then
+  export MEMGEN_PHASE1_OUTPUT_DIR="$CALLER_OUTPUT_DIR"
+fi
 
 : "${MEMGEN_OUTPUT_ROOT:?MEMGEN_OUTPUT_ROOT must be set in .server.env}"
 : "${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY must be set in .server.env}"
 
 export CUDA_VISIBLE_DEVICES="${MEMGEN_DEVICES:-0}"
+PYTHON_BIN="${MEMGEN_PYTHON_BIN:-python}"
 RUN_TAG="${MEMGEN_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 RUN_ID="gsm8k_phase1_verified-student-contrast_${RUN_TAG}"
-RUN_DIR="$MEMGEN_OUTPUT_ROOT/banks/gsm8k/$RUN_ID"
+RUN_DIR="${MEMGEN_PHASE1_OUTPUT_DIR:-$MEMGEN_OUTPUT_ROOT/banks/gsm8k/$RUN_ID}"
 
 STUDENT_MODEL="${MEMGEN_GSM8K_STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 STUDENT_REVISION="${MEMGEN_GSM8K_STUDENT_REVISION:-main}"
@@ -72,7 +78,7 @@ QUARANTINED_BANK="$RUN_DIR/quarantined_bank_records.jsonl"
 AI_REVIEW_REPORT="$RUN_DIR/ai_review_report.json"
 
 if [[ ! -s "$SPLIT_MANIFEST" ]]; then
-  python scripts/build_gsm8k_split_manifest.py \
+  "$PYTHON_BIN" scripts/build_gsm8k_split_manifest.py \
     --output "$SPLIT_MANIFEST" \
     --bank-source-size "$BANK_SOURCE_SIZE" \
     --calibration-val-size "$CALIBRATION_VAL_SIZE" \
@@ -83,7 +89,7 @@ else
 fi
 
 if [[ ! -s "$ROLLOUTS" || ! -s "$ROLLOUT_SUMMARY" ]]; then
-  python scripts/collect_gsm8k_rollouts.py \
+  "$PYTHON_BIN" scripts/collect_gsm8k_rollouts.py \
     --split-manifest "$SPLIT_MANIFEST" \
     --output "$ROLLOUTS" \
     --summary-output "$ROLLOUT_SUMMARY" \
@@ -104,7 +110,7 @@ fi
 
 # This step is deterministic and cheap. Always rebuild it so legacy v1 rollout
 # verifier records are re-diagnosed under the current strict+diagnostic policy.
-python scripts/build_verified_experiences.py \
+"$PYTHON_BIN" scripts/build_verified_experiences.py \
   --rollouts "$ROLLOUTS" \
   --output "$EXPERIENCES" \
   --report-output "$EXPERIENCE_REPORT" \
@@ -115,7 +121,7 @@ if [[ "$TEACHER_LIMIT" -eq 0 || "$TEACHER_LIMIT" -gt "$PAIR_COUNT" ]]; then
   TEACHER_LIMIT="$PAIR_COUNT"
 fi
 
-python scripts/build_teacher_bank.py \
+"$PYTHON_BIN" scripts/build_teacher_bank.py \
   --input-jsonl "$EXPERIENCES" \
   --limit "$TEACHER_LIMIT" \
   --model "$TEACHER_MODEL" \
@@ -129,7 +135,7 @@ python scripts/build_teacher_bank.py \
   --output "$TEACHER_RECORDS" \
   --resume
 
-python scripts/review_experience_bank.py \
+"$PYTHON_BIN" scripts/review_experience_bank.py \
   --experiences "$EXPERIENCES" \
   --teacher-records "$TEACHER_RECORDS" \
   --review-records-output "$AI_REVIEW_RECORDS" \

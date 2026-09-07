@@ -41,6 +41,10 @@ from memgen.experience.risk import (
     stable_low_recovery_offset,
     token_entropy_transition_label,
 )
+from memgen.experience.v4_question_recovery import (
+    load_recovered_source_experiences,
+    recovered_experience_selection,
+)
 
 
 REPORT_SCHEMA = "token-entropy-risk-diagnostic-v3.4"
@@ -76,7 +80,15 @@ class TokenEvent:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--approved-bank", type=Path, required=True)
+    parser.add_argument("--approved-bank", type=Path)
+    parser.add_argument(
+        "--question-recovery-manifest",
+        type=Path,
+        help=(
+            "Use authenticated semantic-packet replay records instead of an "
+            "AI-approved Phase-1 bank. Exactly one source mode is required."
+        ),
+    )
     parser.add_argument("--experiences", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", required=True)
@@ -310,6 +322,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Minimum held-out ROC AUC must be in [0, 1]")
     if args.experience_types != "answer_correctness":
         raise ValueError("V3.4 is restricted to approved answer_correctness data")
+    if (args.approved_bank is None) == (args.question_recovery_manifest is None):
+        raise ValueError(
+            "Provide exactly one of --approved-bank or --question-recovery-manifest"
+        )
 
 
 def main() -> None:
@@ -320,11 +336,23 @@ def main() -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from memgen.model.side_kv import SDPAAttentionEntropyObserver
 
-    selected, selection_report = approved_experiences(
-        list(iter_jsonl(args.approved_bank)),
-        list(iter_jsonl(args.experiences)),
-        allowed_experience_types=("answer_correctness",),
-    )
+    if args.question_recovery_manifest is not None:
+        recovered = load_recovered_source_experiences(
+            args.question_recovery_manifest,
+            experiences_path=args.experiences,
+        )
+        selected, selection_report = recovered_experience_selection(
+            recovered,
+            allowed_experience_types=("answer_correctness",),
+        )
+        source_mode = "semantic_packet_replay_strict_verifier_no_ai"
+    else:
+        selected, selection_report = approved_experiences(
+            list(iter_jsonl(args.approved_bank)),
+            list(iter_jsonl(args.experiences)),
+            allowed_experience_types=("answer_correctness",),
+        )
+        source_mode = "frozen_phase1_ai_approved_bank_no_additional_ai"
     if args.limit:
         selected = selected[: args.limit]
         selection_report["selected_count_after_limit"] = len(selected)
@@ -583,8 +611,27 @@ def main() -> None:
             "row_count": len(evidence_rows),
         },
         "inputs": {
-            "approved_bank_sha256": file_sha256(args.approved_bank),
-            "verified_experiences_sha256": file_sha256(args.experiences),
+            "approved_bank_sha256": (
+                file_sha256(args.approved_bank)
+                if args.approved_bank is not None
+                else None
+            ),
+            "verified_experiences_sha256": (
+                file_sha256(args.experiences)
+                if args.question_recovery_manifest is None
+                else None
+            ),
+            "recovered_experiences_sha256": (
+                file_sha256(args.experiences)
+                if args.question_recovery_manifest is not None
+                else None
+            ),
+            "question_recovery_manifest_sha256": (
+                file_sha256(args.question_recovery_manifest)
+                if args.question_recovery_manifest is not None
+                else None
+            ),
+            "source_mode": source_mode,
             "selection": selection_report,
             "compiler_git_revision": git_revision(),
             "risk_split_seed": args.risk_split_seed,
@@ -718,7 +765,11 @@ def main() -> None:
     artifact_path = output_dir / "token-entropy-risk-gate-v3.4.pt"
     artifact = {
         "schema_version": TOKEN_ENTROPY_RISK_ARTIFACT_SCHEMA,
-        "artifact_id": "token-entropy-risk-gate-v3.4-answer-correctness",
+        "artifact_id": (
+            "token-entropy-risk-gate-v3.4-question-replay"
+            if args.question_recovery_manifest is not None
+            else "token-entropy-risk-gate-v3.4-answer-correctness"
+        ),
         "status": "passed",
         "experience_type": "answer_correctness",
         "created_at": utc_now(),
@@ -738,7 +789,9 @@ def main() -> None:
             chat_template=CONVERSATION_TEMPLATE
         ),
         "construction": {
-            "source": "frozen_phase1_ai_approved_bank_no_additional_ai",
+            "source": source_mode,
+            "ai_review_approval_claim": args.question_recovery_manifest is None,
+            "original_risk_artifact_recovery_claim": False,
             "method": "token_entropy_risk_prototype_classifier",
             "fixed_layer": args.layer,
             "observation_scope": "every_pre_answer_generated_token",

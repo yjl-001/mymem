@@ -222,6 +222,84 @@ oracle audit 对每个 cache 中实际可达的 failure gate event 使用其已�
 报告保留全部 17 个 bank，单列 gate-unreachable failure，并把本结果限定为 construction source 上的 optimistic
 positive control / mechanism qualification，不能表述为 held-out 泛化。
 
+### 7.2 Semantic packet 零付费 source replay
+
+如果旧 Phase-1/risk 被删除，但当前 V4.2 semantic preflight 的
+`semantic_evidence_packets.jsonl` 仍存在，不需要重新调用 DeepSeek。该文件已经保存每条 evidence 的原题、官方
+GSM8K solution、原 verified-success trajectory、原 verified-failure trajectory 和两个 verifier 记录。curated
+bank 的 `construction.experience_ids` 可以从 167 条 packet evidence 中精确选回当前 17-bank 使用的 116 条。
+
+推荐的新入口是：
+
+```bash
+bash scripts/experiments/gsm8k/run_v4_question_recovery.sh \
+  --mode smoke \
+  --stage all \
+  gsm8k-v4-packet-replay-20260907-r1 \
+  "$V4_OUTPUT_ROOT/offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl" \
+  "$V4_OUTPUT_ROOT/offline/construction_v4_2_local_curated" \
+  "$V4_OUTPUT_ROOT/offline/side_kv_v4_2_local_curated" \
+  "$MEMGEN_OUTPUT_ROOT"
+```
+
+runner 会从公开 GSM8K 重建 seed 42、6000/1000 的 split，按 sample ID/source index/hash 核对题目和官方答案，
+再 seal `v4_question_recovery_manifest.json`。它不会伪造旧 `verified_experiences.jsonl` 的文件 SHA，不会伪造
+`ai_review_gate.route=ai_approved`，也不会声明恢复了旧 risk artifact。随后 V3.4 risk 以
+`semantic_packet_replay_strict_verifier_no_ai` 为独立 source mode 重新拟合，仍保持原有事件数与 held-out ROC-AUC
+资格门槛。
+
+smoke/full 都使用全部 116 条恢复轨迹拟合 risk；smoke 只限制 source-state/cache 和 oracle case 数。新 risk 会
+改变 gate reachability，因此旧报告中的 `50/116 unreachable` 不是 recovery runner 的硬断言。replay report
+固定声明：
+
+- `original_phase1_file_recovery_claim=false`；
+- `original_risk_artifact_recovery_claim=false`；
+- `same_source_question=true`；
+- `same_source_success_trajectory=true`；
+- `same_source_failure_trajectory=true`；
+- `held_out_generalization_claim=false`；
+- `external_api_calls_made=0`。
+
+这条结果是“相同 source 题目与相同原始轨迹、重新拟合 gate”的 optimistic mechanism audit，不是旧 Phase-1/risk
+的 byte-identical 复现，也不是跨题泛化结论。
+
+### 7.3 全新 Phase-1 / risk 的命名血缘
+
+V4 的 Phase-1 输入不是仅凭目录名识别：curated bank 的 `inputs` 绑定
+`verified_experiences.jsonl` 与 `split_manifest.json` 的文件级 SHA，risk artifact 另行绑定
+`ai_approved_bank_records.jsonl` 与 verified experiences。因而删除后重新采样得到的 Phase-1，即使使用相同
+seed、配置和 sample ID，也不是旧 17-bank 的等价输入。
+
+重新构造一条独立数据血缘时使用：
+
+```bash
+bash scripts/experiments/gsm8k/run_phase1_risk_lineage.sh \
+  --stage all \
+  --allow-paid-phase1 \
+  --bank-manifest "$CURATED_BANK_DIR/bank_manifest.json" \
+  --side-kv-manifest "$SIDE_KV_DIR/v4_side_kv_manifest.json" \
+  gsm8k-v4-phase1-20260907-r1 \
+  "$MEMGEN_OUTPUT_ROOT"
+
+source "$MEMGEN_OUTPUT_ROOT/lineages/gsm8k/gsm8k-v4-phase1-20260907-r1/USE_THIS_LINEAGE.env"
+```
+
+固定目录结构为：
+
+```text
+MEMGEN_OUTPUT_ROOT/lineages/gsm8k/LINEAGE_ID/
+  phase1/                              # 完整 verifier/teacher/reviewer 工件
+  risk_v3_4/                           # evidence、report、qualified .pt
+  phase1_risk_lineage_manifest.json    # 全文件 SHA、模型/数据配置、下游兼容性
+  USE_THIS_LINEAGE.env                 # 后续唯一应 source 的路径入口
+```
+
+只有在 semantic packet 也不可用、且确实决定构造一套全新 Phase-1 时才使用本节入口。runner 需要
+`--allow-paid-phase1` 才会进入已有的付费 Phase-1 teacher/reviewer；risk 编译不增加教师调用。
+manifest sealed 后目录视为不可变，任何重跑使用新的 lineage ID。若 `downstream_v4.compatible=false`，该数据只
+说明新的 Phase-1/risk 自身完整，不能喂给旧 bank/Side-KV 的 source-state 或 oracle runner；必须恢复旧原件，
+或者显式重建整套下游 lineage。
+
 ## 8. 代码边界
 
 当前主线：
@@ -237,6 +315,12 @@ positive control / mechanism qualification，不能表述为 held-out 泛化。
 - `scripts/audit_v4_oracle_causal_utility.py`
 - `scripts/experiments/gsm8k/run_v4_2_curated_offline.sh`
 - `scripts/experiments/gsm8k/run_v4_source_oracle_audit.sh`
+- `scripts/experiments/gsm8k/run_phase1_risk_lineage.sh`
+- `scripts/experiments/gsm8k/run_v4_question_recovery.sh`
+- `scripts/build_phase1_risk_lineage_manifest.py`
+- `scripts/recover_v4_source_evidence.py`
+- `memgen/experience/input_lineage.py`
+- `memgen/experience/v4_question_recovery.py`
 - `memgen/experience/v4_2_bank.py`
 - `memgen/experience/v4_2_local_direct.py`
 - `memgen/experience/v4_2_curated.py`

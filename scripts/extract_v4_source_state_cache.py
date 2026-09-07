@@ -28,6 +28,10 @@ from memgen.experience.v4_source_state import (
     V4_SOURCE_STATE_MAX_WINDOW,
     save_source_state_cache,
 )
+from memgen.experience.v4_question_recovery import (
+    load_recovered_source_experiences,
+    validate_question_recovery_manifest,
+)
 from scripts.build_v4_repair_bank import _validate_split_manifest, load_v4_experiences
 from scripts.compile_v4_selector_anchors import (
     _construction_bank_membership,
@@ -52,6 +56,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bank-manifest", type=Path, required=True)
     parser.add_argument("--side-kv-manifest", type=Path, required=True)
     parser.add_argument("--token-risk-artifact", type=Path, required=True)
+    parser.add_argument(
+        "--question-recovery-manifest",
+        type=Path,
+        help=(
+            "Explicitly consume semantic-packet replay evidence. Without this "
+            "flag the original exact-Phase1 SHA contract remains mandatory."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dataset-revision", default="main")
     parser.add_argument("--device", default="cuda")
@@ -310,6 +322,11 @@ def _validate_inputs(args: argparse.Namespace) -> None:
     ):
         if not path.is_file():
             raise FileNotFoundError(path)
+    if (
+        args.question_recovery_manifest is not None
+        and not args.question_recovery_manifest.is_file()
+    ):
+        raise FileNotFoundError(args.question_recovery_manifest)
 
 
 def main() -> None:
@@ -329,9 +346,19 @@ def main() -> None:
     split_manifest = _validate_split_manifest(
         args.split_manifest, dataset_revision=args.dataset_revision
     )
-    experiences = load_v4_experiences(
-        args.experiences, split_manifest=split_manifest
-    )
+    recovery_manifest = None
+    if args.question_recovery_manifest is not None:
+        recovery_manifest = validate_question_recovery_manifest(
+            args.question_recovery_manifest
+        )
+        experiences = load_recovered_source_experiences(
+            args.question_recovery_manifest,
+            experiences_path=args.experiences,
+        )
+    else:
+        experiences = load_v4_experiences(
+            args.experiences, split_manifest=split_manifest
+        )
     experience_by_id = {str(item["experience_id"]): item for item in experiences}
     records = _load_records(args.bank_records)
     if len(records) != EXPECTED_CURATED_BANK_COUNT:
@@ -349,12 +376,25 @@ def main() -> None:
         for record in records
     ):
         raise ValueError("V4 source-state records are not bound by bank manifest")
-    if construction_manifest["inputs"].get("experiences_sha256") != file_sha256(args.experiences):
-        raise ValueError("V4 source-state experiences differ from bank construction")
-    if construction_manifest["inputs"].get("split_manifest_sha256") != file_sha256(
-        args.split_manifest
-    ):
-        raise ValueError("V4 source-state split differs from bank construction")
+    if recovery_manifest is None:
+        if construction_manifest["inputs"].get("experiences_sha256") != file_sha256(args.experiences):
+            raise ValueError("V4 source-state experiences differ from bank construction")
+        if construction_manifest["inputs"].get("split_manifest_sha256") != file_sha256(
+            args.split_manifest
+        ):
+            raise ValueError("V4 source-state split differs from bank construction")
+    else:
+        recovery_sources = recovery_manifest["sources"]
+        recovery_artifacts = recovery_manifest["artifacts"]
+        recovery_bindings = (
+            (args.bank_records, recovery_sources["curated_bank_records"]),
+            (args.bank_manifest, recovery_sources["curated_bank_manifest"]),
+            (args.side_kv_manifest, recovery_sources["side_kv_manifest"]),
+            (args.split_manifest, recovery_artifacts["rebuilt_split_manifest"]),
+            (args.experiences, recovery_artifacts["recovered_experiences"]),
+        )
+        if any(entry.get("sha256") != file_sha256(path) for path, entry in recovery_bindings):
+            raise ValueError("V4 source-state inputs differ from recovery lineage")
     membership = _construction_bank_membership(
         records=records, experience_by_id=experience_by_id
     )
@@ -375,6 +415,17 @@ def main() -> None:
     risk_artifact = torch.load(
         args.token_risk_artifact, map_location="cpu", weights_only=False
     )
+    if recovery_manifest is not None:
+        risk_inputs = risk_artifact.get("inputs", {})
+        if (
+            risk_inputs.get("source_mode")
+            != "semantic_packet_replay_strict_verifier_no_ai"
+            or risk_inputs.get("question_recovery_manifest_sha256")
+            != file_sha256(args.question_recovery_manifest)
+            or risk_inputs.get("recovered_experiences_sha256")
+            != file_sha256(args.experiences)
+        ):
+            raise ValueError("V4 recovery cache requires risk fitted to this replay lineage")
     gate = EntropyHysteresisGate.from_token_artifact(risk_artifact)
     if gate.config.layer_number != 24 or gate.config.risk_role != "online_joint_control":
         raise ValueError("V4 source-state cache requires the qualified layer-24 joint gate")
@@ -670,7 +721,15 @@ def main() -> None:
         ],
         "failure_gate_state_scope": "all_counterfactual_attempts_up_to_three",
         "success_state_roles_separated": True,
-        "extraction_scope": "smoke" if args.limit else "full_curated_construction",
+        "extraction_scope": (
+            "question_recovery_smoke"
+            if recovery_manifest is not None and args.limit
+            else "question_recovery_full_curated_construction"
+            if recovery_manifest is not None
+            else "smoke"
+            if args.limit
+            else "full_curated_construction"
+        ),
         "requested_limit": args.limit,
         "expected_full_construction_count": len(membership),
         "extracted_construction_count": len(ordered_ids),
@@ -708,6 +767,28 @@ def main() -> None:
         "created_by": "gpu_teacher_forced_source_state_extractor",
         "external_api_calls_made": 0,
     }
+    if recovery_manifest is not None:
+        provenance["question_recovery"] = {
+            "manifest_path": str(args.question_recovery_manifest.resolve()),
+            "manifest_file_sha256": file_sha256(args.question_recovery_manifest),
+            "manifest_logical_sha256": recovery_manifest["manifest_sha256"],
+            "original_phase1_file_recovery_claim": False,
+            "original_risk_artifact_recovery_claim": False,
+            "same_source_question": True,
+            "same_source_success_completion": True,
+            "same_source_failure_completion": True,
+            "held_out_generalization_claim": False,
+        }
+        provenance["inputs"].update(
+            {
+                "question_recovery_manifest_path": str(
+                    args.question_recovery_manifest.resolve()
+                ),
+                "question_recovery_manifest_sha256": file_sha256(
+                    args.question_recovery_manifest
+                ),
+            }
+        )
     manifest_path, reachability_path = save_source_state_cache(
         output_dir=args.output_dir,
         tensors=tensors,
