@@ -28,7 +28,7 @@ Inputs:
 Outputs under OUTPUT_ROOT/offline/v4_oracle_<mode>/:
   source_state_cache/   safetensors + event JSONL + reachability manifest/report
   source_state_audit/   CPU-only window/normalization/LOO/hubness diagnostics
-  oracle_audit/         exact-prefix baseline/target/reference cases and report
+  oracle_audit_full_answer/ exact-prefix, 32-step memory, full-answer report
 
 Smoke mode deterministically caps cache samples and oracle cases. Full mode
 extracts all curated construction samples and all gate attempts. This runner
@@ -88,7 +88,7 @@ OUTPUT_ROOT="${POSITIONAL[4]}"
 RUN_ROOT="${MEMGEN_V4_ORACLE_RUN_ROOT:-$OUTPUT_ROOT/offline/v4_oracle_${MODE}}"
 SOURCE_STATE_DIR="${MEMGEN_V4_SOURCE_STATE_DIR:-$RUN_ROOT/source_state_cache}"
 STATE_AUDIT_DIR="${MEMGEN_V4_SOURCE_STATE_AUDIT_DIR:-$RUN_ROOT/source_state_audit}"
-ORACLE_AUDIT_DIR="${MEMGEN_V4_ORACLE_AUDIT_DIR:-$RUN_ROOT/oracle_audit}"
+ORACLE_AUDIT_DIR="${MEMGEN_V4_ORACLE_AUDIT_DIR:-$RUN_ROOT/oracle_audit_full_answer}"
 
 EXPERIENCES="$PHASE1_DIR/verified_experiences.jsonl"
 SPLIT_MANIFEST="$PHASE1_DIR/split_manifest.json"
@@ -128,6 +128,7 @@ echo "[v4-source-oracle] token_risk_artifact=$TOKEN_RISK_ARTIFACT"
 echo "[v4-source-oracle] source_state_dir=$SOURCE_STATE_DIR"
 echo "[v4-source-oracle] state_audit_dir=$STATE_AUDIT_DIR"
 echo "[v4-source-oracle] oracle_audit_dir=$ORACLE_AUDIT_DIR"
+echo "[v4-source-oracle] oracle_profile=full-answer memory_active_steps=32 completion_tokens=1024"
 
 if [[ "$STAGE" == "cache" || "$STAGE" == "all" ]]; then
   mkdir -p "$SOURCE_STATE_DIR"
@@ -217,6 +218,7 @@ if [[ "$STAGE" == "oracle" || "$STAGE" == "all" ]]; then
     --device "$DEVICE" \
     --dtype "$DTYPE" \
     --attempt-policy all \
+    --maximum-completion-tokens 1024 \
     --resume \
     "${ORACLE_LIMIT_ARGS[@]}" \
     2>&1 | tee "$ORACLE_AUDIT_DIR/v4_oracle_audit.log"
@@ -228,6 +230,13 @@ if [[ "$STAGE" == "oracle" || "$STAGE" == "all" ]]; then
     and .online_artifacts_generated == false
     and .held_out_generalization_claim == false
     and .gate_unreachable_counted_as_memory_ineffective == false
+    and .configuration.maximum_completion_tokens == 1024
+    and .configuration.local_intervention_observation_tokens == 32
+    and .configuration.maximum_active_steps == 32
+    and .configuration.post_memory_native_continuation == true
+    and .configuration.generation_stop_policy
+      == "completed_boxed_answer_or_eos_or_completion_budget"
+    and .local_and_final_metrics_separated == true
     and .artifacts.online_selector_tensor == null
     and .artifacts.online_selector_manifest == null
   ' "$ORACLE_AUDIT_DIR/v4_oracle_report.json" >/dev/null \

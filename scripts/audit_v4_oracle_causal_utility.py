@@ -3,8 +3,9 @@
 
 Every case is reconstructed from an authenticated source-state gate event.
 The baseline, oracle target, and offline-only reference branches replay the
-same exact prefix once, clone the same native cache, and greedily continue for
-at most 32 tokens under the current nonpersistent V4 memory lifecycle.
+same exact prefix once and clone the same native cache.  Side-KV visibility is
+still capped at 32 decoded tokens, while every branch continues natively until
+a complete boxed answer, EOS, or the frozen 1024-token GSM8K completion budget.
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ from data.utils.math_utils import diagnose_gsm8k_completion
 from memgen.chat_templates import CONVERSATION_TEMPLATE
 from memgen.experience.phase1 import canonical_json_sha256, file_sha256
 from memgen.experience.v4_oracle_audit import (
+    V4_ORACLE_LOCAL_OBSERVATION_TOKENS,
+    V4_ORACLE_MAXIMUM_COMPLETION_TOKENS,
     V4_ORACLE_PROFILE_SCHEMA,
     aggregate_oracle_results,
     build_oracle_plan,
@@ -70,6 +73,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Smoke cap applied separately to failure and success cases; zero is full.",
+    )
+    parser.add_argument(
+        "--maximum-completion-tokens",
+        type=int,
+        default=V4_ORACLE_MAXIMUM_COMPLETION_TOKENS,
+        help="Frozen total completion budget, including the prefix completion.",
     )
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -148,15 +157,28 @@ def _score_branch(
 ) -> dict[str, Any]:
     prefix_completion = [int(value) for value in prefix_token_ids[prompt_token_count:]]
     continuation = [int(value) for value in branch.continuation_token_ids]
+    local_continuation = [
+        int(value) for value in branch.local_continuation_token_ids
+    ]
     full_completion_ids = prefix_completion + continuation
+    local_completion_ids = prefix_completion + local_continuation
     generated_continuation = tokenizer.decode(
         continuation, skip_special_tokens=True
     ).strip()
     full_completion = tokenizer.decode(
         full_completion_ids, skip_special_tokens=True
     ).strip()
+    local_generated_continuation = tokenizer.decode(
+        local_continuation, skip_special_tokens=True
+    ).strip()
+    local_completion = tokenizer.decode(
+        local_completion_ids, skip_special_tokens=True
+    ).strip()
     verifier = diagnose_gsm8k_completion(
         full_completion, verified_success_completion
+    )
+    local_verifier = diagnose_gsm8k_completion(
+        local_completion, verified_success_completion
     )
     branch_payload = branch.to_dict()
     branch_payload.update(
@@ -172,6 +194,32 @@ def _score_branch(
             "format_valid": bool(verifier["format_valid"]),
             "diagnostic_answer_correct": verifier["diagnostic_answer_correct"],
             "failure_types": list(verifier["failure_types"]),
+            "local_intervention_evaluation": {
+                "observation_token_limit": V4_ORACLE_LOCAL_OBSERVATION_TOKENS,
+                "continuation_token_count": len(local_continuation),
+                "continuation_token_ids_sha256": canonical_json_sha256(
+                    local_continuation
+                ),
+                "generated_continuation": local_generated_continuation,
+                "full_completion": local_completion,
+                "full_completion_token_ids_sha256": canonical_json_sha256(
+                    local_completion_ids
+                ),
+                "strict_reward": float(local_verifier["reward"]),
+                "task_success": bool(local_verifier["task_success"]),
+                "format_valid": bool(local_verifier["format_valid"]),
+                "diagnostic_answer_correct": local_verifier[
+                    "diagnostic_answer_correct"
+                ],
+                "failure_types": list(local_verifier["failure_types"]),
+                "answer_marker_seen": bool(
+                    branch.answer_marker_seen_within_local_window
+                ),
+                "complete_boxed_answer_seen": bool(
+                    branch.complete_boxed_answer_seen_within_local_window
+                ),
+                "eos_seen": bool(branch.eos_seen_within_local_window),
+            },
         }
     )
     return branch_payload
@@ -259,6 +307,8 @@ def _build_profile(
 def _validate_input_bindings(args: argparse.Namespace, cache: Any) -> None:
     if args.limit_per_kind < 0:
         raise ValueError("V4 oracle limit-per-kind must be non-negative")
+    if args.maximum_completion_tokens != V4_ORACLE_MAXIMUM_COMPLETION_TOKENS:
+        raise ValueError("V4 oracle maximum-completion-tokens must remain 1024")
     inputs = cache.manifest["provenance"]["inputs"]
     bindings = (
         (args.experiences, "experiences_sha256"),
@@ -318,6 +368,7 @@ def main() -> None:
         cache,
         attempt_policy=args.attempt_policy,
         limit_per_kind=args.limit_per_kind,
+        maximum_completion_tokens=args.maximum_completion_tokens,
     )
     validate_oracle_plan(plan)
     profile = _build_profile(args=args, cache=cache, plan=plan)
@@ -437,7 +488,7 @@ def main() -> None:
         device=args.device,
         gate=gate,
         controller=controller,
-        maximum_continuation_tokens=32,
+        maximum_completion_tokens=args.maximum_completion_tokens,
     )
     try:
         for position, case in enumerate(plan["cases"], start=1):

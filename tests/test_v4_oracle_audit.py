@@ -177,6 +177,10 @@ def result_for_case(plan: dict, case: dict, *, rewards=(0.0, 1.0, 0.0)) -> dict:
             "failure_types": [] if reward else ["boxed_answer_mismatch"],
             "continuation_token_ids": continuation,
             "continuation_token_ids_sha256": canonical_json_sha256(continuation),
+            "local_continuation_token_ids": continuation,
+            "local_continuation_token_ids_sha256": canonical_json_sha256(
+                continuation
+            ),
             "generated_continuation": "fixture continuation",
             "full_completion": "fixture completion",
             "full_completion_token_ids": full_completion,
@@ -188,7 +192,24 @@ def result_for_case(plan: dict, case: dict, *, rewards=(0.0, 1.0, 0.0)) -> dict:
                 if role == "baseline"
                 else "bank-a" if role == "target" else "bank-a::reference"
             ),
-            "attention_traces": [] if role == "baseline" else [{"mass": 0.1}],
+            "local_intervention_evaluation": {
+                "observation_token_limit": 32,
+                "continuation_token_count": len(continuation),
+                "continuation_token_ids_sha256": canonical_json_sha256(
+                    continuation
+                ),
+                "strict_reward": float(reward),
+                "format_valid": float(reward) == 1.0,
+                "failure_types": [] if reward else ["boxed_answer_mismatch"],
+                "answer_marker_seen": False,
+                "complete_boxed_answer_seen": False,
+                "eos_seen": True,
+            },
+            "attention_traces": (
+                []
+                if role == "baseline"
+                else [{"memory_attention_mass": 0.1}]
+            ),
             "lifecycle": None if role == "baseline" else {"state": "CLOSED"},
             "first_step_logits_kl": 0.0 if role == "baseline" else 0.1,
             "first_step_top1_changed": role != "baseline",
@@ -200,8 +221,23 @@ def result_for_case(plan: dict, case: dict, *, rewards=(0.0, 1.0, 0.0)) -> dict:
             "branch_top1_log_probability_delta": 0.0,
             "initial_cache_length": int(case["prefix_token_count"]) - 1,
             "first_output_cache_length": int(case["prefix_token_count"]),
+            "prefix_completion_token_count": (
+                int(case["prefix_token_count"])
+                - int(case["prompt_token_count"])
+            ),
+            "maximum_completion_tokens": 1024,
+            "generation_budget_from_prefix": (
+                1024
+                - int(case["prefix_token_count"])
+                + int(case["prompt_token_count"])
+            ),
+            "stop_reason": "eos",
             "answer_marker_seen": False,
-            "eos_seen": False,
+            "complete_boxed_answer_seen": False,
+            "eos_seen": True,
+            "answer_marker_seen_within_local_window": False,
+            "complete_boxed_answer_seen_within_local_window": False,
+            "eos_seen_within_local_window": True,
         }
     baseline, target, reference = rewards
     return finalize_result(
@@ -295,11 +331,24 @@ class V4OracleAuditTests(unittest.TestCase):
         self.assertEqual(
             plan["independent_sample_count_by_kind"]["failure_oracle"], 1
         )
-        self.assertEqual(plan["configuration"]["maximum_continuation_tokens"], 32)
+        self.assertEqual(plan["configuration"]["maximum_completion_tokens"], 1024)
+        self.assertEqual(
+            plan["configuration"]["local_intervention_observation_tokens"],
+            32,
+        )
+        self.assertTrue(
+            plan["configuration"]["post_memory_native_continuation"]
+        )
         self.assertEqual(
             plan["configuration"]["memory_lifecycle"],
             "v4_nonpersistent_bounded_episode",
         )
+        with self.assertRaisesRegex(ValueError, "1024-token GSM8K budget"):
+            build_oracle_plan(
+                cache_fixture(),
+                attempt_policy="first",
+                maximum_completion_tokens=32,
+            )
 
     def test_result_requires_three_branches_and_exact_prefix_parity(self) -> None:
         plan = build_oracle_plan(cache_fixture(), attempt_policy="first")
@@ -324,6 +373,15 @@ class V4OracleAuditTests(unittest.TestCase):
         ] = False
         with self.assertRaisesRegex(ValueError, "prefix/cache parity"):
             finalize_result(broken_parity)
+
+        broken_local = dict(row)
+        broken_local.pop("record_sha256")
+        broken_local["branches"] = {
+            role: dict(branch) for role, branch in row["branches"].items()
+        }
+        broken_local["branches"]["target"]["local_continuation_token_ids"] = [1]
+        with self.assertRaisesRegex(ValueError, "branch continuation"):
+            finalize_result(broken_local)
 
     def test_incomplete_audit_never_qualifies_online_artifacts(self) -> None:
         plan = build_oracle_plan(cache_fixture(), attempt_policy="all")
@@ -358,6 +416,19 @@ class V4OracleAuditTests(unittest.TestCase):
             ],
             1,
         )
+        self.assertTrue(report["local_and_final_metrics_separated"])
+        self.assertEqual(
+            report["overall"]["local_trajectory_divergence"][
+                "target_differs_from_baseline_count"
+            ],
+            0,
+        )
+        self.assertEqual(
+            report["overall"]["final_outcome_observability"]["target"][
+                "eos_seen_count"
+            ],
+            3,
+        )
         self.assertFalse(
             report["per_bank"]["bank-a"][
                 "gate_unreachable_counted_as_memory_ineffective"
@@ -371,6 +442,10 @@ class V4OracleAuditTests(unittest.TestCase):
         )
         self.assertIn("def get_reference_offline(", source)
         self.assertIn('entry.get("online_injectable") is not False', source)
+        self.assertIn("for step in range(generation_budget):", source)
+        self.assertIn("if within_local_window or memory_active:", source)
+        self.assertIn('stop_reason = "completed_boxed_answer"', source)
+        self.assertNotIn("maximum_continuation_tokens", source)
         self.assertNotIn("def get_reference(", online_source)
 
 

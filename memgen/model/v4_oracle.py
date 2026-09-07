@@ -30,12 +30,49 @@ from memgen.model.v4_side_kv import V4SideKVBankLoader
 _ANSWER_MARKER_RE = re.compile(
     r"(?:\\boxed|\\fbox|final\s+answer|answer\s+is)", re.IGNORECASE
 )
+_BOX_COMMANDS = ("\\boxed", "\\fbox")
+_LOCAL_INTERVENTION_OBSERVATION_TOKENS = 32
+
+
+def _complete_boxed_answer_seen(text: str) -> bool:
+    """Return whether the first braced box command is syntactically complete.
+
+    The strict GSM8K verifier needs the closing brace, so seeing ``\\boxed`` is
+    not enough to stop a long-horizon branch.  Nested braces are handled because
+    model answers sometimes wrap a fraction or a unit inside the final box.
+    """
+
+    candidates = [
+        (text.find(command), command)
+        for command in _BOX_COMMANDS
+        if text.find(command) >= 0
+    ]
+    if not candidates:
+        return False
+    start, command = min(candidates, key=lambda item: item[0])
+    cursor = start + len(command)
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    if cursor >= len(text) or text[cursor] != "{":
+        # The repository verifier also accepts a legacy ``\\boxed 42`` form,
+        # but it has no reliable completion delimiter.  Let EOS/budget stop it.
+        return False
+    depth = 0
+    for character in text[cursor:]:
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return True
+    return False
 
 
 @dataclass(frozen=True)
 class V4OracleBranchResult:
     role: str
     continuation_token_ids: tuple[int, ...]
+    local_continuation_token_ids: tuple[int, ...]
     memory_id: str | None
     attention_traces: tuple[SideKVAttentionTrace, ...]
     lifecycle: Mapping[str, Any] | None
@@ -49,8 +86,16 @@ class V4OracleBranchResult:
     branch_top1_log_probability_delta: float
     initial_cache_length: int
     first_output_cache_length: int
+    prefix_completion_token_count: int
+    maximum_completion_tokens: int
+    generation_budget_from_prefix: int
+    stop_reason: str
     answer_marker_seen: bool
+    complete_boxed_answer_seen: bool
     eos_seen: bool
+    answer_marker_seen_within_local_window: bool
+    complete_boxed_answer_seen_within_local_window: bool
+    eos_seen_within_local_window: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -58,6 +103,12 @@ class V4OracleBranchResult:
             "continuation_token_ids": list(self.continuation_token_ids),
             "continuation_token_ids_sha256": canonical_json_sha256(
                 list(self.continuation_token_ids)
+            ),
+            "local_continuation_token_ids": list(
+                self.local_continuation_token_ids
+            ),
+            "local_continuation_token_ids_sha256": canonical_json_sha256(
+                list(self.local_continuation_token_ids)
             ),
             "attention_traces": [trace.to_dict() for trace in self.attention_traces],
         }
@@ -129,10 +180,10 @@ class V4OracleExactPrefixRuntime:
         device: str,
         gate: EntropyHysteresisGate,
         controller: SideKVAttentionController,
-        maximum_continuation_tokens: int = 32,
+        maximum_completion_tokens: int = 1024,
     ) -> None:
-        if maximum_continuation_tokens != 32:
-            raise ValueError("V4 oracle continuation is initially frozen at 32 tokens")
+        if maximum_completion_tokens != 1024:
+            raise ValueError("V4 full-answer oracle uses the frozen GSM8K 1024-token budget")
         if gate.config.layer_number != 24 or gate.config.risk_role != "online_joint_control":
             raise ValueError("V4 oracle requires the qualified layer-24 joint gate")
         if gate.config.rearm_low_entropy_token_count != 2:
@@ -144,7 +195,10 @@ class V4OracleExactPrefixRuntime:
         self.device = device
         self.gate = gate
         self.controller = controller
-        self.maximum_continuation_tokens = maximum_continuation_tokens
+        self.maximum_completion_tokens = maximum_completion_tokens
+        self.local_intervention_observation_tokens = (
+            _LOCAL_INTERVENTION_OBSERVATION_TOKENS
+        )
         self.decoding = GreedyDecodingPolicy(tokenizer=tokenizer, device=device)
 
     def _tensor(self, token_ids: Sequence[int]) -> torch.Tensor:
@@ -277,6 +331,14 @@ class V4OracleExactPrefixRuntime:
         expected_initial = len(ids) - 1
         if initial_length != expected_initial:
             raise RuntimeError("V4 oracle branch initial cache length drifted")
+        prefix_completion_token_count = len(ids) - prompt_token_count
+        generation_budget = (
+            self.maximum_completion_tokens - prefix_completion_token_count
+        )
+        if generation_budget <= 0:
+            raise RuntimeError(
+                "V4 oracle prefix exhausted the frozen completion-token budget"
+            )
         past = initial_cache
         self.controller.deactivate()
         self.controller.clear_traces()
@@ -288,58 +350,100 @@ class V4OracleExactPrefixRuntime:
         first_scores: torch.Tensor | None = None
         first_output_cache_length = -1
         answer_marker_seen = False
+        complete_boxed_answer_seen = False
         eos_seen = False
+        answer_marker_seen_within_local_window = False
+        complete_boxed_answer_seen_within_local_window = False
+        eos_seen_within_local_window = False
+        stop_reason = "maximum_completion_tokens"
         try:
-            for step in range(self.maximum_continuation_tokens):
+            for step in range(generation_budget):
                 full = self._tensor(ids)
-                probe = self.gate.probe(
-                    model=self.model,
-                    boundary_token=full[:, -1:],
-                    attention_mask=torch.ones_like(full),
-                    past_key_values=past,
-                    clone_past_key_values=False,
+                memory_active = episode is not None and episode.state == "ACTIVE"
+                within_local_window = (
+                    step < self.local_intervention_observation_tokens
                 )
+                probe_entropy: float | None = None
+                if within_local_window or memory_active:
+                    probe = self.gate.probe(
+                        model=self.model,
+                        boundary_token=full[:, -1:],
+                        attention_mask=torch.ones_like(full),
+                        past_key_values=past,
+                        clone_past_key_values=False,
+                    )
+                    output = probe.output
+                    probe_entropy = float(probe.entropy)
+                else:
+                    output = self.model(
+                        input_ids=full[:, -1:],
+                        attention_mask=torch.ones_like(full),
+                        past_key_values=past,
+                        use_cache=True,
+                        return_dict=True,
+                    )
                 scores = self.decoding.processed_scores(
-                    token_ids=ids, logits=probe.output.logits
+                    token_ids=ids, logits=output.logits
                 ).detach().float()
                 if step == 0:
                     first_scores = scores
                     first_output_cache_length = self._cache_sequence_length(
-                        probe.output.past_key_values
+                        output.past_key_values
                     )
-                if episode is not None and episode.state == "ACTIVE":
+                if memory_active:
+                    if probe_entropy is None:
+                        raise RuntimeError("V4 active memory step lacks gate entropy")
                     transition = episode.observe_decoded_token(
                         low_entropy=(
-                            probe.entropy <= self.gate.config.low_entropy_threshold
+                            probe_entropy <= self.gate.config.low_entropy_threshold
                         )
                     )
                     if transition is not None and transition.deactivate_memory:
                         self.controller.deactivate()
                 next_token = self.decoding.next_token(
-                    token_ids=ids, logits=probe.output.logits
+                    token_ids=ids, logits=output.logits
                 )
                 ids.append(next_token)
-                past = probe.output.past_key_values
+                past = output.past_key_values
                 completion_text = self.tokenizer.decode(
                     ids[prompt_token_count:], skip_special_tokens=False
                 )
-                if not answer_marker_seen and _ANSWER_MARKER_RE.search(completion_text):
+                marker_now = bool(_ANSWER_MARKER_RE.search(completion_text))
+                complete_box_now = _complete_boxed_answer_seen(completion_text)
+                eos_now = self.decoding.is_eos(next_token)
+                if marker_now:
                     answer_marker_seen = True
+                    if within_local_window:
+                        answer_marker_seen_within_local_window = True
                     if episode is not None and episode.state != "CLOSED":
                         transition = episode.close(reason="answer_marker")
                         if transition.deactivate_memory:
                             self.controller.deactivate()
-                if self.decoding.is_eos(next_token):
+                if complete_box_now:
+                    complete_boxed_answer_seen = True
+                    if within_local_window:
+                        complete_boxed_answer_seen_within_local_window = True
+                if eos_now:
                     eos_seen = True
+                    if within_local_window:
+                        eos_seen_within_local_window = True
                     if episode is not None and episode.state != "CLOSED":
                         transition = episode.close(reason="eos")
                         if transition.deactivate_memory:
                             self.controller.deactivate()
+                    stop_reason = "eos"
+                    break
+                if complete_box_now:
+                    if episode is not None and episode.state != "CLOSED":
+                        transition = episode.close(reason="completed_boxed_answer")
+                        if transition.deactivate_memory:
+                            self.controller.deactivate()
+                    stop_reason = "completed_boxed_answer"
                     break
         finally:
             self.controller.deactivate()
         if episode is not None and episode.state != "CLOSED":
-            episode.close(reason="maximum_continuation_tokens")
+            episode.close(reason=stop_reason)
         if first_scores is None:
             raise RuntimeError("V4 oracle branch produced no first-step logits")
         reference_scores = first_scores if baseline_first_scores is None else baseline_first_scores
@@ -368,6 +472,13 @@ class V4OracleExactPrefixRuntime:
         result = V4OracleBranchResult(
             role=role,
             continuation_token_ids=tuple(ids[len(prefix_token_ids) :]),
+            local_continuation_token_ids=tuple(
+                ids[
+                    len(prefix_token_ids) :
+                    len(prefix_token_ids)
+                    + self.local_intervention_observation_tokens
+                ]
+            ),
             memory_id=memory.memory_id if memory is not None else None,
             attention_traces=traces,
             lifecycle=episode.summary() if episode is not None else None,
@@ -387,8 +498,20 @@ class V4OracleExactPrefixRuntime:
             ),
             initial_cache_length=initial_length,
             first_output_cache_length=first_output_cache_length,
+            prefix_completion_token_count=prefix_completion_token_count,
+            maximum_completion_tokens=self.maximum_completion_tokens,
+            generation_budget_from_prefix=generation_budget,
+            stop_reason=stop_reason,
             answer_marker_seen=answer_marker_seen,
+            complete_boxed_answer_seen=complete_boxed_answer_seen,
             eos_seen=eos_seen,
+            answer_marker_seen_within_local_window=(
+                answer_marker_seen_within_local_window
+            ),
+            complete_boxed_answer_seen_within_local_window=(
+                complete_boxed_answer_seen_within_local_window
+            ),
+            eos_seen_within_local_window=eos_seen_within_local_window,
         )
         return result, first_scores
 
@@ -489,4 +612,5 @@ __all__ = [
     "V4OfflineSideKVRoleBankLoader",
     "V4OracleBranchResult",
     "V4OracleExactPrefixRuntime",
+    "_complete_boxed_answer_seen",
 ]

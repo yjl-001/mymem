@@ -170,7 +170,8 @@ OUTPUT_ROOT/offline/
   v4_oracle_full/
     source_state_cache/                # offline-only layer-24 raw source states
     source_state_audit/                # CPU-only window/normalization/LOO 诊断
-    oracle_audit/                      # exact-prefix target/reference causal audit
+    oracle_audit/                      # 已保留的 legacy 32-token 局部审计
+    oracle_audit_full_answer/          # 32-step memory + 最终答案 causal audit
 ```
 
 当前唯一推荐的 curated offline 入口：
@@ -216,9 +217,17 @@ support，并比较 raw score、bank-specific empirical tail normalization、hub
 online selector tensor。
 
 oracle audit 对每个 cache 中实际可达的 failure gate event 使用其已知 bank ID，从同一 token prefix 和一次 replay
-得到的 native cache 克隆 baseline、target、reference 三支，固定 greedy、32-step bounded continuation 与当前
-非持续 lifecycle。分支前除 cache length 外，还逐 tensor 检查 shape、dtype、value 完全相同，并验证三份 cache
-不共享底层 mutable storage；任一 parity 条件失败即停止该 case。reference 只能由独立 offline loader 读取。
+得到的 native cache 克隆 baseline、target、reference 三支。分支前除 cache length 外，还逐 tensor 检查
+shape、dtype、value 完全相同，并验证三份 cache 不共享底层 mutable storage；任一 parity 条件失败即停止该 case。
+reference 只能由独立 offline loader 读取。
+
+最初的 32-token audit 已证明 Side-KV 注入通道实际改变 logits/部分短程轨迹，但在 99 个 failure case 中只有 3 个
+target 分支形成 format-valid answer，因而 0 次 strict repair 不能区分“memory 无效”和“答案尚未生成完成”。当前
+full-answer profile 把两个 horizon 明确拆开：Side-KV direct visibility 仍最多 32 token，卸载后保留已形成的
+native causal cache 并继续 greedy generation，直到完整 braced `\boxed{}`、EOS，或 completion（含 gate 前已经
+生成的部分）达到冻结的 1024-token GSM8K 预算。报告分别保存 local-32 与 final-outcome correctness、轨迹分叉和
+终止原因。旧 `oracle_audit/` 不覆盖；新结果写入 `oracle_audit_full_answer/`。
+
 报告保留全部 17 个 bank，单列 gate-unreachable failure，并把本结果限定为 construction source 上的 optimistic
 positive control / mechanism qualification，不能表述为 held-out 泛化。
 
@@ -228,6 +237,11 @@ positive control / mechanism qualification，不能表述为 held-out 泛化。
 `semantic_evidence_packets.jsonl` 仍存在，不需要重新调用 DeepSeek。该文件已经保存每条 evidence 的原题、官方
 GSM8K solution、原 verified-success trajectory、原 verified-failure trajectory 和两个 verifier 记录。curated
 bank 的 `construction.experience_ids` 可以从 167 条 packet evidence 中精确选回当前 17-bank 使用的 116 条。
+
+服务器当前可直接在仓库根目录运行 `./test.sh`。默认会依次跑 recovery lineage 的 smoke/full；它按模式检查
+recovery、risk、source-state cache 和 CPU state-audit，前置工件完整时只执行新的 full-answer oracle，缺失时才
+执行该模式的 `stage=all`。默认输入根目录是 `/data/memgen-runs`，全部路径、GPU 和 stage policy 都可以通过
+`./test.sh --help` 中列出的环境变量覆盖。
 
 推荐的新入口是：
 
@@ -262,6 +276,35 @@ smoke/full 都使用全部 116 条恢复轨迹拟合 risk；smoke 只限制 sour
 
 这条结果是“相同 source 题目与相同原始轨迹、重新拟合 gate”的 optimistic mechanism audit，不是旧 Phase-1/risk
 的 byte-identical 复现，也不是跨题泛化结论。
+
+如果同一 recovery lineage 已经完成 legacy 32-token `--stage all`，不重新执行 recover、risk、cache 或
+state-audit。拉取 full-answer 修复后，先复用 smoke cache：
+
+```bash
+bash scripts/experiments/gsm8k/run_v4_question_recovery.sh \
+  --mode smoke \
+  --stage oracle \
+  gsm8k-v4-packet-replay-20260907-r1 \
+  "$V4_OUTPUT_ROOT/offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl" \
+  "$V4_OUTPUT_ROOT/offline/construction_v4_2_local_curated" \
+  "$V4_OUTPUT_ROOT/offline/side_kv_v4_2_local_curated" \
+  "$MEMGEN_OUTPUT_ROOT"
+```
+
+通过后以相同 `RECOVERY_ID` 复用 full cache：
+
+```bash
+bash scripts/experiments/gsm8k/run_v4_question_recovery.sh \
+  --mode full \
+  --stage oracle \
+  gsm8k-v4-packet-replay-20260907-r1 \
+  "$V4_OUTPUT_ROOT/offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl" \
+  "$V4_OUTPUT_ROOT/offline/construction_v4_2_local_curated" \
+  "$V4_OUTPUT_ROOT/offline/side_kv_v4_2_local_curated" \
+  "$MEMGEN_OUTPUT_ROOT"
+```
+
+这两条命令只重跑三分支 oracle generation；新目录与 profile hash 防止复用或覆盖旧 32-token rows。
 
 ### 7.3 全新 Phase-1 / risk 的命名血缘
 

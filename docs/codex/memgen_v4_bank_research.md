@@ -263,6 +263,19 @@ routing、hubness、bank-size bias 和 threshold diagnostics，但这些都只�
 `scripts/experiments/gsm8k/run_v4_source_oracle_audit.sh`。实现和 schema 的存在不等于 oracle 已通过；在服务器
 报告生成前，17 个 bank 仍只具有 Side-KV 编译资格，没有因果有效性资格。
 
+恢复 lineage 上完成的第一版 32-token full case audit 得到：61/116 个 failure sample gate-reachable、99 个
+failure events；target/reference attention mass 约为 `0.106/0.100`，target first-step KL 约 `0.00459`，且
+26/99 个 target continuation 与 baseline 分叉，证明注入不是 no-op。但 target 只有 3/99 个 case 形成
+format-valid answer，success-safety 也只有 4/107 个 case 形成 strict-correct answer；因此 target 的 0 次 strict
+repair 是严重 right-censored 的局部结果，不能直接判定 bank 语义无效。
+
+当前 oracle v2 将 memory active horizon 与 outcome horizon 分离：memory direct visibility 仍冻结为最多 32 步，
+随后从干预形成的 native cache 继续生成，直到完整 boxed answer、EOS 或总 completion 达到 1024 token。报告同时
+保留 local-32 和 final-outcome 指标，新结果写入 `oracle_audit_full_answer/`，legacy `oracle_audit/` 保持只读。
+在 full-answer causal audit 给出非零且 target-specific 的 repair 证据前，仍不进行 selector 或 held-out bank sweep。
+服务器用仓库根目录 `./test.sh` 作为 smoke→full 总入口；已有 `stage=all` 工件时它自动复用 recovery、risk、cache
+和 state-audit，只重新执行该 full-answer oracle。
+
 ## 6. 活跃代码边界
 
 当前主线：

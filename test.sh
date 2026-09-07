@@ -1,472 +1,265 @@
 #!/usr/bin/env bash
-# Authenticate V4.2 inputs and build the zero-API provisional local-direct bank.
+# Run the current V4 recovered-source oracle workflow on the server.
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
 PYTHON_BIN="${MEMGEN_PYTHON_BIN:-python}"
-OUTPUT_ROOT="${MEMGEN_V4_OUTPUT_ROOT:-$REPO_ROOT/output/experiments/v4}"
-LOCAL_DIR="${MEMGEN_V4_2_LOCAL_DIR:-$OUTPUT_ROOT/offline/construction_v4_2_local}"
-SHORTLIST_DIR="${MEMGEN_V4_2_SHORTLIST_DIR:-$OUTPUT_ROOT/offline/construction_v4_2_shortlist}"
-AUDIT_DIR="${MEMGEN_V4_2_AUDIT_DIR:-$SHORTLIST_DIR/audit}"
-SOURCE_DIR="${MEMGEN_V4_SOURCE_DIR:-$OUTPUT_ROOT/offline/construction}"
-SEMANTIC_DIR="${MEMGEN_V4_2_SEMANTIC_DIR:-$OUTPUT_ROOT/offline/construction_v4_2_semantic}"
-LOCAL_DIRECT_DIR="${MEMGEN_V4_2_LOCAL_DIRECT_DIR:-$OUTPUT_ROOT/offline/construction_v4_2_local_direct}"
-SEMANTIC_POLICY="${MEMGEN_V4_2_SEMANTIC_POLICY:-$REPO_ROOT/configs/experiments/gsm8k/v4_2_semantic_policy.json}"
-SEMANTIC_STAGE="${MEMGEN_V4_2_STAGE:-local-direct}"
-SKIP_SEMANTIC="${MEMGEN_V4_2_SKIP_SEMANTIC:-0}"
-REPORT_PATH="$AUDIT_DIR/v4_2_shortlist_test_report.json"
-LOG_PATH="$AUDIT_DIR/v4_2_shortlist_test.log"
-SEMANTIC_LOG_PATH="$SEMANTIC_DIR/v4_2_semantic_${SEMANTIC_STAGE}.log"
-LOCAL_DIRECT_LOG_PATH="$LOCAL_DIRECT_DIR/v4_2_local_direct.log"
+OUTPUT_ROOT="${MEMGEN_OUTPUT_ROOT:-/data/memgen-runs}"
+V4_OUTPUT_ROOT="${MEMGEN_V4_OUTPUT_ROOT:-$OUTPUT_ROOT/v4}"
+RECOVERY_ID="${MEMGEN_V4_RECOVERY_ID:-gsm8k-v4-packet-replay-20260907-r1}"
+SEMANTIC_PACKETS="${MEMGEN_V4_SEMANTIC_PACKETS:-$V4_OUTPUT_ROOT/offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl}"
+CURATED_BANK_DIR="${MEMGEN_V4_CURATED_BANK_DIR:-$V4_OUTPUT_ROOT/offline/construction_v4_2_local_curated}"
+SIDE_KV_DIR="${MEMGEN_V4_SIDE_KV_DIR:-$V4_OUTPUT_ROOT/offline/side_kv_v4_2_local_curated}"
+STAGE_POLICY="${MEMGEN_V4_TEST_STAGE:-auto}"
+RUN_SELECTION="${1:-all}"
 
-mkdir -p "$AUDIT_DIR"
-: > "$LOG_PATH"
+RUNNER="$REPO_ROOT/scripts/experiments/gsm8k/run_v4_question_recovery.sh"
+LINEAGE_ROOT="${MEMGEN_V4_RECOVERY_LINEAGE_ROOT:-$OUTPUT_ROOT/lineages/gsm8k-recovery/$RECOVERY_ID}"
+RECOVERY_MANIFEST="$LINEAGE_ROOT/recovery/v4_question_recovery_manifest.json"
+RISK_ARTIFACT="$LINEAGE_ROOT/risk_v3_4/token-entropy-risk-gate-v3.4.pt"
+RISK_REPORT="$LINEAGE_ROOT/risk_v3_4/token_entropy_risk_report.json"
+RISK_EVIDENCE="$LINEAGE_ROOT/risk_v3_4/token_entropy_risk_evidence.jsonl"
+CURRENT_MODE="preflight"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./test.sh [all|smoke|full]
+
+With no arguments, the script runs smoke first and then full. It uses the
+recovered GSM8K lineage and the current curated 17-bank Side-KV artifacts.
+
+Default server locations:
+  MEMGEN_OUTPUT_ROOT=/data/memgen-runs
+  MEMGEN_V4_OUTPUT_ROOT=$MEMGEN_OUTPUT_ROOT/v4
+  MEMGEN_V4_RECOVERY_ID=gsm8k-v4-packet-replay-20260907-r1
+
+Optional overrides:
+  MEMGEN_V4_SEMANTIC_PACKETS=/path/to/semantic_evidence_packets.jsonl
+  MEMGEN_V4_CURATED_BANK_DIR=/path/to/construction_v4_2_local_curated
+  MEMGEN_V4_SIDE_KV_DIR=/path/to/side_kv_v4_2_local_curated
+  MEMGEN_V4_TEST_STAGE=auto|oracle|all|recover|risk|cache|state-audit
+  MEMGEN_V4_DEVICE=cuda
+  MEMGEN_V4_DTYPE=bfloat16
+  MEMGEN_V4_CUDA_VISIBLE_DEVICES=0
+  MEMGEN_V4_ORACLE_SMOKE_LIMIT=8
+  MEMGEN_PYTHON_BIN=python
+
+The default stage policy is auto. For each mode, it reuses authenticated
+recovery/risk/cache/state-audit artifacts when they exist and runs only the
+fixed full-answer oracle. If a prerequisite is absent, that mode runs
+stage=all to build it. Set MEMGEN_V4_TEST_STAGE explicitly to override this.
+
+No selector, dev-test, final-test, or paid external API is invoked.
+EOF
+}
 
 fail() {
-  echo "[v4.2-test] FAIL: $*" >&2
+  echo "[v4-test] FAIL: $*" >&2
   exit 1
 }
+
+on_error() {
+  local status="$?"
+  echo "[v4-test] FAIL mode=$CURRENT_MODE line=$1 status=$status" >&2
+  exit "$status"
+}
+trap 'on_error "$LINENO"' ERR
+
+case "$RUN_SELECTION" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  all|smoke|full) ;;
+  *)
+    usage >&2
+    fail "argument must be all, smoke, or full"
+    ;;
+esac
+
+case "$STAGE_POLICY" in
+  auto|oracle|all|recover|risk|cache|state-audit) ;;
+  *) fail "MEMGEN_V4_TEST_STAGE must be auto, oracle, all, recover, risk, cache, or state-audit" ;;
+esac
 
 command -v "$PYTHON_BIN" >/dev/null 2>&1 \
   || fail "Python executable not found: $PYTHON_BIN"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
-case "$SEMANTIC_STAGE" in
-  preflight | local-direct) ;;
-  paid)
-    [[ "${MEMGEN_V4_2_APPROVE_PAID_STAGE:-0}" == "1" ]] \
-      || fail "paid stage requires MEMGEN_V4_2_APPROVE_PAID_STAGE=1"
-    [[ -n "${DEEPSEEK_API_KEY:-}" ]] \
-      || fail "paid stage requires DEEPSEEK_API_KEY"
+[[ -x "$RUNNER" ]] || fail "missing executable recovery runner: $RUNNER"
+
+for required in \
+  "$SEMANTIC_PACKETS" \
+  "$CURATED_BANK_DIR/bank_records.jsonl" \
+  "$CURATED_BANK_DIR/bank_manifest.json" \
+  "$SIDE_KV_DIR/v4_side_kv_manifest.json"; do
+  [[ -s "$required" ]] || fail "missing required input: $required"
+done
+
+export MEMGEN_PYTHON_BIN="$PYTHON_BIN"
+export MEMGEN_V4_DEVICE="${MEMGEN_V4_DEVICE:-cuda}"
+export MEMGEN_V4_DTYPE="${MEMGEN_V4_DTYPE:-bfloat16}"
+export MEMGEN_V4_CUDA_VISIBLE_DEVICES="${MEMGEN_V4_CUDA_VISIBLE_DEVICES:-0}"
+export MEMGEN_V4_ORACLE_SMOKE_LIMIT="${MEMGEN_V4_ORACLE_SMOKE_LIMIT:-8}"
+
+# This workflow is local/model-inference only. Never let a child process inherit
+# a paid-provider credential accidentally.
+unset DEEPSEEK_API_KEY GLM_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY || true
+
+echo "[v4-test] repo_revision=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+echo "[v4-test] run_selection=$RUN_SELECTION stage_policy=$STAGE_POLICY"
+echo "[v4-test] recovery_id=$RECOVERY_ID"
+echo "[v4-test] output_root=$OUTPUT_ROOT"
+echo "[v4-test] semantic_packets=$SEMANTIC_PACKETS"
+echo "[v4-test] curated_bank_dir=$CURATED_BANK_DIR"
+echo "[v4-test] side_kv_dir=$SIDE_KV_DIR"
+echo "[v4-test] oracle_profile=memory_active_steps=32 completion_tokens=1024"
+
+prerequisites_exist() {
+  local mode="$1"
+  local run_root="$LINEAGE_ROOT/v4_oracle_${mode}"
+  local cache_manifest="$run_root/source_state_cache/v4_source_state_manifest.json"
+  local state_audit_report="$run_root/source_state_audit/v4_source_state_cpu_audit_report.json"
+  local required
+  for required in \
+    "$RECOVERY_MANIFEST" \
+    "$RISK_ARTIFACT" \
+    "$RISK_REPORT" \
+    "$RISK_EVIDENCE" \
+    "$cache_manifest" \
+    "$state_audit_report"; do
+    [[ -s "$required" ]] || return 1
+  done
+}
+
+stage_for_mode() {
+  local mode="$1"
+  if [[ "$STAGE_POLICY" != "auto" ]]; then
+    printf '%s\n' "$STAGE_POLICY"
+  elif prerequisites_exist "$mode"; then
+    printf '%s\n' "oracle"
+  else
+    printf '%s\n' "all"
+  fi
+}
+
+write_core_summary() {
+  local mode="$1"
+  local report="$2"
+  local summary="$3"
+  local temporary
+  temporary="$(mktemp "$(dirname -- "$summary")/.v4_oracle_core_summary.XXXXXX")"
+  jq '
+    def core_metrics:
+      {
+        case_count,
+        independent_sample_count,
+        baseline_accuracy,
+        target_accuracy,
+        reference_accuracy,
+        baseline_independent_sample_macro_accuracy,
+        target_independent_sample_macro_accuracy,
+        reference_independent_sample_macro_accuracy,
+        baseline_wrong_to_target_correct_count,
+        baseline_wrong_to_target_correct_independent_sample_count,
+        baseline_wrong_to_reference_correct_count,
+        baseline_wrong_to_reference_correct_independent_sample_count,
+        target_harm_count,
+        target_harm_independent_sample_count,
+        target_better_than_reference_count,
+        target_better_than_reference_independent_sample_count,
+        mean_target_minus_reference_reward,
+        independent_sample_macro_target_minus_reference_reward,
+        local_intervention_observability,
+        final_outcome_observability,
+        local_trajectory_divergence,
+        final_trajectory_divergence,
+        intervention_diagnostics
+      };
+    {
+      schema_version: "memgen-v4-oracle-core-summary-v2",
+      status,
+      complete,
+      expected_case_count,
+      completed_case_count,
+      gate_unreachable_failure_count,
+      gate_unreachable_counted_as_memory_ineffective,
+      configuration,
+      failure_oracle: (.by_dimension.case_kind.failure_oracle | core_metrics),
+      success_safety: (.by_dimension.case_kind.success_safety | core_metrics),
+      primary: (.by_dimension.curation_tier.primary | core_metrics),
+      conditional: (.by_dimension.curation_tier.conditional | core_metrics)
+    }
+  ' "$report" > "$temporary"
+  mv "$temporary" "$summary"
+  echo "[v4-test] $mode core summary:"
+  jq . "$summary"
+}
+
+run_mode() {
+  local mode="$1"
+  local stage
+  local run_root="$LINEAGE_ROOT/v4_oracle_${mode}"
+  local oracle_dir="$run_root/oracle_audit_full_answer"
+  local report="$oracle_dir/v4_oracle_report.json"
+  local summary="$oracle_dir/v4_oracle_core_summary.json"
+
+  CURRENT_MODE="$mode"
+  stage="$(stage_for_mode "$mode")"
+  echo "[v4-test] START mode=$mode stage=$stage"
+  bash "$RUNNER" \
+    --mode "$mode" \
+    --stage "$stage" \
+    "$RECOVERY_ID" \
+    "$SEMANTIC_PACKETS" \
+    "$CURATED_BANK_DIR" \
+    "$SIDE_KV_DIR" \
+    "$OUTPUT_ROOT"
+
+  if [[ "$stage" == "oracle" || "$stage" == "all" ]]; then
+    [[ -s "$report" ]] || fail "missing oracle report: $report"
+    jq -e '
+      .status == "completed_mechanism_diagnostic"
+      and .complete == true
+      and .completed_case_count == .expected_case_count
+      and .offline_only == true
+      and .qualified_for_online_use == false
+      and .online_artifacts_generated == false
+      and .held_out_generalization_claim == false
+      and .gate_unreachable_counted_as_memory_ineffective == false
+      and .configuration.maximum_completion_tokens == 1024
+      and .configuration.local_intervention_observation_tokens == 32
+      and .configuration.maximum_active_steps == 32
+      and .configuration.post_memory_native_continuation == true
+      and .configuration.generation_stop_policy
+        == "completed_boxed_answer_or_eos_or_completion_budget"
+      and .local_and_final_metrics_separated == true
+      and .question_recovery.external_api_calls_made == 0
+      and .artifacts.online_selector_tensor == null
+      and .artifacts.online_selector_manifest == null
+    ' "$report" >/dev/null \
+      || fail "full-answer oracle report validation failed: $report"
+    write_core_summary "$mode" "$report" "$summary"
+    echo "[v4-test] report=$report"
+    echo "[v4-test] summary=$summary"
+  fi
+  echo "[v4-test] PASS mode=$mode stage=$stage"
+}
+
+case "$RUN_SELECTION" in
+  smoke)
+    run_mode smoke
     ;;
-  *) fail "MEMGEN_V4_2_STAGE must be preflight, local-direct, or paid" ;;
+  full)
+    run_mode full
+    ;;
+  all)
+    run_mode smoke
+    run_mode full
+    ;;
 esac
 
-for REQUIRED in \
-  construction_profile.json \
-  local_atoms.jsonl \
-  multiview_embeddings_manifest.json \
-  mechanism_embeddings.npy \
-  repair_embeddings.npy \
-  applicability_embeddings.npy \
-  local_clusters.jsonl \
-  cluster_review_packets.jsonl \
-  local_cluster_plan.json; do
-  [[ -s "$LOCAL_DIR/$REQUIRED" ]] \
-    || fail "missing or empty local construction artifact: $LOCAL_DIR/$REQUIRED"
-done
-
-SHORTLIST_ENTRYPOINT="$REPO_ROOT/scripts/select_v4_2_bank_candidates.py"
-[[ -s "$SHORTLIST_ENTRYPOINT" ]] || fail "missing shortlist entrypoint"
-if grep -Eq 'TeacherClient|DEEPSEEK_API_KEY|os\.environ|urllib' \
-  "$SHORTLIST_ENTRYPOINT"; then
-  fail "shortlist entrypoint contains a forbidden paid/network dependency"
-fi
-
-REPO_REVISION="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-echo "[v4.2-test] repo_revision=$REPO_REVISION"
-echo "[v4.2-test] local_dir=$LOCAL_DIR"
-echo "[v4.2-test] shortlist_dir=$SHORTLIST_DIR"
-echo "[v4.2-test] audit_dir=$AUDIT_DIR"
-
-# The local shortlist child is deliberately unable to inherit a paid-stage key.
-(
-  unset DEEPSEEK_API_KEY || true
-  "$PYTHON_BIN" "$SHORTLIST_ENTRYPOINT" \
-    --local-construction-dir "$LOCAL_DIR" \
-    --output-dir "$SHORTLIST_DIR" \
-    --preferred-support 6 \
-    --minimum-support-cohesion-quantile 0.50 \
-    --redundancy-mechanism-threshold 0.92 \
-    --redundancy-repair-threshold 0.92 \
-    --redundancy-applicability-threshold 0.85 \
-    --max-synthesis-candidates 48 \
-    --target-runtime-bank-cap 32 \
-    --synthesis-batch-size 4 \
-    --review-batch-size 8 \
-    --resume
-) 2>&1 | tee "$LOG_PATH"
-
-PREFLIGHT_PATH="$SHORTLIST_DIR/api_preflight_report.json"
-QUALITY_PATH="$SHORTLIST_DIR/candidate_quality_report.json"
-SELECTED_PATH="$SHORTLIST_DIR/selected_synthesis_candidates.jsonl"
-REJECTED_PATH="$SHORTLIST_DIR/rejected_or_redundant_candidates.jsonl"
-EDGES_PATH="$SHORTLIST_DIR/candidate_redundancy_edges.jsonl"
-MANIFEST_PATH="$SHORTLIST_DIR/synthesis_shortlist_manifest.json"
-
-for REQUIRED in \
-  "$PREFLIGHT_PATH" \
-  "$QUALITY_PATH" \
-  "$SELECTED_PATH" \
-  "$REJECTED_PATH" \
-  "$EDGES_PATH" \
-  "$MANIFEST_PATH"; do
-  [[ -f "$REQUIRED" ]] || fail "missing shortlist artifact: $REQUIRED"
-done
-
-jq -e '
-  .status == "synthesis_shortlist_complete_api_not_started"
-  and .external_api_calls_made == 0
-  and .api_key_read == false
-  and .automatic_paid_stage_transition == false
-  and .qualified_for_online_use == false
-  and .source_candidate_count
-      == (.selected_synthesis_candidate_count + .rejected_candidate_count)
-  and .selected_synthesis_candidate_count > 0
-  and .selected_synthesis_candidate_count <= .max_synthesis_candidates
-  and (([.decision_counts[]] | add) == .source_candidate_count)
-  and .within_synthesis_candidate_guardrail == true
-  and .synthesis_blocked_reason == null
-' "$PREFLIGHT_PATH" >/dev/null \
-  || fail "preflight invariants did not pass"
-
-SOURCE_COUNT="$(jq -r '.source_candidate_count' "$PREFLIGHT_PATH")"
-SELECTED_COUNT="$(jq -r '.selected_synthesis_candidate_count' "$PREFLIGHT_PATH")"
-REJECTED_COUNT="$(jq -r '.rejected_candidate_count' "$PREFLIGHT_PATH")"
-REDUNDANCY_COUNT="$(jq -r '.redundancy_edge_count' "$PREFLIGHT_PATH")"
-
-jq -e \
-  --argjson source_count "$SOURCE_COUNT" \
-  --argjson selected_count "$SELECTED_COUNT" \
-  --argjson rejected_count "$REJECTED_COUNT" '
-  .source_candidate_count == $source_count
-  and .selected_candidate_count == $selected_count
-  and .rejected_candidate_count == $rejected_count
-  and (([.candidates[] | select(.decision == "selected")] | length)
-       == $selected_count)
-  and (([.candidates[] | select(.decision == "rejected")] | length)
-       == $rejected_count)
-' "$QUALITY_PATH" >/dev/null \
-  || fail "candidate-quality terminal coverage did not pass"
-
-REPORT_TEMP="$(mktemp "$AUDIT_DIR/.v4_2_shortlist_test_report.XXXXXX")"
-trap 'rm -f "$REPORT_TEMP"' EXIT
-jq -n \
-  --arg repo_revision "$REPO_REVISION" \
-  --arg local_dir "$LOCAL_DIR" \
-  --arg shortlist_dir "$SHORTLIST_DIR" \
-  --slurpfile preflight "$PREFLIGHT_PATH" \
-  --slurpfile quality "$QUALITY_PATH" \
-  --slurpfile selected "$SELECTED_PATH" \
-  --slurpfile edges "$EDGES_PATH" '
-  ($preflight[0]) as $p
-  | ($quality[0]) as $q
-  | ([
-      $edges[]
-      | . + {
-          weakest_normalized_redundancy_margin: (
-            [
-              ((.mechanism_similarity - 0.92) / 0.08),
-              ((.repair_similarity - 0.92) / 0.08),
-              ((.applicability_similarity - 0.85) / 0.15)
-            ]
-            | min
-          )
-        }
-    ] | sort_by(.weakest_normalized_redundancy_margin) | .[:20])
-    as $boundary_edges
-  | {
-      schema_version: "memgen-v4.2-shortlist-test-report-v1",
-      status: "PASS",
-      repo_revision: $repo_revision,
-      local_construction_dir: $local_dir,
-      shortlist_dir: $shortlist_dir,
-      assertions: {
-        authenticated_resume_passed: true,
-        external_api_calls_made: $p.external_api_calls_made,
-        api_key_read: $p.api_key_read,
-        automatic_paid_stage_transition: $p.automatic_paid_stage_transition,
-        qualified_for_online_use: $p.qualified_for_online_use,
-        terminal_candidate_coverage_passed: true,
-        within_synthesis_candidate_guardrail:
-          $p.within_synthesis_candidate_guardrail,
-        within_runtime_bank_cap_without_review:
-          ($p.selected_synthesis_candidate_count <= $p.target_runtime_bank_cap)
-      },
-      summary: {
-        source_candidate_count: $p.source_candidate_count,
-        selected_synthesis_candidate_count:
-          $p.selected_synthesis_candidate_count,
-        rejected_candidate_count: $p.rejected_candidate_count,
-        decision_counts: $p.decision_counts,
-        minimum_support_cohesion_threshold:
-          $p.minimum_support_cohesion_threshold,
-        redundancy_edge_count: $p.redundancy_edge_count,
-        max_synthesis_candidates: $p.max_synthesis_candidates,
-        target_runtime_bank_cap: $p.target_runtime_bank_cap,
-        planned_initial_synthesis_requests:
-          $p.planned_initial_synthesis_requests,
-        maximum_followup_review_requests:
-          $p.maximum_followup_review_requests,
-        maximum_total_paid_requests: $p.maximum_total_paid_requests,
-        semantic_evidence_characters: $p.semantic_evidence_characters,
-        estimated_semantic_evidence_tokens_at_three_chars_per_token:
-          $p.estimated_semantic_evidence_tokens_at_three_chars_per_token,
-        profile_sha256: $p.profile_sha256,
-        shortlist_manifest_sha256: $p.shortlist_manifest_sha256,
-        report_sha256: $p.report_sha256
-      },
-      selected_quality: [
-        $q.candidates[]
-        | select(.decision == "selected")
-        | {
-            rank: .selection_rank,
-            candidate_id,
-            support: .distinct_sample_count,
-            support_tier,
-            weakest_margin: .weakest_normalized_minimum_margin,
-            mechanism_min: .mechanism_similarity_min,
-            repair_min: .repair_similarity_min,
-            applicability_min: .applicability_similarity_min,
-            joint_min: .joint_similarity_min,
-            joint_mean: .joint_similarity_mean,
-            selection_reason: .reason
-          }
-      ] | sort_by(.rank),
-      high_risk_semantic_audit: [
-        $selected[]
-        | select(
-            .quality.weakest_normalized_minimum_margin < 0.12
-            or .quality.joint_similarity_min < 0.86
-          )
-        | {
-            rank: .selection_rank,
-            candidate_id: .candidate.candidate_id,
-            support: .candidate.distinct_sample_count,
-            weakest_margin: .quality.weakest_normalized_minimum_margin,
-            mechanism_min: .quality.mechanism_similarity_min,
-            repair_min: .quality.repair_similarity_min,
-            applicability_min: .quality.applicability_similarity_min,
-            joint_min: .quality.joint_similarity_min,
-            joint_mean: .quality.joint_similarity_mean,
-            semantic_evidence: [
-              .semantic_evidence[]
-              | {
-                  problem_structure,
-                  decision_point,
-                  failure_mechanism,
-                  repair_operator,
-                  verification_operator
-                }
-            ]
-          }
-      ] | sort_by(.rank),
-      boundary_redundancy_edges: $boundary_edges
-    }
-' > "$REPORT_TEMP"
-mv "$REPORT_TEMP" "$REPORT_PATH"
-trap - EXIT
-
-HIGH_RISK_COUNT="$(jq -r '.high_risk_semantic_audit | length' "$REPORT_PATH")"
-REPORT_BYTES="$(wc -c < "$REPORT_PATH" | tr -d ' ')"
-
-echo "[v4.2-test] PASS source=$SOURCE_COUNT selected=$SELECTED_COUNT rejected=$REJECTED_COUNT redundancy_edges=$REDUNDANCY_COUNT high_risk=$HIGH_RISK_COUNT api_calls=0"
-echo "[v4.2-test] report=$REPORT_PATH bytes=$REPORT_BYTES"
-echo "[v4.2-test] log=$LOG_PATH"
-
-if [[ "$SKIP_SEMANTIC" == "1" ]]; then
-  echo "[v4.2-test] semantic stage explicitly skipped"
-  exit 0
-fi
-
-for REQUIRED in \
-  "$SOURCE_DIR/repair_signatures.jsonl" \
-  "$SOURCE_DIR/construction_profile.json" \
-  "$SEMANTIC_POLICY"; do
-  [[ -s "$REQUIRED" ]] || fail "missing semantic-bank input: $REQUIRED"
-done
-
-PHASE1_DIR="${MEMGEN_PHASE1_DIR:-}"
-if [[ -z "$PHASE1_DIR" ]]; then
-  PHASE1_CANDIDATES=()
-  while IFS= read -r CANDIDATE; do
-    [[ -s "$CANDIDATE/verified_experiences.jsonl" ]] \
-      && PHASE1_CANDIDATES+=("$CANDIDATE")
-  done < <(find "$REPO_ROOT/output/experiments" -type f -name split_manifest.json -print 2>/dev/null | sed 's#/split_manifest.json$##' | sort -u)
-  if [[ "${#PHASE1_CANDIDATES[@]}" -ne 1 ]]; then
-    fail "set MEMGEN_PHASE1_DIR; automatic discovery found ${#PHASE1_CANDIDATES[@]} matching directories"
-  fi
-  PHASE1_DIR="${PHASE1_CANDIDATES[0]}"
-fi
-for REQUIRED in \
-  "$PHASE1_DIR/verified_experiences.jsonl" \
-  "$PHASE1_DIR/split_manifest.json"; do
-  [[ -s "$REQUIRED" ]] || fail "missing Phase-1 input: $REQUIRED"
-done
-
-SEMANTIC_ENTRYPOINT="$REPO_ROOT/scripts/build_v4_2_semantic_bank.py"
-[[ -s "$SEMANTIC_ENTRYPOINT" ]] || fail "missing semantic-bank entrypoint"
-mkdir -p "$SEMANTIC_DIR"
-SEMANTIC_BUILD_STAGE="$SEMANTIC_STAGE"
-if [[ "$SEMANTIC_BUILD_STAGE" == "local-direct" ]]; then
-  SEMANTIC_BUILD_STAGE="preflight"
-fi
-SEMANTIC_COMMAND=(
-  "$PYTHON_BIN" "$SEMANTIC_ENTRYPOINT"
-  --experiences "$PHASE1_DIR/verified_experiences.jsonl"
-  --split-manifest "$PHASE1_DIR/split_manifest.json"
-  --source-signatures "$SOURCE_DIR/repair_signatures.jsonl"
-  --source-construction-profile "$SOURCE_DIR/construction_profile.json"
-  --local-construction-dir "$LOCAL_DIR"
-  --shortlist-dir "$SHORTLIST_DIR"
-  --semantic-policy "$SEMANTIC_POLICY"
-  --output-dir "$SEMANTIC_DIR"
-  --dataset-revision main
-  --stage "$SEMANTIC_BUILD_STAGE"
-  --resume
-)
-if [[ "$SEMANTIC_BUILD_STAGE" == "paid" ]]; then
-  SEMANTIC_COMMAND+=(--approve-paid-stage)
-  "${SEMANTIC_COMMAND[@]}" 2>&1 | tee "$SEMANTIC_LOG_PATH"
-else
-  (
-    unset DEEPSEEK_API_KEY || true
-    "${SEMANTIC_COMMAND[@]}"
-  ) 2>&1 | tee "$SEMANTIC_LOG_PATH"
-fi
-
-SEMANTIC_PREFLIGHT="$SEMANTIC_DIR/api_preflight_report.json"
-[[ -s "$SEMANTIC_PREFLIGHT" ]] || fail "missing semantic preflight report"
-jq -e '
-  .status == "semantic_evidence_ready_api_not_started"
-  and .external_api_calls_made == 0
-  and .api_key_read == false
-  and .automatic_paid_stage_transition == false
-  and .qualified_for_online_use == false
-  and .planned_candidate_count > 0
-  and (.planned_candidate_count + .preflight_excluded_candidate_count
-       == .source_selected_candidate_count)
-  and .policy_excluded_evidence_count == 2
-  and .planned_combined_request_count > 0
-  and (.nominal_total_paid_request_count_if_all_coherent
-       <= .maximum_total_request_units_after_recursive_split)
-' "$SEMANTIC_PREFLIGHT" >/dev/null \
-  || fail "semantic preflight invariants did not pass"
-
-if [[ "$SEMANTIC_STAGE" == "paid" ]]; then
-  PAID_REPORT="$SEMANTIC_DIR/paid_stage_report.json"
-  BANK_MANIFEST="$SEMANTIC_DIR/bank_manifest.json"
-  BANK_RECORDS="$SEMANTIC_DIR/bank_records.jsonl"
-  for REQUIRED in "$PAID_REPORT" "$BANK_MANIFEST" "$BANK_RECORDS"; do
-    [[ -s "$REQUIRED" ]] || fail "missing paid semantic-bank artifact: $REQUIRED"
-  done
-  jq -e '
-    .status == "semantic_bank_constructed_not_tensor_compiled"
-    and .qualified_for_online_use == false
-    and .bank_record_count > 0
-    and .bank_record_count <= 32
-    and .bank_manifest_sha256 != null
-  ' "$PAID_REPORT" >/dev/null || fail "paid semantic-bank report did not pass"
-  jq -e '
-    .schema_version == "memgen-v4.2-bank-manifest-v1"
-    and .status == "constructed_not_tensor_compiled"
-    and .qualified_for_online_use == false
-    and .record_count > 0
-    and .record_count <= .profile.target_runtime_bank_cap
-    and (.record_count == (.bank_ids | length))
-  ' "$BANK_MANIFEST" >/dev/null || fail "semantic bank manifest did not pass"
-  BANK_RECORD_COUNT="$(wc -l < "$BANK_RECORDS" | tr -d ' ')"
-  [[ "$BANK_RECORD_COUNT" == "$(jq -r '.record_count' "$BANK_MANIFEST")" ]] \
-    || fail "semantic bank record count differs from manifest"
-  echo "[v4.2-test] PAID PASS bank_records=$BANK_RECORD_COUNT"
-  echo "[v4.2-test] paid_report=$PAID_REPORT"
-  echo "[v4.2-test] bank_manifest=$BANK_MANIFEST"
-elif [[ "$SEMANTIC_STAGE" == "local-direct" ]]; then
-  LOCAL_DIRECT_ENTRYPOINT="$REPO_ROOT/scripts/build_v4_2_local_direct_bank.py"
-  [[ -s "$LOCAL_DIRECT_ENTRYPOINT" ]] \
-    || fail "missing V4.2 local-direct bank entrypoint"
-  mkdir -p "$LOCAL_DIRECT_DIR"
-  (
-    unset DEEPSEEK_API_KEY || true
-    "$PYTHON_BIN" "$LOCAL_DIRECT_ENTRYPOINT" \
-      --experiences "$PHASE1_DIR/verified_experiences.jsonl" \
-      --split-manifest "$PHASE1_DIR/split_manifest.json" \
-      --source-signatures "$SOURCE_DIR/repair_signatures.jsonl" \
-      --source-construction-profile "$SOURCE_DIR/construction_profile.json" \
-      --local-construction-dir "$LOCAL_DIR" \
-      --shortlist-dir "$SHORTLIST_DIR" \
-      --semantic-preflight-dir "$SEMANTIC_DIR" \
-      --semantic-policy "$SEMANTIC_POLICY" \
-      --output-dir "$LOCAL_DIRECT_DIR" \
-      --dataset-revision main \
-      --resume
-  ) 2>&1 | tee "$LOCAL_DIRECT_LOG_PATH"
-
-  LOCAL_DIRECT_REPORT="$LOCAL_DIRECT_DIR/local_direct_report.json"
-  BANK_MANIFEST="$LOCAL_DIRECT_DIR/bank_manifest.json"
-  BANK_RECORDS="$LOCAL_DIRECT_DIR/bank_records.jsonl"
-  MEDOID_SELECTIONS="$LOCAL_DIRECT_DIR/medoid_selections.jsonl"
-  for REQUIRED in \
-    "$LOCAL_DIRECT_REPORT" \
-    "$BANK_MANIFEST" \
-    "$BANK_RECORDS" \
-    "$MEDOID_SELECTIONS"; do
-    [[ -s "$REQUIRED" ]] \
-      || fail "missing local-direct bank artifact: $REQUIRED"
-  done
-  jq -e --slurpfile preflight "$SEMANTIC_PREFLIGHT" '
-    .status == "local_direct_bank_constructed_not_tensor_compiled"
-    and .quality_tier == "provisional_local_direct"
-    and .qualified_for_online_use == false
-    and .admission_basis == "authenticated_local_shortlist"
-    and .semantic_audit_performed == false
-    and .independent_review_performed == false
-    and .api_key_read == false
-    and .external_api_calls_made == 0
-    and .bank_record_count == $preflight[0].planned_candidate_count
-    and .source_candidate_count == .bank_record_count
-    and .joint_medoid_count == .bank_record_count
-    and .evidence_count == $preflight[0].evidence_count
-    and .bank_record_count > 0
-    and .bank_record_count <= 32
-  ' "$LOCAL_DIRECT_REPORT" >/dev/null \
-    || fail "V4.2 local-direct report did not pass"
-  jq -e '
-    .schema_version == "memgen-v4.2-local-direct-bank-manifest-v1"
-    and .construction_version == "v4.2-local-direct"
-    and .status == "constructed_not_tensor_compiled"
-    and .quality_tier == "provisional_local_direct"
-    and .qualified_for_online_use == false
-    and .semantic_review.performed == false
-    and .semantic_review.reviewer == null
-    and .semantic_review.external_api_calls_made == 0
-    and .api_key_read == false
-    and .external_api_calls_made == 0
-    and .profile.injection_layer == 24
-    and .profile.relative_phase_delta == 0
-    and .profile.target_online_only == true
-    and .auxiliary_banks_materialized == false
-    and .record_count == (.bank_ids | length)
-  ' "$BANK_MANIFEST" >/dev/null \
-    || fail "V4.2 local-direct manifest did not pass"
-  BANK_RECORD_COUNT="$(wc -l < "$BANK_RECORDS" | tr -d ' ')"
-  MEDOID_COUNT="$(wc -l < "$MEDOID_SELECTIONS" | tr -d ' ')"
-  [[ "$BANK_RECORD_COUNT" == "$(jq -r '.record_count' "$BANK_MANIFEST")" ]] \
-    || fail "local-direct bank record count differs from manifest"
-  [[ "$MEDOID_COUNT" == "$BANK_RECORD_COUNT" ]] \
-    || fail "local-direct medoid count differs from bank count"
-  jq -e -s '
-    all(.[];
-      .construction.distinct_sample_count >= 5
-      and .roles == {
-        "target_online_injectable": true,
-        "reference_online_injectable": false,
-        "auxiliary": null
-      }
-      and .local_direct_admission.semantic_audit_performed == false
-      and .local_direct_admission.independent_review_performed == false
-      and .compiler_contract.layer_number == 24
-    )
-  ' "$BANK_RECORDS" >/dev/null \
-    || fail "V4.2 local-direct bank records did not pass"
-  echo "[v4.2-test] LOCAL-DIRECT PASS bank_records=$BANK_RECORD_COUNT api_calls=0"
-  echo "[v4.2-test] local_direct_report=$LOCAL_DIRECT_REPORT"
-  echo "[v4.2-test] bank_manifest=$BANK_MANIFEST"
-  echo "[v4.2-test] local_direct_log=$LOCAL_DIRECT_LOG_PATH"
-else
-  echo "[v4.2-test] PREFLIGHT PASS api_key_read=false api_calls=0"
-fi
-echo "[v4.2-test] semantic_preflight=$SEMANTIC_PREFLIGHT"
-echo "[v4.2-test] semantic_log=$SEMANTIC_LOG_PATH"
-echo "[v4.2-test] send the local-direct report or, after paid mode, the paid report"
+CURRENT_MODE="complete"
+echo "[v4-test] PASS run_selection=$RUN_SELECTION"

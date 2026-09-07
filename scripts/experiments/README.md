@@ -33,6 +33,22 @@ offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl
 当前 curated 17-bank 使用的 116 条原题、success/failure 原始轨迹和 verifier 证据可以直接恢复，不需要调用
 DeepSeek，也不需要重新生成 bank 或 Side-KV。服务器 smoke：
 
+当前推荐的服务器总入口是仓库根目录的 `test.sh`：
+
+```bash
+git pull
+./test.sh
+```
+
+不带参数时，它按顺序运行 smoke 和 full。默认使用 `/data/memgen-runs`、recovery lineage
+`gsm8k-v4-packet-replay-20260907-r1` 以及下面列出的三份 V4 输入；如果 recovery、risk、对应模式的 cache 和
+state-audit 已存在，就自动只运行修复后的 `stage=oracle`，否则为缺少前置工件的模式运行 `stage=all`。可用
+`./test.sh smoke` 或 `./test.sh full` 单独运行，也可通过 `MEMGEN_OUTPUT_ROOT`、`MEMGEN_V4_OUTPUT_ROOT`、
+`MEMGEN_V4_RECOVERY_ID` 和 `MEMGEN_V4_TEST_STAGE` 覆盖默认值。脚本不会进入 selector、dev-test、final-test，
+也不会继承付费 provider key。
+
+下面保留等价的底层命令，便于排错或精确控制单个阶段。服务器 smoke：
+
 ```bash
 bash scripts/experiments/gsm8k/run_v4_question_recovery.sh \
   --mode smoke \
@@ -60,6 +76,39 @@ bash scripts/experiments/gsm8k/run_v4_question_recovery.sh \
 该入口只访问公开 GSM8K 和本地 Qwen，显式清除付费 provider keys。新 risk 使用全部 116 条 packet replay
 轨迹并保持正式 qualification 门槛；smoke 只缩小 cache/oracle。输出明确声明它不是旧 Phase-1 文件或旧 risk
 artifact 的 byte-identical 恢复，也不是 held-out 泛化实验。
+
+Oracle 的 full-answer profile 保持 Side-KV 最多 active 32 token，但 memory 卸载后继续原生生成，直到完整
+`\boxed{}`、EOS 或总 completion 达到 1024 token。它把 local-32 和 final-outcome 指标分开写入
+`oracle_audit_full_answer/`，不会覆盖早期 `oracle_audit/` 中的 32-token 局部报告。
+
+如果相同 `RECOVERY_ID` 已完成旧版 `--stage all`，只需重跑 oracle，不要重新恢复、拟合 risk 或提取 cache。先跑
+smoke：
+
+```bash
+bash scripts/experiments/gsm8k/run_v4_question_recovery.sh \
+  --mode smoke \
+  --stage oracle \
+  gsm8k-v4-packet-replay-20260907-r1 \
+  /data/memgen-runs/v4/offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl \
+  /data/memgen-runs/v4/offline/construction_v4_2_local_curated \
+  /data/memgen-runs/v4/offline/side_kv_v4_2_local_curated \
+  /data/memgen-runs
+```
+
+通过后复用 full cache：
+
+```bash
+bash scripts/experiments/gsm8k/run_v4_question_recovery.sh \
+  --mode full \
+  --stage oracle \
+  gsm8k-v4-packet-replay-20260907-r1 \
+  /data/memgen-runs/v4/offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl \
+  /data/memgen-runs/v4/offline/construction_v4_2_local_curated \
+  /data/memgen-runs/v4/offline/side_kv_v4_2_local_curated \
+  /data/memgen-runs
+```
+
+两次运行都不会启动 selector、dev-test、final-test 或外部教师 API。
 
 ### 备选：全新 Phase-1 / risk 数据与唯一血缘
 

@@ -12,6 +12,29 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class V4PipelineContractTests(unittest.TestCase):
+    def test_root_test_runner_executes_fixed_oracle_smoke_then_full(self) -> None:
+        source = (ROOT / "test.sh").read_text(encoding="utf-8")
+        self.assertIn("set -Eeuo pipefail", source)
+        self.assertIn('RUN_SELECTION="${1:-all}"', source)
+        self.assertIn("run_mode smoke", source)
+        self.assertIn("run_mode full", source)
+        self.assertIn("run_v4_question_recovery.sh", source)
+        self.assertIn('MEMGEN_V4_TEST_STAGE:-auto', source)
+        self.assertIn('printf \'%s\\n\' "oracle"', source)
+        self.assertIn('printf \'%s\\n\' "all"', source)
+        self.assertIn("oracle_audit_full_answer", source)
+        self.assertIn("maximum_completion_tokens == 1024", source)
+        self.assertIn("local_intervention_observation_tokens == 32", source)
+        self.assertIn("post_memory_native_continuation == true", source)
+        self.assertIn("v4_oracle_core_summary.json", source)
+        self.assertIn(
+            "unset DEEPSEEK_API_KEY GLM_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY",
+            source,
+        )
+        self.assertNotIn("evaluate_v4_experience_memory.py", source)
+        self.assertNotIn('"dev-test"', source)
+        self.assertNotIn('"final-test"', source)
+
     def test_selector_failure_persists_diagnostics_and_withholds_runtime_artifacts(
         self,
     ) -> None:
@@ -197,6 +220,9 @@ class V4PipelineContractTests(unittest.TestCase):
         self.assertIn("extract_v4_source_state_cache.py", source)
         self.assertIn("audit_v4_source_state_cache.py", source)
         self.assertIn("audit_v4_oracle_causal_utility.py", source)
+        self.assertIn("oracle_audit_full_answer", source)
+        self.assertIn("--maximum-completion-tokens 1024", source)
+        self.assertIn("post_memory_native_continuation", source)
         self.assertIn(".counts.bank_count == 17", source)
         self.assertIn(".counts.independent_sample_count == 116", source)
         self.assertIn("unset DEEPSEEK_API_KEY GLM_API_KEY", source)

@@ -31,7 +31,9 @@ Outputs:
   OUTPUT_ROOT/lineages/gsm8k-recovery/RECOVERY_ID/
     recovery/                 rebuilt split, exact packet trajectories, sealed manifest
     risk_v3_4/                newly fitted no-AI V3.4 risk artifact
-    v4_oracle_smoke|full/     source-state cache, CPU audit, oracle audit
+    v4_oracle_smoke|full/     source-state cache, CPU audit, oracle audits
+      oracle_audit/           preserved legacy 32-token local audit, if present
+      oracle_audit_full_answer/  32-step memory + full-answer outcome audit
     logs/                     stage logs
 
 The recovery stage downloads/reads only the public GSM8K dataset. It does not
@@ -97,7 +99,7 @@ RISK_DIR="$LINEAGE_ROOT/risk_v3_4"
 RUN_ROOT="$LINEAGE_ROOT/v4_oracle_${MODE}"
 SOURCE_STATE_DIR="$RUN_ROOT/source_state_cache"
 STATE_AUDIT_DIR="$RUN_ROOT/source_state_audit"
-ORACLE_AUDIT_DIR="$RUN_ROOT/oracle_audit"
+ORACLE_AUDIT_DIR="$RUN_ROOT/oracle_audit_full_answer"
 LOG_DIR="$LINEAGE_ROOT/logs"
 
 BANK_RECORDS="$CURATED_BANK_DIR/bank_records.jsonl"
@@ -139,6 +141,7 @@ echo "[v4-question-recovery] semantic_packets=$SEMANTIC_PACKETS"
 echo "[v4-question-recovery] curated_bank_dir=$CURATED_BANK_DIR"
 echo "[v4-question-recovery] side_kv_dir=$SIDE_KV_DIR"
 echo "[v4-question-recovery] lineage_root=$LINEAGE_ROOT"
+echo "[v4-question-recovery] oracle_profile=full-answer memory_active_steps=32 completion_tokens=1024"
 
 if [[ "$STAGE" == "recover" || "$STAGE" == "all" ]]; then
   "$PYTHON_BIN" scripts/recover_v4_source_evidence.py \
@@ -322,9 +325,10 @@ if [[ "$STAGE" == "oracle" || "$STAGE" == "all" ]]; then
     --device "$DEVICE" \
     --dtype "$DTYPE" \
     --attempt-policy all \
+    --maximum-completion-tokens 1024 \
     --resume \
     "${ORACLE_LIMIT_ARGS[@]}" \
-    2>&1 | tee "$LOG_DIR/oracle-${MODE}.log"
+    2>&1 | tee "$LOG_DIR/oracle-full-answer-${MODE}.log"
   jq -e '
     .status == "completed_mechanism_diagnostic"
     and .complete == true
@@ -333,6 +337,13 @@ if [[ "$STAGE" == "oracle" || "$STAGE" == "all" ]]; then
     and .online_artifacts_generated == false
     and .held_out_generalization_claim == false
     and .gate_unreachable_counted_as_memory_ineffective == false
+    and .configuration.maximum_completion_tokens == 1024
+    and .configuration.local_intervention_observation_tokens == 32
+    and .configuration.maximum_active_steps == 32
+    and .configuration.post_memory_native_continuation == true
+    and .configuration.generation_stop_policy
+      == "completed_boxed_answer_or_eos_or_completion_budget"
+    and .local_and_final_metrics_separated == true
     and .question_recovery.original_phase1_file_recovery_claim == false
     and .question_recovery.original_risk_artifact_recovery_claim == false
     and .question_recovery.same_source_question == true

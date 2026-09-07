@@ -10,12 +10,14 @@ from memgen.experience.phase1 import canonical_json_sha256
 from memgen.experience.v4_source_state import V4SourceStateCache
 
 
-V4_ORACLE_PROFILE_SCHEMA = "memgen-v4-oracle-causal-profile-v1"
-V4_ORACLE_PLAN_SCHEMA = "memgen-v4-oracle-causal-plan-v1"
+V4_ORACLE_PROFILE_SCHEMA = "memgen-v4-oracle-causal-profile-v2"
+V4_ORACLE_PLAN_SCHEMA = "memgen-v4-oracle-causal-plan-v2"
 V4_ORACLE_CASE_SCHEMA = "memgen-v4-oracle-causal-case-v1"
-V4_ORACLE_RESULT_SCHEMA = "memgen-v4-oracle-causal-result-v1"
-V4_ORACLE_REPORT_SCHEMA = "memgen-v4-oracle-causal-report-v1"
+V4_ORACLE_RESULT_SCHEMA = "memgen-v4-oracle-causal-result-v2"
+V4_ORACLE_REPORT_SCHEMA = "memgen-v4-oracle-causal-report-v2"
 V4_ORACLE_BRANCHES = ("baseline", "target", "reference")
+V4_ORACLE_MAXIMUM_COMPLETION_TOKENS = 1024
+V4_ORACLE_LOCAL_OBSERVATION_TOKENS = 32
 
 
 def _logical_hash(value: Mapping[str, Any], hash_field: str) -> str:
@@ -124,7 +126,13 @@ def validate_oracle_plan(plan: Mapping[str, Any]) -> None:
         or configuration.get("canonical_pre_rope") is not True
         or configuration.get("relative_phase_delta") != 0
         or configuration.get("decoding") != "greedy"
-        or configuration.get("maximum_continuation_tokens") != 32
+        or configuration.get("maximum_completion_tokens")
+        != V4_ORACLE_MAXIMUM_COMPLETION_TOKENS
+        or configuration.get("local_intervention_observation_tokens")
+        != V4_ORACLE_LOCAL_OBSERVATION_TOKENS
+        or configuration.get("post_memory_native_continuation") is not True
+        or configuration.get("generation_stop_policy")
+        != "completed_boxed_answer_or_eos_or_completion_budget"
         or configuration.get("memory_lifecycle") != "v4_nonpersistent_bounded_episode"
     ):
         raise ValueError("V4 oracle plan frozen configuration drifted")
@@ -208,6 +216,7 @@ def build_oracle_plan(
     *,
     attempt_policy: str = "all",
     limit_per_kind: int = 0,
+    maximum_completion_tokens: int = V4_ORACLE_MAXIMUM_COMPLETION_TOKENS,
 ) -> dict[str, Any]:
     """Build branch cases only from gate events authenticated by the cache."""
 
@@ -215,6 +224,8 @@ def build_oracle_plan(
         raise ValueError("V4 oracle attempt policy must be all or first")
     if isinstance(limit_per_kind, bool) or limit_per_kind < 0:
         raise ValueError("V4 oracle case limit must be non-negative")
+    if maximum_completion_tokens != V4_ORACLE_MAXIMUM_COMPLETION_TOKENS:
+        raise ValueError("V4 full-answer oracle requires the 1024-token GSM8K budget")
     prompts = {
         str(event["sample_id"]): event
         for event in cache.events
@@ -335,7 +346,14 @@ def build_oracle_plan(
             "canonical_pre_rope": True,
             "relative_phase_delta": 0,
             "decoding": "greedy",
-            "maximum_continuation_tokens": 32,
+            "maximum_completion_tokens": maximum_completion_tokens,
+            "local_intervention_observation_tokens": (
+                V4_ORACLE_LOCAL_OBSERVATION_TOKENS
+            ),
+            "post_memory_native_continuation": True,
+            "generation_stop_policy": (
+                "completed_boxed_answer_or_eos_or_completion_budget"
+            ),
             "memory_lifecycle": "v4_nonpersistent_bounded_episode",
             "recovery_low_entropy_token_count": 2,
             "maximum_active_steps": 32,
@@ -419,6 +437,7 @@ def _validate_result(row: Mapping[str, Any], *, require_hash: bool) -> None:
             raise ValueError("V4 oracle result branch role drifted")
         reward = branch.get("strict_reward")
         continuation = branch.get("continuation_token_ids")
+        local_continuation = branch.get("local_continuation_token_ids")
         full_completion = branch.get("full_completion_token_ids")
         if isinstance(reward, bool) or reward not in {0.0, 1.0}:
             raise ValueError("V4 oracle result branch reward is invalid")
@@ -427,6 +446,11 @@ def _validate_result(row: Mapping[str, Any], *, require_hash: bool) -> None:
             or any(isinstance(token, bool) or not isinstance(token, int) for token in continuation)
             or branch.get("continuation_token_ids_sha256")
             != canonical_json_sha256(continuation)
+            or not isinstance(local_continuation, list)
+            or local_continuation
+            != continuation[:V4_ORACLE_LOCAL_OBSERVATION_TOKENS]
+            or branch.get("local_continuation_token_ids_sha256")
+            != canonical_json_sha256(local_continuation)
             or not isinstance(full_completion, list)
             or any(
                 isinstance(token, bool) or not isinstance(token, int)
@@ -446,6 +470,47 @@ def _validate_result(row: Mapping[str, Any], *, require_hash: bool) -> None:
             or not all(isinstance(value, str) for value in branch["failure_types"])
         ):
             raise ValueError("V4 oracle result branch correctness diagnostics are invalid")
+        local_evaluation = branch.get("local_intervention_evaluation")
+        if (
+            not isinstance(local_evaluation, Mapping)
+            or local_evaluation.get("observation_token_limit")
+            != V4_ORACLE_LOCAL_OBSERVATION_TOKENS
+            or local_evaluation.get("continuation_token_count")
+            != len(local_continuation)
+            or local_evaluation.get("continuation_token_ids_sha256")
+            != canonical_json_sha256(local_continuation)
+            or isinstance(local_evaluation.get("strict_reward"), bool)
+            or not isinstance(local_evaluation.get("strict_reward"), (int, float))
+            or float(local_evaluation["strict_reward"]) not in {0.0, 1.0}
+            or not isinstance(local_evaluation.get("format_valid"), bool)
+            or not isinstance(local_evaluation.get("failure_types"), list)
+            or any(
+                not isinstance(local_evaluation.get(field), bool)
+                for field in (
+                    "answer_marker_seen",
+                    "complete_boxed_answer_seen",
+                    "eos_seen",
+                )
+            )
+        ):
+            raise ValueError("V4 oracle local intervention evaluation is invalid")
+        prefix_completion_count = branch.get("prefix_completion_token_count")
+        generation_budget = branch.get("generation_budget_from_prefix")
+        if (
+            isinstance(prefix_completion_count, bool)
+            or not isinstance(prefix_completion_count, int)
+            or prefix_completion_count != prefix_count - prompt_count
+            or isinstance(generation_budget, bool)
+            or not isinstance(generation_budget, int)
+            or generation_budget
+            != V4_ORACLE_MAXIMUM_COMPLETION_TOKENS - prefix_completion_count
+            or branch.get("maximum_completion_tokens")
+            != V4_ORACLE_MAXIMUM_COMPLETION_TOKENS
+            or not 0 < len(continuation) <= generation_budget
+            or branch.get("stop_reason")
+            not in {"completed_boxed_answer", "eos", "maximum_completion_tokens"}
+        ):
+            raise ValueError("V4 oracle full-answer generation budget is invalid")
         for field in (
             "first_step_logits_kl",
             "baseline_top1_log_probability_delta",
@@ -472,9 +537,35 @@ def _validate_result(row: Mapping[str, Any], *, require_hash: bool) -> None:
                 raise ValueError("V4 oracle result branch rank/cache diagnostics are invalid")
         if any(
             not isinstance(branch.get(field), bool)
-            for field in ("first_step_top1_changed", "answer_marker_seen", "eos_seen")
+            for field in (
+                "first_step_top1_changed",
+                "answer_marker_seen",
+                "complete_boxed_answer_seen",
+                "eos_seen",
+                "answer_marker_seen_within_local_window",
+                "complete_boxed_answer_seen_within_local_window",
+                "eos_seen_within_local_window",
+            )
         ):
             raise ValueError("V4 oracle result branch boolean diagnostics are invalid")
+        if (
+            branch["answer_marker_seen_within_local_window"]
+            and not branch["answer_marker_seen"]
+        ) or (
+            branch["complete_boxed_answer_seen_within_local_window"]
+            and not branch["complete_boxed_answer_seen"]
+        ) or (branch["eos_seen_within_local_window"] and not branch["eos_seen"]):
+            raise ValueError("V4 oracle local/final stop diagnostics are inconsistent")
+        if (
+            branch["stop_reason"] == "completed_boxed_answer"
+            and not branch["complete_boxed_answer_seen"]
+        ) or (
+            branch["stop_reason"] == "eos" and not branch["eos_seen"]
+        ) or (
+            branch["stop_reason"] == "maximum_completion_tokens"
+            and len(continuation) != generation_budget
+        ):
+            raise ValueError("V4 oracle branch stop reason is inconsistent")
     if (
         branches["baseline"].get("memory_id") is not None
         or branches["target"].get("memory_id") != row["bank_id"]
@@ -485,6 +576,19 @@ def _validate_result(row: Mapping[str, Any], *, require_hash: bool) -> None:
         or not branches["target"]["attention_traces"]
         or not isinstance(branches["reference"].get("attention_traces"), list)
         or not branches["reference"]["attention_traces"]
+        or len(branches["target"]["attention_traces"])
+        > V4_ORACLE_LOCAL_OBSERVATION_TOKENS
+        or len(branches["reference"]["attention_traces"])
+        > V4_ORACLE_LOCAL_OBSERVATION_TOKENS
+        or any(
+            not isinstance(trace, Mapping)
+            or isinstance(trace.get("memory_attention_mass"), bool)
+            or not isinstance(trace.get("memory_attention_mass"), (int, float))
+            or not math.isfinite(float(trace["memory_attention_mass"]))
+            or float(trace["memory_attention_mass"]) <= 0.0
+            for role in ("target", "reference")
+            for trace in branches[role]["attention_traces"]
+        )
         or row.get("reference_online_injectable") is not False
     ):
         raise ValueError("V4 oracle result target/reference role integrity failed")
@@ -600,6 +704,132 @@ def validate_result_against_plan(
             raise ValueError("V4 oracle result case identity drifted")
 
 
+def _mean_or_none(values: Sequence[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _branch_observability(
+    rows: Sequence[Mapping[str, Any]], *, local: bool
+) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for role in V4_ORACLE_BRANCHES:
+        payloads = [
+            (
+                row["branches"][role]["local_intervention_evaluation"]
+                if local
+                else row["branches"][role]
+            )
+            for row in rows
+        ]
+        token_counts = [
+            int(payload["continuation_token_count"])
+            if local
+            else len(payload["continuation_token_ids"])
+            for payload in payloads
+        ]
+        count = len(payloads)
+
+        def flag_count(field: str) -> int:
+            return sum(payload.get(field) is True for payload in payloads)
+
+        marker_count = flag_count("answer_marker_seen")
+        complete_box_count = flag_count("complete_boxed_answer_seen")
+        eos_count = flag_count("eos_seen")
+        format_valid_count = flag_count("format_valid")
+        diagnostic_correct_count = flag_count("diagnostic_answer_correct")
+        strict_correct_count = sum(
+            float(payload["strict_reward"]) == 1.0 for payload in payloads
+        )
+
+        def rate(value: int) -> float | None:
+            return value / count if count else None
+
+        output[role] = {
+            "case_count": count,
+            "mean_continuation_token_count": _mean_or_none(token_counts),
+            "answer_marker_seen_count": marker_count,
+            "answer_marker_seen_rate": rate(marker_count),
+            "complete_boxed_answer_seen_count": complete_box_count,
+            "complete_boxed_answer_seen_rate": rate(complete_box_count),
+            "eos_seen_count": eos_count,
+            "eos_seen_rate": rate(eos_count),
+            "format_valid_count": format_valid_count,
+            "format_valid_rate": rate(format_valid_count),
+            "diagnostic_answer_correct_count": diagnostic_correct_count,
+            "diagnostic_answer_correct_rate": rate(diagnostic_correct_count),
+            "strict_correct_count": strict_correct_count,
+            "strict_accuracy": rate(strict_correct_count),
+            "completion_budget_exhausted_count": (
+                0
+                if local
+                else sum(
+                    payload.get("stop_reason") == "maximum_completion_tokens"
+                    for payload in payloads
+                )
+            ),
+        }
+    return output
+
+
+def _trajectory_divergence(
+    rows: Sequence[Mapping[str, Any]], *, local: bool
+) -> dict[str, int]:
+    hash_field = (
+        "local_continuation_token_ids_sha256"
+        if local
+        else "continuation_token_ids_sha256"
+    )
+
+    def differs(row: Mapping[str, Any], left: str, right: str) -> bool:
+        return (
+            row["branches"][left][hash_field]
+            != row["branches"][right][hash_field]
+        )
+
+    return {
+        "target_differs_from_baseline_count": sum(
+            differs(row, "target", "baseline") for row in rows
+        ),
+        "reference_differs_from_baseline_count": sum(
+            differs(row, "reference", "baseline") for row in rows
+        ),
+        "target_differs_from_reference_count": sum(
+            differs(row, "target", "reference") for row in rows
+        ),
+        "all_three_identical_count": sum(
+            not differs(row, "target", "baseline")
+            and not differs(row, "reference", "baseline")
+            for row in rows
+        ),
+    }
+
+
+def _intervention_diagnostics(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for role in ("target", "reference"):
+        first_step_kls = [
+            float(row["branches"][role]["first_step_logits_kl"])
+            for row in rows
+        ]
+        attention_masses = [
+            float(trace["memory_attention_mass"])
+            for row in rows
+            for trace in row["branches"][role]["attention_traces"]
+        ]
+        output[role] = {
+            "first_step_logits_kl_mean": _mean_or_none(first_step_kls),
+            "first_step_top1_changed_count": sum(
+                row["branches"][role]["first_step_top1_changed"] is True
+                for row in rows
+            ),
+            "memory_attention_mass_mean": _mean_or_none(attention_masses),
+            "memory_attention_step_count": len(attention_masses),
+        }
+    return output
+
+
 def _group_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     if not rows:
         return {
@@ -621,6 +851,19 @@ def _group_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "target_better_than_reference_independent_sample_count": 0,
             "mean_target_minus_reference_reward": None,
             "independent_sample_macro_target_minus_reference_reward": None,
+            "local_intervention_observability": _branch_observability(
+                rows, local=True
+            ),
+            "final_outcome_observability": _branch_observability(
+                rows, local=False
+            ),
+            "local_trajectory_divergence": _trajectory_divergence(
+                rows, local=True
+            ),
+            "final_trajectory_divergence": _trajectory_divergence(
+                rows, local=False
+            ),
+            "intervention_diagnostics": _intervention_diagnostics(rows),
         }
     rewards = {
         role: [float(row["branches"][role]["strict_reward"]) for row in rows]
@@ -697,6 +940,19 @@ def _group_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "independent_sample_macro_target_minus_reference_reward": (
             macro_target_reference_delta
         ),
+        "local_intervention_observability": _branch_observability(
+            rows, local=True
+        ),
+        "final_outcome_observability": _branch_observability(
+            rows, local=False
+        ),
+        "local_trajectory_divergence": _trajectory_divergence(
+            rows, local=True
+        ),
+        "final_trajectory_divergence": _trajectory_divergence(
+            rows, local=False
+        ),
+        "intervention_diagnostics": _intervention_diagnostics(rows),
     }
 
 
@@ -769,6 +1025,8 @@ def aggregate_oracle_results(
         "held_out_generalization_claim": False,
         "audit_interpretation": "optimistic_source_positive_control_and_mechanism_qualification",
         "causal_qualification_decision": "pending_research_interpretation",
+        "configuration": dict(plan["configuration"]),
+        "local_and_final_metrics_separated": True,
         "profile_sha256": profile_sha256,
         "plan_sha256": plan["plan_sha256"],
         "expected_case_count": len(expected_ids),
@@ -787,6 +1045,8 @@ def aggregate_oracle_results(
 __all__ = [
     "V4_ORACLE_BRANCHES",
     "V4_ORACLE_CASE_SCHEMA",
+    "V4_ORACLE_LOCAL_OBSERVATION_TOKENS",
+    "V4_ORACLE_MAXIMUM_COMPLETION_TOKENS",
     "V4_ORACLE_PLAN_SCHEMA",
     "V4_ORACLE_PROFILE_SCHEMA",
     "V4_ORACLE_REPORT_SCHEMA",
