@@ -169,7 +169,7 @@ class DeepSeekConstructionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "strict JSON"):
             semantic.parse_response('{"clauses": {}, "clauses": {}}', packet)
 
-    def test_real_support_shortfall_and_generated_leakage_remain_explicit(self):
+    def test_support_shortfall_remains_but_numeric_text_is_not_screened(self):
         data = fixture()
         for kind in ("support", "leakage"):
             answer = response_for(data["packets"][0])
@@ -180,10 +180,13 @@ class DeepSeekConstructionTests(unittest.TestCase):
                 answer["clauses"]["repair_operator"]["text"] = "Multiply the rate by 37 to obtain the requested quantity."
             record = semantic.build_semantic_candidate(data["records"][0], data["packets"][0], self.entry(data, answer))
             bank.validate_record(record)
-            self.assertFalse(record["qualification"]["construction_qualified"])
-            self.assertIsNone(record["descriptor"])
             if kind == "support":
+                self.assertFalse(record["qualification"]["construction_qualified"])
+                self.assertIsNone(record["descriptor"])
                 self.assertEqual(record["clause_support"]["repair_operator"]["support_count"], 4)
+            else:
+                self.assertTrue(record["qualification"]["construction_qualified"])
+                self.assertIn("37", record["descriptor"])
 
     def test_resealed_card_and_support_tampering_rejected(self):
         data = fixture()
@@ -196,9 +199,23 @@ class DeepSeekConstructionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "reconstruction"):
                 bank.validate_record(bank.seal(changed))
 
-    def test_generic_relations_allowed_but_final_constants_screened(self):
-        self.assertEqual(semantic.screen_card("Multiply the target quantity by twice the stated rate.", []), [])
-        self.assertIn("numeric_constant", semantic.screen_card("Multiply the target quantity by 37.", []))
+    def test_no_numeric_formula_entity_answer_phrase_or_operator_verb_screen(self):
+        data = fixture()
+        texts = ["The final answer is the requested quantity with its proper units.",
+                 "Profit = total revenue - total cost, after aligning units.",
+                 "The remaining fraction is (1 - discount rate).",
+                 "The monetary unit relation is 1 dollar = 100 cents.",
+                 "The time unit relation is 7 days per week.",
+                 "Total contributions form the aggregate quantity."]
+        with patch.object(bank, "leakage_issues", side_effect=AssertionError("Static screen must not run")):
+            for text in texts:
+                answer = response_for(data["packets"][0])
+                answer["clauses"]["repair_operator"]["text"] = text
+                answer["clauses"]["verification_operator"]["text"] = text
+                record = semantic.build_semantic_candidate(data["records"][0], data["packets"][0], self.entry(data, answer))
+                bank.validate_record(record)
+                self.assertTrue(record["qualification"]["construction_qualified"])
+                self.assertFalse(record["leakage_audit"]["static_content_screening_performed"])
 
     def test_transport_uses_json_mode_disables_redirects_and_sanitizes_receipt(self):
         data = fixture()
@@ -246,83 +263,49 @@ class DeepSeekConstructionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 semantic.parse_response(json.dumps(invalid), packet)
 
-    def make_legacy_partial_cache(self, root):
-        data = fixture([8, 8, 6, 6, 6, 6, 6] + [7] * 10)
-        kwargs = kwargs_for(root, data)
-        paths = {"records": kwargs["source_dir"] / "bank_records.jsonl",
-                 "manifest": kwargs["source_dir"] / "bank_manifest.json",
-                 "packets": kwargs["packets_path"], "policy": kwargs["policy_path"]}
-        requests = [semantic.request_spec(r, p, legacy=True) for r, p in zip(data["records"], data["packets"])]
-        profile = bank.seal({"schema_version": "memgen-v4.3-deepseek-cache-v1",
-            "input_sha256": {k: bank.file_hash(p) for k, p in paths.items()},
-            "implementation_sha256": driver.LEGACY_IMPLEMENTATION_HASHES,
-            "policy_sha256": bank.canonical_hash(semantic.POLICY), "model": "deepseek-v4-flash", "max_tokens": 8192,
-            "request_sha256": [bank.canonical_hash(r) for r in requests]}, "profile_sha256")
-        cache = kwargs["cache_dir"]
-        cache.mkdir()
-        driver.atomic_json(cache / "profile.json", profile, immutable=True)
-        entry = bank.seal({"profile_sha256": profile["profile_sha256"], "request": requests[0],
-            "request_sha256": bank.canonical_hash(requests[0]), "response": response_for(data["packets"][0]),
-            "receipt": {"http_attempts": 1, "final_response_usage": {"total_tokens": 900}}}, "cache_sha256")
-        entry_path = cache / (entry["request_sha256"] + ".json")
-        driver.atomic_json(entry_path, entry, immutable=True)
-        return kwargs, entry_path
-
-    def test_dbeab53_partial_cache_preserved_and_only_sixteen_banks_requested(self):
+    def test_old_prompt_cache_is_rejected_without_key_access_or_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:
-            kwargs, entry_path = self.make_legacy_partial_cache(Path(tmp))
-            old_entry = entry_path.read_bytes()
-            profile_path = kwargs["cache_dir"] / "profile.json"
-            old_profile = profile_path.read_bytes()
+            kwargs = kwargs_for(Path(tmp))
+            fake = FakeClient()
+            fake.fail_at = 1
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sentinel"}), self.assertRaises(RuntimeError):
+                driver.construct(**kwargs, client_factory=lambda *_: fake)
+            path = kwargs["cache_dir"] / "profile.json"
+            profile = json.loads(path.read_text())
+            profile["policy_sha256"] = bank.canonical_hash({"historical_static_screen": True})
+            path.write_text(json.dumps(bank.seal(profile, "profile_sha256")))
+            snapshot = {p.name: p.read_bytes() for p in kwargs["cache_dir"].iterdir()}
+            with patch.object(driver.os.environ, "get", side_effect=AssertionError("No API key read")):
+                with self.assertRaisesRegex(ValueError, "old responses are not reused"):
+                    driver.construct(**kwargs, resume=True)
+            self.assertEqual(snapshot, {p.name: p.read_bytes() for p in kwargs["cache_dir"].iterdir()})
+
+    def test_all_seventeen_requests_have_one_new_prompt_and_no_old_drafts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kwargs = kwargs_for(Path(tmp))
             fake = FakeClient()
             with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sentinel"}):
-                output = driver.construct(**kwargs, resume=True, client_factory=lambda *_: fake)
-            self.assertEqual(len(fake.calls), 16)
-            self.assertTrue(all(r["messages"][0]["content"] == semantic.SYSTEM_PROMPT for r in fake.calls))
-            self.assertEqual(entry_path.read_bytes(), old_entry)
-            self.assertEqual(profile_path.read_bytes(), old_profile)
-            self.assertEqual(output["construction_report.json"]["external_api_calls_made"], 17)
-            self.assertEqual(output["construction_report.json"]["qualified_tier_counts"], {"primary": 11, "conditional": 6})
-            load_construction(kwargs["output_dir"])
-            for flag in ("resume", "validate_only"):
-                with patch.object(driver.os.environ, "get", side_effect=AssertionError("Must not read API key")):
-                    driver.construct(**kwargs, **{flag: True})
+                result = driver.construct(**kwargs, client_factory=lambda *_: fake)
+            self.assertEqual(len(fake.calls), 17)
+            self.assertEqual({r["messages"][0]["content"] for r in fake.calls}, {semantic.SYSTEM_PROMPT})
+            for request in fake.calls:
+                self.assertEqual(set(json.loads(request["messages"][1]["content"])), {"bank_id", "curation", "evidence"})
+            report = result["construction_report.json"]
+            self.assertEqual(report["screened_clause_count"], 0)
+            self.assertFalse(report["static_content_screening_performed"])
+            self.assertEqual(report["source_field_judgment_count"], 580)
+            for record in result["candidate_bank_records.jsonl"]:
+                self.assertEqual(record["leakage_audit"]["status"], "not_performed_prompt_guidance_only")
+                self.assertFalse(record["leakage_audit"]["complete_leakage_freedom_claim"])
 
-    def test_legacy_cache_quote_and_profile_drift_still_rejected_before_api(self):
-        for mutation in ("quote", "profile", "input"):
-            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
-                kwargs, entry_path = self.make_legacy_partial_cache(Path(tmp))
-                if mutation == "quote":
-                    entry = json.loads(entry_path.read_text())
-                    entry["response"]["clauses"]["repair_operator"]["judgments"][0]["quote"] = "a paraphrase is not a legacy citation"
-                    entry_path.write_text(json.dumps(bank.seal(entry, "cache_sha256")))
-                elif mutation == "profile":
-                    profile_path = kwargs["cache_dir"] / "profile.json"
-                    profile = json.loads(profile_path.read_text())
-                    profile["implementation_sha256"]["memgen/experience/v4_3_deepseek.py"] = "a" * 64
-                    profile_path.write_text(json.dumps(bank.seal(profile, "profile_sha256")))
-                else:
-                    kwargs["source_dir"].joinpath("bank_records.jsonl").write_text(
-                        kwargs["source_dir"].joinpath("bank_records.jsonl").read_text() + "\n")
-                with patch.object(driver.os.environ, "get", side_effect=AssertionError("Must reject before key access")):
-                    with self.assertRaises(ValueError):
-                        driver.construct(**kwargs, resume=True)
-                self.assertFalse((kwargs["cache_dir"] / "profile-citations-v2.json").exists())
-
-    def test_migration_interruption_resumes_new_and_legacy_responses_together(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            kwargs, entry_path = self.make_legacy_partial_cache(Path(tmp))
-            original = entry_path.read_bytes()
-            first = FakeClient()
-            first.fail_at = 2
-            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sentinel"}):
-                with self.assertRaisesRegex(RuntimeError, "interruption"):
-                    driver.construct(**kwargs, resume=True, client_factory=lambda *_: first)
-                second = FakeClient()
-                driver.construct(**kwargs, resume=True, client_factory=lambda *_: second)
-            self.assertEqual(len(second.calls), 14)
-            self.assertEqual(entry_path.read_bytes(), original)
-            load_construction(kwargs["output_dir"])
+    def test_old_prompt_response_cannot_be_relabelled_as_current(self):
+        data = fixture()
+        entry = self.entry(data)
+        entry["request"]["messages"][0]["content"] = "Historical teacher prompt"
+        entry["request_sha256"] = bank.canonical_hash(entry["request"])
+        entry = bank.seal(entry, "cache_sha256")
+        with self.assertRaisesRegex(ValueError, "request binding"):
+            semantic.build_semantic_candidate(data["records"][0], data["packets"][0], entry)
 
 
 if __name__ == "__main__":

@@ -14,12 +14,12 @@ LINEAGE_ROOT="${MEMGEN_V4_RECOVERY_LINEAGE_ROOT:-$OUTPUT_ROOT/lineages/gsm8k-rec
 PACKETS="${MEMGEN_V4_SEMANTIC_PACKETS:-$V4_ROOT/offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl}"
 CURATED="${MEMGEN_V4_CURATED_BANK_DIR:-$V4_ROOT/offline/construction_v4_2_local_curated}"
 LEGACY_SIDE_KV="${MEMGEN_V4_SIDE_KV_DIR:-$V4_ROOT/offline/side_kv_v4_2_local_curated}"
-BANK_DIR="${MEMGEN_V43_BANK_DIR:-$V4_ROOT/offline/construction_v4_3_deepseek}"
-TEACHER_CACHE="${MEMGEN_V43_TEACHER_CACHE:-$V4_ROOT/offline/construction_v4_3_deepseek_requests}"
-SIDE_DIR="${MEMGEN_V43_SIDE_KV_DIR:-$V4_ROOT/offline/side_kv_v4_3_deepseek}"
+BANK_DIR="${MEMGEN_V43_BANK_DIR:-$V4_ROOT/offline/construction_v4_3_deepseek_prompt_v3}"
+TEACHER_CACHE="${MEMGEN_V43_TEACHER_CACHE:-$V4_ROOT/offline/construction_v4_3_deepseek_prompt_v3_requests}"
+SIDE_DIR="${MEMGEN_V43_SIDE_KV_DIR:-$V4_ROOT/offline/side_kv_v4_3_deepseek_prompt_v3}"
 CACHE_MANIFEST="${MEMGEN_V43_CACHE_MANIFEST:-$LINEAGE_ROOT/v4_oracle_full/source_state_cache/v4_source_state_manifest.json}"
 RISK_ARTIFACT="${MEMGEN_V43_RISK_ARTIFACT:-$LINEAGE_ROOT/risk_v3_4/token-entropy-risk-gate-v3.4.pt}"
-AUDIT_ROOT="${MEMGEN_V43_AUDIT_ROOT:-$V4_ROOT/offline/v4_3_deepseek_audit}"
+AUDIT_ROOT="${MEMGEN_V43_AUDIT_ROOT:-$V4_ROOT/offline/v4_3_deepseek_prompt_v3_audit}"
 POLICY="${MEMGEN_V43_CURATION_POLICY:-$REPO_ROOT/configs/experiments/gsm8k/v4_2_local_curation_policy.json}"
 DEVICE="${MEMGEN_V43_DEVICE:-cuda}"
 MODE="${1:-all}"
@@ -37,6 +37,8 @@ V4.3 unified Bank experiment. Default: all (smoke, then full).
 
 Always reuses the complete 116-sample V4.2 source-state cache, even for smoke.
 DeepSeek is used only to construct uncached cards (DEEPSEEK_API_KEY required).
+Prompt v3 freshly constructs all 17 Banks; old prompt responses are never reused.
+No static content blacklist: quality is guided by the teacher prompt.
 Never invokes Phase-1 recovery, selector, dev-test or final-test.
 Missing source cache/risk fails with its exact path; no automatic regeneration.
 Construction qualification failures remain explicit exclusions; thresholds stay fixed.

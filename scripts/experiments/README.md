@@ -42,11 +42,14 @@ git pull
 
 不带参数时，使用 DeepSeek 综合统一卡片，再执行 primary/conditional Side-KV 编译、四层 smoke，认证通过后执行 full。
 首次构造需要环境中的 `DEEPSEEK_API_KEY`；每 Bank 一次正常请求，完整缓存复用不请求 API。
+当前 prompt v3 将 17 个 Bank 全部重新生成，不带入旧卡片或旧响应；只复用同版中断缓存。
+内容不再用数字、公式、实体或关键词静态拦截，改用教师提示词约束适用条件与过度概括；
+响应结构、证据身份、支持数与工件完整性检查保留。
 默认使用 `/data/memgen-runs` 及 recovery lineage `gsm8k-v4-packet-replay-20260907-r1` 中已经存在的
 完整 116-sample source cache 和 risk；缺失旧工件直接停止，不自动恢复或重新拟合。
 可用 `./test.sh construct` 只生成卡片，不要求 GPU/source cache/risk；也可用 `./test.sh smoke`、
 `./test.sh full` 或 `MEMGEN_V43_VALIDATE_ONLY=1 ./test.sh all`。
-新输出使用 `*_v4_3_deepseek` 独立目录，支持按 Bank 响应和按 case 认证恢复；
+新输出使用 `*_v4_3_deepseek_prompt_v3` 独立目录，支持按 Bank 响应和按 case 认证恢复；
 脚本在构造结束后清除 DeepSeek key，编译和审计保持 offline-only。
 配置与工件说明见 [V4.3 完整实现合同](../../docs/codex/memgen_v4_3_construction.md)。
 

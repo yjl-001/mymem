@@ -57,6 +57,10 @@ packet JSONL，以及既有 `v4_2_local_curation_policy.json`。
 API 无不可变模型 commit 承诺，因此保存完整请求和响应，复用以缓存内容哈希为准；
 同样输入重新请求不保证生成同样文本。
 
+当前统一使用 prompt v3，从原 17 个 Bank 的全部 evidence 重新生成，不复用旧响应，
+也不传入旧卡片作为草稿。同一 prompt v3 的已完成响应仍可断点复用。profile/report
+明确保存 prompt version 和文本 SHA，防止一个实验中混合多个提示词。
+
 DeepSeek 综合出五条通用过程描述；每条必须对全部 evidence 返回 `evidence_id`、
 `supports` 布尔判断和 `rationale`。模型不再逐字抄写 quote；程序按所属 clause 字段及
 evidence ID，从认证 packet 中附上该 signature 字段全文作为 `source_quote`。
@@ -87,15 +91,21 @@ Use only when: 继承适用范围的固定限制 + conditional curation scope gu
 理由的固定映射。它不冒充五条 evidence 的独立新发现；`boundary_provenance` 明确记录
 `independent_support_claim=false`。core 字段仍严格要求五个独立样本。
 
-生成后的卡片检查包括数字字符、姓名线索、答案标记/片段、公式线索、source ID、role/reward
-语言、与原问题/解答/轨迹的连续八词重叠，以及 repair/verify 是否有可执行操作词。
-这些检查可能保守误报，也不保证排除所有语义泄漏或隐含矛盾；报告明确声明没有完成
-独立事实一致性审核。通用的 twice/half 关系、普通 target quantity 表述允许保留。
-原问题、解答、完整轨迹与 verifier 会发送给 DeepSeek 并保存在离线来源审计记录中，
-不进入 card、descriptor 或 side-KV 编译内容。
+按照用户要求，默认 DeepSeek 构造不再运行静态内容检查，包括数字、公式、普通关键词、
+实体、源文重叠及可执行操作词黑名单。条款阶段和整卡组装阶段都不使用这些检查。
+`leakage_audit.status=not_performed_prompt_guidance_only`，`screened_clause_count=0`，
+`static_content_screening_performed=false`；空 issues 不表示已经独立验证无泄漏。
 
-任何核心字段支持不足、生成条款不合格、缺少 conditional guard 或组装后静态
-检查失败，都将整个候选放入 quarantine，并将 card/descriptor/descriptor SHA 设为
+内容质量交给新版提示词：先综合，再在同次生成中审查反例和适用条件。明确允许通用
+公式、单位常数和 final answer 等普通推理用语；要求避免样本答案、专名和解题轨迹。
+防过度概括要求覆盖：逐次确定百分比基数；按单位关系选择乘除；计数不固定用除法；
+折扣、剩余量、时长比较的严格不等式须有条件；相同修复可对应不同失败机制，不能
+虚构统一失败原因，也不能通过泛泛描述或拼接分支凑足支持数。这是模型自审要求，
+不声称完成了独立语义审核，也不保证所有卡片都正确。
+
+仍保留响应 JSON schema、长度界限、证据完整性、引用绑定、哈希、独立支持数和
+conditional scope guard 等结构/证据合同。核心字段或组合 applicability 支持不足、
+缺少 conditional guard 时仍会 quarantine，并将 card/descriptor/descriptor SHA 设为
 `null`。它仍保留原 membership、lineage 和诊断，不出现在可编译 tier manifest。
 其余候选只取得 `qualified_for_offline_compilation`，所有 record/manifest 始终
 `qualified_for_online_use=false`。11/6 是输入 tier 数，不能预先假定输出仍为 11/6。
@@ -126,18 +136,15 @@ record、tier manifest、lineage、report 均有逻辑哈希；最后写入的 b
 输出不嵌入绝对路径、时间戳或 Git revision；相同输入、实现和已缓存响应可跨目录
 byte-identical。Git revision 变化但实现不变不破坏逻辑复用。
 
-单独的 `construction_v4_3_deepseek_requests/` 保存固定 `profile.json`、进程锁及逐请求
+单独的 `construction_v4_3_deepseek_prompt_v3_requests/` 保存固定 `profile.json`、进程锁及逐请求
 SHA 命名的响应文件。先校验全部已有响应，再读取 key/请求缺失 Bank；每条响应原子
 写入，构造中断后只补缺失项。缓存漂移、并发写入、未知条目会明确停止。
 响应尚未落盘时进程被杀，重跑可能重复该次请求；调用数只统计已保存响应对应的尝试，
 不声称与服务端账单完全一致。缓存不保存 key、HTTP headers 或代理凭据。
 
-针对 `dbeab53` 的逐字引用报错，`--resume` 自动识别这一确切版本的旧 profile，
-核验原输入、参数、prompt、五个实现文件 SHA，以及全部已保存响应的哈希、成员和原文
-引用。通过后保留旧 `profile.json` 和响应字节，新请求采用上述 ID/字段引用协议，
-另写 `profile-citations-v2.json` 绑定混合请求及旧 profile SHA。不需要删除缓存或换目录。
-比如第一条成功、第二条失败时，只请求剩余 16 个 Bank。损坏、参数变化或未知旧实现
-不会通过这项兼容检查；已有完整旧构造 bundle 仍受不可覆盖规则约束。
+旧 dbeab53/1a5744a 的响应与构造工件保留在原目录。prompt v3 不迁移或导入它们，
+首次正常调用为 17 个 Bank 各一次；之后只续跑同版未完成的 Bank。指定旧缓存目录
+会在读取 API key 之前报 profile drift，而不会把旧响应重新标注为新版结果。
 
 `--resume` 先核对全部已有文件，再补齐未 seal 的中断输出；发生任何漂移则停止，保留
 已有内容。完整 seal 后缺失文件不会被静默重建。未知文件和 symlink 输出也拒绝覆盖。
@@ -151,8 +158,8 @@ python scripts/build_v4_3_deepseek_bank.py \
   --source-dir /data/memgen-runs/v4/offline/construction_v4_2_local_curated \
   --semantic-packets /data/memgen-runs/v4/offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl \
   --curation-policy configs/experiments/gsm8k/v4_2_local_curation_policy.json \
-  --output-dir /data/memgen-runs/v4/offline/construction_v4_3_deepseek \
-  --cache-dir /data/memgen-runs/v4/offline/construction_v4_3_deepseek_requests \
+  --output-dir /data/memgen-runs/v4/offline/construction_v4_3_deepseek_prompt_v3 \
+  --cache-dir /data/memgen-runs/v4/offline/construction_v4_3_deepseek_prompt_v3_requests \
   --resume
 ```
 
@@ -177,8 +184,10 @@ V4.3 不自动调用它，也不重新恢复 Phase-1、拟合 risk、提取 sour
 默认复用 `/data/memgen-runs/lineages/gsm8k-recovery/gsm8k-v4-packet-replay-20260907-r1/`
 下面的 `v4_oracle_full/source_state_cache/v4_source_state_manifest.json` 和
 `risk_v3_4/token-entropy-risk-gate-v3.4.pt`。smoke 也绑定完整 116-sample cache。
-新输出在 `/data/memgen-runs/v4/offline/` 下的 `construction_v4_3_deepseek`、
-`side_kv_v4_3_deepseek`、`v4_3_deepseek_audit/{smoke,full}`，不会覆盖旧隔离工件。
+新输出在 `/data/memgen-runs/v4/offline/` 下的 `construction_v4_3_deepseek_prompt_v3`、
+`side_kv_v4_3_deepseek_prompt_v3`、`v4_3_deepseek_prompt_v3_audit/{smoke,full}`，不会覆盖旧隔离工件。
+若此前显式设置了 MEMGEN_V43_BANK_DIR/TEACHER_CACHE/SIDE_KV_DIR/AUDIT_ROOT，应改为新目录
+或清除这些覆盖项以使用新版默认目录；保留既有 V4 来源路径配置。
 DeepSeek key 仅传给构造阶段，构造返回后在诊断、编译和审计前清除。
 可用 `./test.sh --help` 查看全部路径、设备与只读验证覆盖项。
 `memgen.model.MemGenModel` 改为按需导入，旧公开 import 保持兼容；离线 side-KV 工具不再
@@ -306,11 +315,12 @@ shasum -a 256 memgen/model/e1_runtime.py memgen/model/side_kv.py \
 未执行真实 116 条构造、GPU compilation、GPU smoke/full、dev-test/final-test 或任何付费 API。
 
 DeepSeek 新测试覆盖数字/表达不同的 17/116 来源、完整成员引用、重复/伪造引用拒绝、
-真实支持不足、生成卡片泄漏、响应篡改、部分缓存恢复、零 API 缓存复用、凭据隔离及
+真实支持不足、响应篡改、部分缓存恢复、零 API 缓存复用、凭据隔离及
 mock 响应经过原生 bf16 编译进入 smoke/full 计划。这里的 provider 响应是明确合成的 mock。
-引用修复新增 8-evidence Bank、程序原文绑定、dbeab53 部分缓存迁移、迁移再中断续跑，
-以及旧引用/旧 profile/源文件漂移拒绝的测试。
-本次引用修复后完整 V4.3 回归：96 项通过，无 skip；未调用真实 DeepSeek API。
+prompt v3 测试验证 17 次请求统一新提示词、无旧卡片输入、旧缓存/提示词拒绝混入、
+数字/公式/普通词不被静态拒绝、条款及整卡都不调用静态检查，并保留支持不足测试。
+本次 prompt v3 完整回归：96 项通过，无 skip；本地没有真实来源工件或 API key，未执行真实生成。
+此前引用修复后完整 V4.3 回归：96 项通过，无 skip；未调用真实 DeepSeek API。
 2026-09-08 引用修复前本地验证：92 项 V4.3 测试通过（无 skip），另外执行的 26 项旧
 side-KV/oracle-runtime/recovery/pipeline 回归通过。
 原生测试环境为 CPU Torch 2.7.1、Transformers 4.55.4、safetensors 0.7.0，随机初始化
