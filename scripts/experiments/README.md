@@ -33,19 +33,22 @@ offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl
 当前 curated 17-bank 使用的 116 条原题、success/failure 原始轨迹和 verifier 证据可以直接恢复，不需要调用
 DeepSeek，也不需要重新生成 bank 或 Side-KV。服务器 smoke：
 
-当前推荐的服务器总入口是仓库根目录的 `test.sh`：
+当前服务器总入口 `test.sh` 默认运行 **V4.3 Unified Heuristic Memory**：
 
 ```bash
 git pull
 ./test.sh
 ```
 
-不带参数时，它按顺序运行 smoke 和 full。默认使用 `/data/memgen-runs`、recovery lineage
-`gsm8k-v4-packet-replay-20260907-r1` 以及下面列出的三份 V4 输入；如果 recovery、risk、对应模式的 cache 和
-state-audit 已存在，就自动只运行修复后的 `stage=oracle`，否则为缺少前置工件的模式运行 `stage=all`。可用
-`./test.sh smoke` 或 `./test.sh full` 单独运行，也可通过 `MEMGEN_OUTPUT_ROOT`、`MEMGEN_V4_OUTPUT_ROOT`、
-`MEMGEN_V4_RECOVERY_ID` 和 `MEMGEN_V4_TEST_STAGE` 覆盖默认值。脚本不会进入 selector、dev-test、final-test，
-也不会继承付费 provider key。
+不带参数时，执行统一卡片构造、primary/conditional Side-KV 编译、四层 smoke，认证通过后执行 full。
+默认使用 `/data/memgen-runs` 及 recovery lineage `gsm8k-v4-packet-replay-20260907-r1` 中已经存在的
+完整 116-sample source cache 和 risk；缺失旧工件直接停止，不自动恢复或重新拟合。
+可用 `./test.sh smoke`、`./test.sh full` 或 `MEMGEN_V43_VALIDATE_ONLY=1 ./test.sh all`。
+新输出使用 V4.3 独立目录，支持按 case 认证恢复；脚本清除 provider key，保持 offline-only。
+配置与工件说明见 [V4.3 完整实现合同](../../docs/codex/memgen_v4_3_construction.md)。
+
+旧 V4.2 自动选择 `stage=oracle/all` 的行为保留为显式 `./test.sh legacy [smoke|full|all]`。
+下面的 recovery/旧 oracle 命令属于该历史流程，不由 V4.3 自动调用。
 
 下面保留等价的底层命令，便于排错或精确控制单个阶段。服务器 smoke：
 

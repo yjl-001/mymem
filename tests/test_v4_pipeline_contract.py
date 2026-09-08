@@ -12,8 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class V4PipelineContractTests(unittest.TestCase):
-    def test_root_test_runner_executes_fixed_oracle_smoke_then_full(self) -> None:
-        source = (ROOT / "test.sh").read_text(encoding="utf-8")
+    def test_explicit_legacy_runner_preserves_fixed_oracle_smoke_then_full(self) -> None:
+        source = (ROOT / "scripts/experiments/gsm8k/run_v4_2_recovered_legacy.sh").read_text(encoding="utf-8")
         self.assertIn("set -Eeuo pipefail", source)
         self.assertIn('RUN_SELECTION="${1:-all}"', source)
         self.assertIn("run_mode smoke", source)
