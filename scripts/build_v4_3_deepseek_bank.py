@@ -17,6 +17,16 @@ from memgen.experience.v4_3_bank import authenticate, authenticate_sources, buil
 from memgen.experience.v4_3_deepseek import IMPLEMENTATION_PATHS, POLICY, build_semantic_candidate, parse_response, request_spec
 from scripts.build_v4_3_unified_bank import encode_outputs, read_json, read_jsonl, write_or_validate
 
+# Exact released dbeab53 implementation, accepted ONLY for validated v1 cache
+# reuse. This is not a general ignore-code-drift switch.
+LEGACY_IMPLEMENTATION_HASHES = {
+    "memgen/experience/v4_3_bank.py": "b2973849d451f40602d680b04d186d075625d617893247871ce2102cb719066c",
+    "memgen/experience/v4_3_deepseek.py": "7ec595864b2238f8f8b05018c4fbe5e2dda765535928e57067951ebda997bb31",
+    "scripts/build_v4_3_deepseek_bank.py": "d518da687e3b13b604b11c5d90c4a1f29220b30eff919a96a2fdfdfcf17f83be",
+    "scripts/build_v4_3_unified_bank.py": "d2de4771729cca4ac5252591696fe29497940ad0320daf8502fab01e0414e74b",
+    "scripts/build_teacher_bank.py": "96d7e9f18a3934ee5b4f0bd025643e13fdcda671ab532ceabb120e71498942fc",
+}
+
 
 class DeepSeekClient:
     """Lazy provider adapter; caches parsed responses, never headers or secrets."""
@@ -108,15 +118,36 @@ def construct(*, source_dir, packets_path, policy_path, output_dir, cache_dir,
         existing = list(cache_dir.iterdir())
         if any(p.name != ".lock" for p in existing) and not (resume or validate_only):
             raise ValueError("Response cache exists; use --resume")
-        allowed = set(names) | {"profile.json", ".lock"}
         if any(p.is_symlink() or not p.is_file() for p in existing):
             raise ValueError("Unexpected or unsafe response cache entry")
         profile_path = cache_dir / "profile.json"
+        legacy_profile = None
+        legacy_names = set()
         if profile_path.exists():
             if read_json(profile_path) != profile:
-                raise ValueError("DeepSeek cache input/model/prompt/code profile drift")
+                # Keep both the old profile and every completed old response
+                # byte-identical. Only missing Banks use the new wire protocol.
+                legacy_requests = [request_spec(r, packet_map[r["cluster"]["source_candidate_id"]],
+                                                model, max_tokens, legacy=True) for r in records]
+                legacy_profile = seal({**profile, "implementation_sha256": LEGACY_IMPLEMENTATION_HASHES,
+                                       "request_sha256": [canonical_hash(r) for r in legacy_requests]}, "profile_sha256")
+                if read_json(profile_path) != legacy_profile:
+                    raise ValueError("DeepSeek cache input/model/prompt/code profile drift")
+                for i, request in enumerate(legacy_requests):
+                    name = canonical_hash(request) + ".json"
+                    if (cache_dir / name).exists():
+                        requests[i], names[i] = request, name
+                        legacy_names.add(name)
+                profile = seal({**profile, "request_sha256": [canonical_hash(r) for r in requests],
+                                "reused_legacy_profile_sha256": legacy_profile["profile_sha256"]}, "profile_sha256")
+                profile_path = cache_dir / "profile-citations-v2.json"
+                if profile_path.exists() and read_json(profile_path) != profile:
+                    raise ValueError("DeepSeek migrated cache profile drift")
         elif len(existing) > 1 or validate_only:
             raise ValueError("DeepSeek cache profile missing")
+        allowed = set(names) | {"profile.json", ".lock"}
+        if legacy_profile is not None:
+            allowed.add("profile-citations-v2.json")
         if any(p.name not in allowed for p in existing):
             raise ValueError("Unexpected or unsafe response cache entry")
         entries = {}
@@ -125,7 +156,8 @@ def construct(*, source_dir, packets_path, policy_path, output_dir, cache_dir,
             if (cache_dir / name).exists():
                 entry = read_json(cache_dir / name)
                 authenticate(entry, "cache_sha256", "DeepSeek cached response")
-                if entry["profile_sha256"] != profile["profile_sha256"] or entry["request"] != requests[i]:
+                owner = legacy_profile if name in legacy_names else profile
+                if entry["profile_sha256"] != owner["profile_sha256"] or entry["request"] != requests[i]:
                     raise ValueError("Cached response profile/request drift")
                 build_semantic_candidate(records[i], packet_map[records[i]["cluster"]["source_candidate_id"]], entry)
                 entries[name] = entry
@@ -136,6 +168,10 @@ def construct(*, source_dir, packets_path, policy_path, output_dir, cache_dir,
             raise ValueError("Existing construction output requires complete authenticated cache and --resume")
         if not validate_only:
             atomic_json(profile_path, profile, immutable=True)
+        elif not profile_path.exists():
+            raise ValueError("Migrated DeepSeek cache profile missing; run --resume first")
+        if legacy_names:
+            print(f"[v4.3] authenticated_legacy_bank_responses_reused={len(legacy_names)}", flush=True)
         client = None
         try:
             if pending:
@@ -150,6 +186,7 @@ def construct(*, source_dir, packets_path, policy_path, output_dir, cache_dir,
                 response, receipt = client.generate(requests[i], packet)
                 entry = seal({"profile_sha256": profile["profile_sha256"], "request": requests[i],
                               "request_sha256": canonical_hash(requests[i]), "response": response,
+                              "citation_protocol": "evidence_id_and_enclosing_field_v2",
                               "receipt": receipt}, "cache_sha256")
                 # A genuine insufficient-support outcome is saved, never retried
                 # to pressure the model into falsely reaching the support quota.

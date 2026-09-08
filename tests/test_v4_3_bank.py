@@ -12,14 +12,14 @@ from memgen.experience import v4_3_bank as bank
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def fixture() -> dict:
+def fixture(sample_counts=None) -> dict:
     """Full-count synthetic input, using the actual 24-decision curation policy."""
     policy = json.loads((ROOT / "configs/experiments/gsm8k/v4_2_local_curation_policy.json").read_text())
     decisions = [d for d in policy["decisions"] if d["decision"] in {"primary", "conditional"}]
     records, packets = [], []
     for i, decision in enumerate(decisions):
         evidence = []
-        for j in range(6 if i < 3 else 7):
+        for j in range(sample_counts[i] if sample_counts is not None else (6 if i < 3 else 7)):
             question = f"A warehouse tracks parcels for shipment batch {i * 10 + j}. What quantity is requested?"
             signature = {
                 "problem_structure": "The problem relates a quantity to a rate over a stated duration.",

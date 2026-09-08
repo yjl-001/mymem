@@ -57,9 +57,13 @@ packet JSONL，以及既有 `v4_2_local_curation_policy.json`。
 API 无不可变模型 commit 承诺，因此保存完整请求和响应，复用以缓存内容哈希为准；
 同样输入重新请求不保证生成同样文本。
 
-DeepSeek 综合出五条通用过程描述；每条必须对全部 evidence 给出支持/不支持判断、
-来自该 evidence 同名 signature 字段的精确引用和理由。程序验证所有成员恰好出现一次、
-引用真实存在、支持 ID 没有重复或跨组、样本映射一致。支持数是模型判断的独立 sample
+DeepSeek 综合出五条通用过程描述；每条必须对全部 evidence 返回 `evidence_id`、
+`supports` 布尔判断和 `rationale`。模型不再逐字抄写 quote；程序按所属 clause 字段及
+evidence ID，从认证 packet 中附上该 signature 字段全文作为 `source_quote`。
+缓存的 response 是完成引用绑定后的结构化响应，`citation_protocol` 标为
+`evidence_id_and_enclosing_field_v2`。该原文说明判断对应的来源，不冒充模型选择的精确片段，
+也不证明支持关系。程序验证所有成员恰好出现一次、支持 ID 没有重复或跨组、样本映射一致。
+支持数是模型判断的独立 sample
 计数，不再通过 0.80 词面相似度决定，也不把这些检查称为独立语义证明。
 
 每个核心字段仍需至少五个独立 sample 支持；structure 与 decision 支持集合交集也需
@@ -127,6 +131,13 @@ SHA 命名的响应文件。先校验全部已有响应，再读取 key/请求�
 写入，构造中断后只补缺失项。缓存漂移、并发写入、未知条目会明确停止。
 响应尚未落盘时进程被杀，重跑可能重复该次请求；调用数只统计已保存响应对应的尝试，
 不声称与服务端账单完全一致。缓存不保存 key、HTTP headers 或代理凭据。
+
+针对 `dbeab53` 的逐字引用报错，`--resume` 自动识别这一确切版本的旧 profile，
+核验原输入、参数、prompt、五个实现文件 SHA，以及全部已保存响应的哈希、成员和原文
+引用。通过后保留旧 `profile.json` 和响应字节，新请求采用上述 ID/字段引用协议，
+另写 `profile-citations-v2.json` 绑定混合请求及旧 profile SHA。不需要删除缓存或换目录。
+比如第一条成功、第二条失败时，只请求剩余 16 个 Bank。损坏、参数变化或未知旧实现
+不会通过这项兼容检查；已有完整旧构造 bundle 仍受不可覆盖规则约束。
 
 `--resume` 先核对全部已有文件，再补齐未 seal 的中断输出；发生任何漂移则停止，保留
 已有内容。完整 seal 后缺失文件不会被静默重建。未知文件和 symlink 输出也拒绝覆盖。
@@ -297,7 +308,10 @@ shasum -a 256 memgen/model/e1_runtime.py memgen/model/side_kv.py \
 DeepSeek 新测试覆盖数字/表达不同的 17/116 来源、完整成员引用、重复/伪造引用拒绝、
 真实支持不足、生成卡片泄漏、响应篡改、部分缓存恢复、零 API 缓存复用、凭据隔离及
 mock 响应经过原生 bf16 编译进入 smoke/full 计划。这里的 provider 响应是明确合成的 mock。
-2026-09-08 本地验证：92 项 V4.3 测试通过（无 skip），本次另外执行的 26 项旧
+引用修复新增 8-evidence Bank、程序原文绑定、dbeab53 部分缓存迁移、迁移再中断续跑，
+以及旧引用/旧 profile/源文件漂移拒绝的测试。
+本次引用修复后完整 V4.3 回归：96 项通过，无 skip；未调用真实 DeepSeek API。
+2026-09-08 引用修复前本地验证：92 项 V4.3 测试通过（无 skip），另外执行的 26 项旧
 side-KV/oracle-runtime/recovery/pipeline 回归通过。
 原生测试环境为 CPU Torch 2.7.1、Transformers 4.55.4、safetensors 0.7.0，随机初始化
 24 层小型 Qwen，未下载预训练模型。py_compile、shell 语法、diff whitespace 和四个
