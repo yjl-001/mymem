@@ -392,9 +392,12 @@ def _scope_support(support: Mapping[str, Any], sample_map: Mapping[str, str]) ->
             "support_count": len(ids), "qualified": len(ids) >= 5}
 
 
-def build_candidate(source: Mapping[str, Any], packet: Mapping[str, Any]) -> dict[str, Any]:
+def build_candidate(source: Mapping[str, Any], packet: Mapping[str, Any], *,
+                    support_override=None, construction_policy=None, screen=None) -> dict[str, Any]:
     evidence = sorted(packet["evidence"], key=lambda e: e["evidence_id"])
-    support = {f: select_clause(f, evidence) for f in SIGNATURE_FIELDS}
+    support = support_override if support_override is not None else {f: select_clause(f, evidence) for f in SIGNATURE_FIELDS}
+    construction_policy = construction_policy or CONSTRUCTION_POLICY
+    screen = screen or leakage_issues
     failures = [f + ":" + s["failure"] for f, s in support.items() if not s["qualified"]]
     scope_support = _scope_support(support, {e["evidence_id"]: e["sample_id"] for e in evidence})
     if not scope_support["qualified"]:
@@ -415,7 +418,7 @@ def build_candidate(source: Mapping[str, Any], packet: Mapping[str, Any]) -> dic
         for field in CARD_FIELDS:
             texts = card[field] if isinstance(card[field], list) else [card[field]]
             for text in texts:
-                leakage.extend(f"{field}:{issue}" for issue in leakage_issues(text, evidence))
+                leakage.extend(f"{field}:{issue}" for issue in screen(text, evidence))
         if leakage:
             failures.append("assembled_card_leakage")
             card = None
@@ -446,7 +449,7 @@ def build_candidate(source: Mapping[str, Any], packet: Mapping[str, Any]) -> dic
         "boundary_provenance": {"basis": "scope_restriction_not_an_independent_evidence_vote",
                                 "conditional_guard": guard, "independent_support_claim": False},
         "curation_provenance": {"source_curated_record_sha256": source["record_sha256"], **source["curation"]},
-        "construction_policy_sha256": canonical_hash(CONSTRUCTION_POLICY),
+        "construction_policy_sha256": canonical_hash(construction_policy),
         "qualification": {"construction_qualified": not failures, "failures": failures,
                           "status": "qualified_for_offline_compilation" if not failures else "quarantine"},
         "leakage_audit": {"status": "passed_static_screen" if not failures else "not_qualified",
@@ -462,6 +465,10 @@ def build_candidate(source: Mapping[str, Any], packet: Mapping[str, Any]) -> dic
 
 
 def validate_record(record: Mapping[str, Any]) -> None:
+    if "semantic_construction" in record:
+        from memgen.experience.v4_3_deepseek import validate_semantic_record
+        validate_semantic_record(record)
+        return
     authenticate(record, "record_sha256", "V4.3 record")
     if record.get("schema_version") != RECORD_SCHEMA or record.get("construction_version") != VERSION:
         raise ValueError("V4.3 record schema/version mismatch")
@@ -531,15 +538,24 @@ def validate_record(record: Mapping[str, Any]) -> None:
 
 def build_outputs(*, records: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any],
                   packets: Sequence[Mapping[str, Any]], policy: Mapping[str, Any],
-                  input_hashes: Mapping[str, str], implementation_hashes: Mapping[str, str]) -> dict[str, Any]:
+                  input_hashes: Mapping[str, str], implementation_hashes: Mapping[str, str],
+                  candidates=None, construction_policy=None, report_metadata=None) -> dict[str, Any]:
     packet_map = authenticate_sources(records=records, manifest=manifest, packets=packets,
                                       policy=policy, input_hashes=input_hashes)
-    candidates = [build_candidate(r, packet_map[r["cluster"]["source_candidate_id"]]) for r in records]
+    construction_policy = construction_policy or CONSTRUCTION_POLICY
+    if candidates is None:
+        candidates = [build_candidate(r, packet_map[r["cluster"]["source_candidate_id"]]) for r in records]
+    if len(candidates) != len(records) or any(
+            candidate["source_v42_bank_id"] != source["bank_id"]
+            or candidate["curation_provenance"]["source_curated_record_sha256"] != source["record_sha256"]
+            or candidate["construction"]["evidence_packet_sha256"] != packet_map[source["cluster"]["source_candidate_id"]]["packet_sha256"]
+            for candidate, source in zip(candidates, records)):
+        raise ValueError("Construction candidate/source binding mismatch")
     for record in candidates:
         validate_record(record)
     bindings = {"file_sha256": dict(input_hashes), "source_manifest_sha256": manifest["manifest_sha256"],
                 "curation_policy_sha256": canonical_hash(policy),
-                "construction_policy_sha256": canonical_hash(CONSTRUCTION_POLICY),
+                "construction_policy_sha256": canonical_hash(construction_policy),
                 "implementation_sha256": dict(implementation_hashes)}
     lineage = seal({"schema_version": "memgen-v4.3-bank-lineage-v1", "inputs": bindings,
                     "source_v42_to_v43": {r["source_v42_bank_id"]: r["bank_id"] for r in candidates},
@@ -547,7 +563,7 @@ def build_outputs(*, records: Sequence[Mapping[str, Any]], manifest: Mapping[str
                     "membership_preserved": True}, "lineage_sha256")
     outputs: dict[str, Any] = {"candidate_bank_records.jsonl": candidates,
                                "source_v42_to_v43_lineage.json": lineage,
-                               "construction_policy.json": CONSTRUCTION_POLICY}
+                               "construction_policy.json": construction_policy}
     for tier in ("primary", "conditional"):
         admitted = [r for r in candidates if r["quality_tier"] == tier and r["qualification"]["construction_qualified"]]
         bank_ids = [r["bank_id"] for r in admitted]
@@ -574,7 +590,7 @@ def build_outputs(*, records: Sequence[Mapping[str, Any]], manifest: Mapping[str
                                   "composed_field_support": r["composed_field_support"],
                                   "boundary_provenance": r["boundary_provenance"]} for r in candidates}}, "report_sha256")
     outputs["leakage_audit_report.json"] = seal({"schema_version": "memgen-v4.3-leakage-audit-report-v1",
-        "inputs": bindings, "method": CONSTRUCTION_POLICY["leakage_policy"],
+        "inputs": bindings, "method": construction_policy["leakage_policy"],
         "semantic_factual_consistency_review_performed": False,
         "banks": {r["bank_id"]: {"card_audit": r["leakage_audit"],
                     "fields": {f: s["candidate_audit"] for f, s in r["clause_support"].items()}} for r in candidates}}, "report_sha256")
@@ -597,6 +613,8 @@ def build_outputs(*, records: Sequence[Mapping[str, Any]], manifest: Mapping[str
         "held_out_generalization_claim": False, "construction_evaluation_overlap": "construction_mechanism_audits_only",
         "selector_artifact": None, "tensor_artifact": None,
     }, "report_sha256")
+    if report_metadata:
+        outputs["construction_report.json"] = seal({**outputs["construction_report.json"], **report_metadata}, "report_sha256")
     return outputs
 
 

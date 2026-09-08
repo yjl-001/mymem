@@ -20,8 +20,10 @@ from memgen.experience.v4_3_audit import (
     CONFIGURATION, LAYERS, aggregate, bind_source_state, build_plan, build_wrong_controls, validate_result,
 )
 from memgen.experience.v4_source_state import load_source_state_cache
+from memgen.experience.v4_3_reasoner import identity, resolved_reasoner, replay_contract, validate_tokenizer_replay
 
 IMPLEMENTATION_PATHS = (
+    "memgen/experience/v4_3_reasoner.py",
     "memgen/model/__init__.py",
     "data/gsm8k/prompt.py", "data/utils/math_utils.py", "memgen/chat_templates.py",
     "memgen/experience/v4_source_state.py", "memgen/experience/v4_3_artifacts.py",
@@ -56,7 +58,12 @@ def prepare(args):
     cache = load_source_state_cache(args.cache_manifest, load_tensors=False)
     binding = bind_source_state(cache=cache, bank=bank, evidence=evidence,
                                 semantic_packets_path=args.semantic_packets, risk_path=args.token_risk_artifact)
-    reasoner = {k: cache.manifest["reasoner"][k] for k in ("model_name", "model_revision", "tokenizer_revision")}
+    source_reasoner = identity(cache.manifest["reasoner"])
+    reasoner = resolved_reasoner(source_reasoner)
+    tokenizer_replay = None
+    if source_reasoner["tokenizer_revision"] == "main":
+        tokenizer_replay = replay_contract(cache=cache, evidence=evidence, source_reasoner=source_reasoner,
+                                          packets_sha256=file_hash(args.semantic_packets))
     records, loaders, manifests, slots = [], {}, {}, {}
     for tier in ("primary", "conditional"):
         source = bank[f"{tier}_bank_records.jsonl"]
@@ -65,6 +72,8 @@ def prepare(args):
         path = args.side_kv_dir / f"v4_3_{tier}_side_kv_manifest.json"
         loader = V43SideKVBankLoader(path, source_manifest=bank[f"{tier}_bank_manifest.json"],
                                     source_records=source, expected_reasoner=reasoner)
+        if identity(loader.manifest["source_reasoner"]) != source_reasoner or loader.manifest["tokenizer_replay_validation"] != tokenizer_replay:
+            raise ValueError("Compiled tokenizer/source-state replay identity differs")
         if loader.manifest["dtype"] != "torch.bfloat16":
             raise ValueError("Production audit requires bfloat16 compiled tensors")
         manifests[tier] = loader.manifest["manifest_sha256"]
@@ -78,7 +87,8 @@ def prepare(args):
     experiment = {"configuration": CONFIGURATION, "binding_sha256": binding["binding_sha256"],
         "controls_sha256": controls["controls_sha256"], "compiled_manifest_sha256": manifests,
         "implementation_sha256": implementation_hashes(IMPLEMENTATION_PATHS),
-        "reasoner": reasoner, "prompt_contract": GSM8K_PROMPT_CONTRACT.metadata(chat_template=CONVERSATION_TEMPLATE)}
+        "reasoner": reasoner, "source_reasoner": source_reasoner, "tokenizer_replay_validation": tokenizer_replay,
+        "prompt_contract": GSM8K_PROMPT_CONTRACT.metadata(chat_template=CONVERSATION_TEMPLATE)}
     profile = seal({"schema_version": "memgen-v4.3-audit-profile-v1", "experiment": experiment,
         "experiment_identity_sha256": canonical_hash(experiment), "plan_sha256": plan["plan_sha256"],
         "answer_access": "post_branch_scoring_only", "offline_only": True, "qualified_for_online_use": False}, "profile_sha256")
@@ -251,16 +261,22 @@ def main():
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    source_reasoner = profile["experiment"]["source_reasoner"]
+    if source_reasoner["tokenizer_revision"] == "main":
+        replayed = validate_tokenizer_replay(tokenizer=tokenizer, cache=cache, evidence=evidence,
+            source_reasoner=source_reasoner, packets_sha256=file_hash(args.semantic_packets))
+        if replayed != profile["experiment"]["tokenizer_replay_validation"]:
+            raise ValueError("Runtime tokenizer replay differs from compiled binding")
     # Validate every selected native prefix before any branch is generated.
     prefixes = {c["case_id"]: checked_prefix(c, evidence[c["experience_id"]], tokenizer) for c in plan["cases"]}
     risk = torch.load(args.token_risk_artifact, map_location="cpu", weights_only=False)
-    if any(risk["reasoner"].get(k) != v for k, v in reasoner.items()):
+    if any(risk["reasoner"].get(k) != v for k, v in source_reasoner.items()):
         raise ValueError("Gate and compiled Memory reasoner identities differ")
     gate = EntropyHysteresisGate.from_token_artifact(risk)
     model = AutoModelForCausalLM.from_pretrained(reasoner["model_name"], revision=reasoner["model_revision"],
                                                torch_dtype=torch.bfloat16, attn_implementation="sdpa").to(args.device).eval()
-    if (getattr(model.config, "_commit_hash", reasoner["model_revision"]) != reasoner["model_revision"]
-            or tokenizer.init_kwargs.get("_commit_hash", reasoner["tokenizer_revision"]) != reasoner["tokenizer_revision"]):
+    if ((getattr(model.config, "_commit_hash", None) or reasoner["model_revision"]) != reasoner["model_revision"]
+            or (tokenizer.init_kwargs.get("_commit_hash") or reasoner["tokenizer_revision"]) != reasoner["tokenizer_revision"]):
         raise ValueError("Loaded model/tokenizer revision mismatch")
     controller = SideKVAttentionController(model=model, layer_number=24, audit_canonical_rope=True,
                                            memory_score_normalization="log_valid_slots", memory_score_bias=MEMORY_SCORE_BIAS)

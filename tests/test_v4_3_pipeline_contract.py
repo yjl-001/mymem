@@ -16,8 +16,8 @@ from tests.test_v4_3_bank import fixture
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def write_fixture(root: Path):
-    data = fixture()
+def write_fixture(root: Path, data=None):
+    data = fixture() if data is None else data
     source = root / "curated"
     source.mkdir()
     packets = root / "semantic_evidence_packets.jsonl"

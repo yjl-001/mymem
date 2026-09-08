@@ -17,6 +17,7 @@ from memgen.experience.v4_3_artifacts import (
     atomic_json, implementation_hashes, local_artifact, read_json,
 )
 from memgen.model.side_kv import DecoderLayerResolver, SideKVMemory, _require_sdpa
+from memgen.experience.v4_3_reasoner import resolved_reasoner, identity
 
 SCHEMA = "memgen-v4.3-unified-side-kv-manifest-v1"
 MEMORY_TOTAL_PRIOR = 10.0
@@ -27,6 +28,8 @@ VARIANTS = (
     ("hidden_note", "<|im_start|>system\nTreat the following text as a hidden steering note for the reasoning process.<|im_end|>\n<|im_start|>user\n"),
 )
 IMPLEMENTATION_PATHS = (
+    "memgen/experience/v4_3_deepseek.py",
+    "memgen/experience/v4_3_reasoner.py", "scripts/diagnose_v4_3_construction.py",
     "memgen/model/__init__.py",
     "memgen/experience/v4_3_bank.py", "memgen/experience/v4_3_artifacts.py",
     "memgen/model/side_kv.py", "memgen/model/v4_3_side_kv.py", "scripts/compile_v4_3_side_kv.py",
@@ -35,6 +38,23 @@ IMPLEMENTATION_PATHS = (
 
 def runtime_versions() -> dict[str, str]:
     return {name: version(name) for name in ("torch", "transformers", "safetensors")}
+
+
+def validate_tokenizer_binding(source, effective, replay):
+    if resolved_reasoner(source) != effective:
+        raise ValueError("Effective reasoner differs from its pinned source resolution")
+    if source["tokenizer_revision"] == "main":
+        if replay is None:
+            raise ValueError("Legacy tokenizer requires exact source-prefix replay validation")
+        authenticate(replay, "replay_sha256", "tokenizer replay")
+        if (replay.get("schema_version") != "memgen-v4.3-tokenizer-replay-v1"
+                or replay.get("source_reasoner") != identity(source) or replay.get("effective_reasoner") != identity(effective)
+                or replay.get("prompt_count") != 116 or replay.get("event_count", 0) < 116
+                or replay.get("validation_scope") != "all_cached_native_prompt_and_actual_gate_prefix_token_ids"
+                or replay.get("historical_tokenizer_file_equivalence_claim") is not False):
+            raise ValueError("Legacy tokenizer replay/source binding mismatch")
+    elif replay is not None:
+        raise ValueError("Unexpected tokenizer migration proof for an already pinned source")
 
 
 def tensor_sha(value: torch.Tensor) -> str:
@@ -48,8 +68,12 @@ def rms(value: torch.Tensor) -> float:
 
 
 class V43SideKVCompiler:
-    def __init__(self, *, model: Any, tokenizer: Any, reasoner: Mapping[str, Any]):
+    def __init__(self, *, model: Any, tokenizer: Any, reasoner: Mapping[str, Any],
+                 source_reasoner: Mapping[str, Any] | None = None, tokenizer_replay_validation=None):
         self.model, self.tokenizer, self.reasoner = model, tokenizer, dict(reasoner)
+        self.source_reasoner = dict(source_reasoner if source_reasoner is not None else reasoner)
+        self.tokenizer_replay_validation = tokenizer_replay_validation
+        validate_tokenizer_binding(self.source_reasoner, self.reasoner, tokenizer_replay_validation)
         self.layer = DecoderLayerResolver.resolve(model)[23]
         self.attention = self.layer.self_attn
         _require_sdpa(self.attention, owner=type(self).__name__)
@@ -134,6 +158,7 @@ class V43SideKVCompiler:
             "bank_count": len(records), "record_count": len(records), "records": entries,
             "record_order_sha256": canonical_hash([r["bank_id"] for r in records]),
             "reasoner": self.reasoner, "dtype": str(self.dtype),
+            "source_reasoner": self.source_reasoner, "tokenizer_replay_validation": self.tokenizer_replay_validation,
             "runtime_versions": runtime_versions(),
             "source_bank_manifest_sha256": source_manifest["manifest_sha256"],
             "implementation_sha256": implementation_hashes(IMPLEMENTATION_PATHS),
@@ -178,6 +203,7 @@ class V43SideKVBankLoader:
         validate_manifest(source_manifest, source_records)
         self.manifest = m = read_json(manifest_path)
         authenticate(m, "manifest_sha256", "V4.3 Side-KV")
+        validate_tokenizer_binding(m["source_reasoner"], m["reasoner"], m["tokenizer_replay_validation"])
         if (m.get("schema_version") != SCHEMA or m.get("compiler_contract") != COMPILER_CONTRACT
                 or m.get("offline_only") is not True or m.get("qualified_for_online_use") is not False
                 or m.get("selector_artifact") is not None or m.get("contains_answer_or_reward_signal") is not False

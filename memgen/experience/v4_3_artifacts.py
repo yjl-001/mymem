@@ -87,15 +87,20 @@ def load_construction(directory: Path) -> dict[str, Any]:
         if canonical_hash(value) != entry["logical_sha256"]:
             raise ValueError(f"Construction logical hash mismatch: {name}")
         outputs[name] = value
-    if outputs["construction_policy.json"] != CONSTRUCTION_POLICY:
+    from memgen.experience.v4_3_deepseek import POLICY, IMPLEMENTATION_PATHS
+    semantic = outputs["construction_policy.json"] == POLICY
+    if not semantic and outputs["construction_policy.json"] != CONSTRUCTION_POLICY:
         raise ValueError("Construction policy drifted")
-    expected = implementation_hashes(("memgen/experience/v4_3_bank.py", "scripts/build_v4_3_unified_bank.py"))
+    expected = implementation_hashes(IMPLEMENTATION_PATHS if semantic else (
+        "memgen/experience/v4_3_bank.py", "scripts/build_v4_3_unified_bank.py"))
     if bundle["inputs"]["implementation_sha256"] != expected:
         raise ValueError("Construction implementation identity drifted")
     candidates = outputs["candidate_bank_records.jsonl"]
     if len(candidates) != 17 or len({r["source_v42_bank_id"] for r in candidates}) != 17:
         raise ValueError("V4.3 candidate coverage mismatch")
     for record in candidates:
+        if ("semantic_construction" in record) != semantic:
+            raise ValueError("Construction method/policy mismatch")
         validate_record(record)
     for tier in ("primary", "conditional"):
         records, manifest = outputs[f"{tier}_bank_records.jsonl"], outputs[f"{tier}_bank_manifest.json"]

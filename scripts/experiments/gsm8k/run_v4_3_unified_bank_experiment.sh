@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
-unset DEEPSEEK_API_KEY GLM_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY || true
+unset GLM_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY || true
 
 PYTHON_BIN="${MEMGEN_PYTHON_BIN:-python}"
 OUTPUT_ROOT="${MEMGEN_OUTPUT_ROOT:-/data/memgen-runs}"
@@ -14,11 +14,12 @@ LINEAGE_ROOT="${MEMGEN_V4_RECOVERY_LINEAGE_ROOT:-$OUTPUT_ROOT/lineages/gsm8k-rec
 PACKETS="${MEMGEN_V4_SEMANTIC_PACKETS:-$V4_ROOT/offline/construction_v4_2_semantic/semantic_evidence_packets.jsonl}"
 CURATED="${MEMGEN_V4_CURATED_BANK_DIR:-$V4_ROOT/offline/construction_v4_2_local_curated}"
 LEGACY_SIDE_KV="${MEMGEN_V4_SIDE_KV_DIR:-$V4_ROOT/offline/side_kv_v4_2_local_curated}"
-BANK_DIR="${MEMGEN_V43_BANK_DIR:-$V4_ROOT/offline/construction_v4_3_unified}"
-SIDE_DIR="${MEMGEN_V43_SIDE_KV_DIR:-$V4_ROOT/offline/side_kv_v4_3_unified}"
+BANK_DIR="${MEMGEN_V43_BANK_DIR:-$V4_ROOT/offline/construction_v4_3_deepseek}"
+TEACHER_CACHE="${MEMGEN_V43_TEACHER_CACHE:-$V4_ROOT/offline/construction_v4_3_deepseek_requests}"
+SIDE_DIR="${MEMGEN_V43_SIDE_KV_DIR:-$V4_ROOT/offline/side_kv_v4_3_deepseek}"
 CACHE_MANIFEST="${MEMGEN_V43_CACHE_MANIFEST:-$LINEAGE_ROOT/v4_oracle_full/source_state_cache/v4_source_state_manifest.json}"
 RISK_ARTIFACT="${MEMGEN_V43_RISK_ARTIFACT:-$LINEAGE_ROOT/risk_v3_4/token-entropy-risk-gate-v3.4.pt}"
-AUDIT_ROOT="${MEMGEN_V43_AUDIT_ROOT:-$V4_ROOT/offline/v4_3_unified_audit}"
+AUDIT_ROOT="${MEMGEN_V43_AUDIT_ROOT:-$V4_ROOT/offline/v4_3_deepseek_audit}"
 POLICY="${MEMGEN_V43_CURATION_POLICY:-$REPO_ROOT/configs/experiments/gsm8k/v4_2_local_curation_policy.json}"
 DEVICE="${MEMGEN_V43_DEVICE:-cuda}"
 MODE="${1:-all}"
@@ -26,15 +27,17 @@ STAGE="preflight"
 
 usage() {
   cat <<'EOF'
-Usage: ./test.sh [smoke|full|all]
+Usage: ./test.sh [construct|smoke|full|all]
 
 V4.3 unified Bank experiment. Default: all (smoke, then full).
+  construct  Only synthesize/resume 17 DeepSeek cards; no GPU/cache/risk required.
   smoke  Construct/authenticate Banks; compile/reuse both tiers; run four-layer smoke.
   full   Run the complete audit using a passed, authenticated smoke from this experiment.
   all    Construct/compile prerequisites, run smoke, then full only if smoke passes.
 
 Always reuses the complete 116-sample V4.2 source-state cache, even for smoke.
-Never invokes Phase-1 recovery, paid providers, selector, dev-test or final-test.
+DeepSeek is used only to construct uncached cards (DEEPSEEK_API_KEY required).
+Never invokes Phase-1 recovery, selector, dev-test or final-test.
 Missing source cache/risk fails with its exact path; no automatic regeneration.
 Construction qualification failures remain explicit exclusions; thresholds stay fixed.
 
@@ -42,6 +45,7 @@ Overrides:
   MEMGEN_OUTPUT_ROOT, MEMGEN_V4_OUTPUT_ROOT, MEMGEN_V4_RECOVERY_LINEAGE_ROOT
   MEMGEN_V4_SEMANTIC_PACKETS, MEMGEN_V4_CURATED_BANK_DIR, MEMGEN_V4_SIDE_KV_DIR
   MEMGEN_V43_BANK_DIR, MEMGEN_V43_SIDE_KV_DIR, MEMGEN_V43_AUDIT_ROOT
+  MEMGEN_V43_TEACHER_CACHE    Immutable per-Bank DeepSeek response cache.
   MEMGEN_V43_CACHE_MANIFEST, MEMGEN_V43_RISK_ARTIFACT, MEMGEN_V43_CURATION_POLICY
   MEMGEN_V43_DEVICE=cuda, MEMGEN_V43_CUDA_VISIBLE_DEVICES=0
   MEMGEN_V43_ALL_BANK_SWEEP=1    Append the optional outcome-informed primary-Bank sweep.
@@ -57,13 +61,16 @@ fail() { echo "[v4.3] FAIL stage=$STAGE: $*" >&2; exit 1; }
 trap 'status=$?; echo "[v4.3] FAIL stage=$STAGE line=$LINENO status=$status; valid artifacts preserved" >&2; exit "$status"' ERR
 case "$MODE" in
   -h|--help) usage; exit 0 ;;
-  smoke|full|all) ;;
-  *) usage >&2; fail "expected smoke, full, or all" ;;
+  construct|smoke|full|all) ;;
+  *) usage >&2; fail "expected construct, smoke, full, or all" ;;
 esac
 [[ "$#" -le 1 ]] || fail "only one mode argument is supported"
 command -v "$PYTHON_BIN" >/dev/null || fail "Python executable missing: $PYTHON_BIN"
-for path in "$PACKETS" "$CURATED/bank_records.jsonl" "$CURATED/bank_manifest.json" \
-  "$LEGACY_SIDE_KV/v4_side_kv_manifest.json" "$CACHE_MANIFEST" "$RISK_ARTIFACT" "$POLICY"; do
+INPUTS=("$PACKETS" "$CURATED/bank_records.jsonl" "$CURATED/bank_manifest.json" "$POLICY")
+if [[ "$MODE" != "construct" ]]; then
+  INPUTS+=("$LEGACY_SIDE_KV/v4_side_kv_manifest.json" "$CACHE_MANIFEST" "$RISK_ARTIFACT")
+fi
+for path in "${INPUTS[@]}"; do
   [[ -s "$path" ]] || fail "missing required existing input: $path"
 done
 if [[ "$MODE" == "full" ]]; then
@@ -81,14 +88,24 @@ echo "[v4.3] one_bank_one_memory=true active_steps=32 completion_tokens=1024 sel
 
 STAGE="construction"
 echo "[v4.3] stage=$STAGE"
-"$PYTHON_BIN" scripts/build_v4_3_unified_bank.py \
+"$PYTHON_BIN" scripts/build_v4_3_deepseek_bank.py \
   --source-dir "$CURATED" --semantic-packets "$PACKETS" --curation-policy "$POLICY" \
-  --output-dir "$BANK_DIR" "${RESUME[@]}"
+  --output-dir "$BANK_DIR" --cache-dir "$TEACHER_CACHE" "${RESUME[@]}"
+unset DEEPSEEK_API_KEY || true
+if [[ "$MODE" == "construct" ]]; then
+  STAGE="complete"
+  echo "[v4.3] PASS mode=construct bundle=$BANK_DIR/construction_bundle_manifest.json"
+  exit 0
+fi
+
+"$PYTHON_BIN" scripts/diagnose_v4_3_construction.py \
+  --bank-dir "$BANK_DIR" --reasoner-manifest "$LEGACY_SIDE_KV/v4_side_kv_manifest.json" --require-auditable
 
 STAGE="compilation"
 echo "[v4.3] stage=$STAGE"
 "$PYTHON_BIN" scripts/compile_v4_3_side_kv.py \
   --bank-dir "$BANK_DIR" --reasoner-manifest "$LEGACY_SIDE_KV/v4_side_kv_manifest.json" \
+  --cache-manifest "$CACHE_MANIFEST" --semantic-packets "$PACKETS" \
   --output-dir "$SIDE_DIR" --device "$DEVICE" "${RESUME[@]}"
 
 run_mode() {
