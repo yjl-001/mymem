@@ -40,6 +40,8 @@ def parse_args():
     for name in ("bank-dir", "side-kv-dir", "semantic-packets", "cache-manifest", "token-risk-artifact", "output-dir"):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--mode", choices=("smoke", "full"), default="smoke")
+    p.add_argument("--bank-scope", choices=("primary", "all"), default="primary",
+                   help="Select source cases AND wrong-Bank pool; default: primary only")
     p.add_argument("--device", default="cuda")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--validate-only", action="store_true")
@@ -65,7 +67,8 @@ def prepare(args):
         tokenizer_replay = replay_contract(cache=cache, evidence=evidence, source_reasoner=source_reasoner,
                                           packets_sha256=file_hash(args.semantic_packets))
     records, loaders, manifests, slots = [], {}, {}, {}
-    for tier in ("primary", "conditional"):
+    tiers = ("primary",) if args.bank_scope == "primary" else ("primary", "conditional")
+    for tier in tiers:
         source = bank[f"{tier}_bank_records.jsonl"]
         if not source:
             continue
@@ -83,8 +86,9 @@ def prepare(args):
             slots[bid] = loader.entries[bid]["kv_valid_slot_count"]
     controls = build_wrong_controls(records, slots)
     plan = build_plan(candidates=bank["candidate_bank_records.jsonl"], events=cache.events,
-                      controls=controls, binding=binding, mode=args.mode, all_bank_sweep=args.all_bank_sweep)
-    experiment = {"configuration": CONFIGURATION, "binding_sha256": binding["binding_sha256"],
+                      controls=controls, binding=binding, mode=args.mode, all_bank_sweep=args.all_bank_sweep,
+                      bank_scope=args.bank_scope)
+    experiment = {"configuration": CONFIGURATION, "bank_scope": args.bank_scope, "binding_sha256": binding["binding_sha256"],
         "controls_sha256": controls["controls_sha256"], "compiled_manifest_sha256": manifests,
         "implementation_sha256": implementation_hashes(IMPLEMENTATION_PATHS),
         "reasoner": reasoner, "source_reasoner": source_reasoner, "tokenizer_replay_validation": tokenizer_replay,
@@ -135,7 +139,7 @@ def score_branch(tokenizer, prefix, prompt_count, branch, official_solution):
 def smoke_integrity(plan, rows):
     if plan["mode"] != "smoke" or len(rows) != len(plan["cases"]):
         return False
-    for tier in ("primary", "conditional"):
+    for tier in plan.get("selected_quality_tiers", ("primary", "conditional")):
         subset = [r for r in rows if r["quality_tier"] == tier]
         if not set(LAYERS) <= {r["audit_layer"] for r in subset}:
             return False
@@ -161,6 +165,7 @@ def write_report(args, plan, rows, profile):
     atomic_json(args.output_dir / "v4_3_audit_report.json", report)
     core = {k: report[k] for k in ("status", "mode", "complete", "expected_case_count", "completed_case_count",
             "experiment_identity_sha256", "smoke_integrity_passed", "configuration", "source_sample_count",
+            "bank_scope", "source_cache_sample_count", "out_of_scope_sample_count",
             "excluded_samples", "gate_unreachable_failure_count", "gate_unreachable_counted_as_memory_ineffective",
             "offline_only", "qualified_for_online_use", "held_out_generalization_claim", "external_api_calls_made")}
     core["by_audit_layer"] = {layer: {k: values[k] for k in ("expected_case_count", "completed_case_count", "overall", "by_quality_tier")}

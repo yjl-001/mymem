@@ -19,7 +19,10 @@ TEACHER_CACHE="${MEMGEN_V43_TEACHER_CACHE:-$V4_ROOT/offline/construction_v4_3_de
 SIDE_DIR="${MEMGEN_V43_SIDE_KV_DIR:-$V4_ROOT/offline/side_kv_v4_3_deepseek_prompt_v3}"
 CACHE_MANIFEST="${MEMGEN_V43_CACHE_MANIFEST:-$LINEAGE_ROOT/v4_oracle_full/source_state_cache/v4_source_state_manifest.json}"
 RISK_ARTIFACT="${MEMGEN_V43_RISK_ARTIFACT:-$LINEAGE_ROOT/risk_v3_4/token-entropy-risk-gate-v3.4.pt}"
-AUDIT_ROOT="${MEMGEN_V43_AUDIT_ROOT:-$V4_ROOT/offline/v4_3_deepseek_prompt_v3_audit}"
+BANK_SCOPE="${MEMGEN_V43_BANK_SCOPE:-primary}"
+AUDIT_SUFFIX=""
+if [[ "$BANK_SCOPE" == "primary" ]]; then AUDIT_SUFFIX="_primary"; fi
+AUDIT_ROOT="${MEMGEN_V43_AUDIT_ROOT:-$V4_ROOT/offline/v4_3_deepseek_prompt_v3${AUDIT_SUFFIX}_audit}"
 POLICY="${MEMGEN_V43_CURATION_POLICY:-$REPO_ROOT/configs/experiments/gsm8k/v4_2_local_curation_policy.json}"
 DEVICE="${MEMGEN_V43_DEVICE:-cuda}"
 MODE="${1:-all}"
@@ -29,15 +32,20 @@ usage() {
   cat <<'EOF'
 Usage: ./test.sh [construct|smoke|full|all]
 
-V4.3 unified Bank experiment. Default: all (smoke, then full).
+V4.3 unified Bank experiment. Default: primary scope, all (smoke, then full).
+Primary scope reuses the existing 11 primary cards and compiled side-KV.
+Conditional Banks are excluded from cases AND wrong-Bank controls.
+No construction API calls or compilation occur in primary scope.
+In primary scope, construct only authenticates the existing construction bundle.
+The following construction/compilation behavior applies to BANK_SCOPE=all:
   construct  Only synthesize/resume 17 DeepSeek cards; no GPU/cache/risk required.
   smoke  Construct/authenticate Banks; compile/reuse both tiers; run four-layer smoke.
   full   Run the complete audit using a passed, authenticated smoke from this experiment.
   all    Construct/compile prerequisites, run smoke, then full only if smoke passes.
 
 Always reuses the complete 116-sample V4.2 source-state cache, even for smoke.
-DeepSeek is used only to construct uncached cards (DEEPSEEK_API_KEY required).
-Prompt v3 freshly constructs all 17 Banks; old prompt responses are never reused.
+With BANK_SCOPE=all, DeepSeek constructs uncached cards (DEEPSEEK_API_KEY required).
+That historical construction uses prompt v3 for all 17 Banks, without old prompt responses.
 No static content blacklist: quality is guided by the teacher prompt.
 Never invokes Phase-1 recovery, selector, dev-test or final-test.
 Missing source cache/risk fails with its exact path; no automatic regeneration.
@@ -50,6 +58,7 @@ Overrides:
   MEMGEN_V43_TEACHER_CACHE    Immutable per-Bank DeepSeek response cache.
   MEMGEN_V43_CACHE_MANIFEST, MEMGEN_V43_RISK_ARTIFACT, MEMGEN_V43_CURATION_POLICY
   MEMGEN_V43_DEVICE=cuda, MEMGEN_V43_CUDA_VISIBLE_DEVICES=0
+  MEMGEN_V43_BANK_SCOPE=primary    Use all only to reproduce the historical two-tier scope.
   MEMGEN_V43_ALL_BANK_SWEEP=1    Append the optional outcome-informed primary-Bank sweep.
   MEMGEN_V43_VALIDATE_ONLY=1    Authenticate existing complete outputs without inference.
   MEMGEN_PYTHON_BIN=python
@@ -67,11 +76,18 @@ case "$MODE" in
   *) usage >&2; fail "expected construct, smoke, full, or all" ;;
 esac
 [[ "$#" -le 1 ]] || fail "only one mode argument is supported"
+[[ "$BANK_SCOPE" == "primary" || "$BANK_SCOPE" == "all" ]] || fail "MEMGEN_V43_BANK_SCOPE must be primary or all"
 command -v "$PYTHON_BIN" >/dev/null || fail "Python executable missing: $PYTHON_BIN"
 INPUTS=("$PACKETS" "$CURATED/bank_records.jsonl" "$CURATED/bank_manifest.json" "$POLICY")
 if [[ "$MODE" != "construct" ]]; then
-  INPUTS+=("$LEGACY_SIDE_KV/v4_side_kv_manifest.json" "$CACHE_MANIFEST" "$RISK_ARTIFACT")
+  INPUTS+=("$CACHE_MANIFEST" "$RISK_ARTIFACT")
+  if [[ "$BANK_SCOPE" == "all" ]]; then
+    INPUTS+=("$LEGACY_SIDE_KV/v4_side_kv_manifest.json")
+  else
+    INPUTS+=("$SIDE_DIR/v4_3_primary_side_kv_manifest.json")
+  fi
 fi
+if [[ "$BANK_SCOPE" == "primary" ]]; then INPUTS+=("$BANK_DIR/construction_bundle_manifest.json"); fi
 for path in "${INPUTS[@]}"; do
   [[ -s "$path" ]] || fail "missing required existing input: $path"
 done
@@ -87,7 +103,26 @@ echo "[v4.3] packets=$PACKETS curated=$CURATED policy=$POLICY"
 echo "[v4.3] source_cache=$CACHE_MANIFEST risk=$RISK_ARTIFACT"
 echo "[v4.3] bank_output=$BANK_DIR side_kv_output=$SIDE_DIR audit_output=$AUDIT_ROOT"
 echo "[v4.3] one_bank_one_memory=true active_steps=32 completion_tokens=1024 selector=false"
+echo "[v4.3] bank_scope=$BANK_SCOPE wrong_bank_scope=$BANK_SCOPE"
 
+if [[ "$BANK_SCOPE" == "primary" ]]; then
+  STAGE="construction-authentication"
+  unset DEEPSEEK_API_KEY || true
+  "$PYTHON_BIN" -c 'from pathlib import Path
+import sys
+from memgen.experience.v4_3_artifacts import load_construction
+bank = load_construction(Path(sys.argv[1]))
+records = bank["primary_bank_records.jsonl"]
+if len(records) != 11:
+    raise ValueError(f"Primary scope requires the 11 qualified primary Banks; found {len(records)}")
+count = sum(len(r["construction"]["sample_ids"]) for r in records)
+print(f"[v4.3] authenticated primary_banks={len(records)} evidence_count={count}")
+' "$BANK_DIR"
+  if [[ "$MODE" == "construct" ]]; then
+    echo "[v4.3] PASS mode=construct primary bundle authenticated; no API calls"
+    exit 0
+  fi
+else
 STAGE="construction"
 echo "[v4.3] stage=$STAGE"
 "$PYTHON_BIN" scripts/build_v4_3_deepseek_bank.py \
@@ -109,13 +144,14 @@ echo "[v4.3] stage=$STAGE"
   --bank-dir "$BANK_DIR" --reasoner-manifest "$LEGACY_SIDE_KV/v4_side_kv_manifest.json" \
   --cache-manifest "$CACHE_MANIFEST" --semantic-packets "$PACKETS" \
   --output-dir "$SIDE_DIR" --device "$DEVICE" "${RESUME[@]}"
+fi
 
 run_mode() {
   local selection="$1"
   STAGE="audit-$selection"
   echo "[v4.3] stage=$STAGE"
   local audit_command=("$PYTHON_BIN" scripts/audit_v4_3_unified_memory.py \
-    --mode "$selection" --bank-dir "$BANK_DIR" --side-kv-dir "$SIDE_DIR" \
+    --mode "$selection" --bank-scope "$BANK_SCOPE" --bank-dir "$BANK_DIR" --side-kv-dir "$SIDE_DIR" \
     --semantic-packets "$PACKETS" --cache-manifest "$CACHE_MANIFEST" \
     --token-risk-artifact "$RISK_ARTIFACT" --output-dir "$AUDIT_ROOT/$selection" \
     --device "$DEVICE" "${RESUME[@]}")

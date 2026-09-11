@@ -12,7 +12,7 @@ RUNNER = ROOT / "test.sh"
 
 
 class V43ShellTests(unittest.TestCase):
-    def run_fixture(self, root, mode="all", fail_smoke=False, missing_cache=False, validate=False, fail_construction=False):
+    def run_fixture(self, root, mode="all", fail_smoke=False, missing_cache=False, validate=False, fail_construction=False, bank_scope="all"):
         paths = {"MEMGEN_V4_SEMANTIC_PACKETS": root / "packets.jsonl",
                  "MEMGEN_V4_CURATED_BANK_DIR": root / "curated",
                  "MEMGEN_V4_SIDE_KV_DIR": root / "old-side",
@@ -26,6 +26,9 @@ class V43ShellTests(unittest.TestCase):
                   paths["MEMGEN_V4_SIDE_KV_DIR"] / "v4_side_kv_manifest.json", paths["MEMGEN_V43_RISK_ARTIFACT"]]
         if not missing_cache:
             inputs.append(paths["MEMGEN_V43_CACHE_MANIFEST"])
+        if bank_scope == "primary":
+            inputs.extend([paths["MEMGEN_V43_BANK_DIR"] / "construction_bundle_manifest.json",
+                           paths["MEMGEN_V43_SIDE_KV_DIR"] / "v4_3_primary_side_kv_manifest.json"])
         for p in inputs:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text("fixture only")
@@ -33,6 +36,8 @@ class V43ShellTests(unittest.TestCase):
         stub.write_text("#!" + sys.executable + "\n" + '''
 import json, os, pathlib, sys
 args = sys.argv[1:]
+if args[0] == '-c':
+    compile(args[1], '<primary-preflight>', 'exec')
 assert not any(k in os.environ for k in ('GLM_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'))
 assert ('DEEPSEEK_API_KEY' in os.environ) == args[0].endswith('build_v4_3_deepseek_bank.py')
 with open(os.environ['CALL_LOG'], 'a') as handle:
@@ -53,6 +58,7 @@ if args[0].endswith('audit_v4_3_unified_memory.py'):
                "MEMGEN_PYTHON_BIN": str(stub), "CALL_LOG": str(root / "calls.jsonl"),
                "FAIL_SMOKE": str(int(fail_smoke)), "MEMGEN_V43_VALIDATE_ONLY": str(int(validate))}
         env["FAIL_CONSTRUCTION"] = str(int(fail_construction))
+        env["MEMGEN_V43_BANK_SCOPE"] = bank_scope
         for key in ("DEEPSEEK_API_KEY", "GLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
             env[key] = "sentinel-not-a-key"
         result = subprocess.run(["bash", str(RUNNER), mode], cwd=ROOT, env=env, text=True, capture_output=True)
@@ -79,6 +85,15 @@ if args[0].endswith('audit_v4_3_unified_memory.py'):
             result, calls = self.run_fixture(Path(tmp), fail_smoke=True)
             self.assertEqual(result.returncode, 17)
             self.assertFalse(any("full" in call for call in calls))
+
+    def test_primary_reuses_artifacts_without_teacher_or_compiler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, calls = self.run_fixture(Path(tmp), bank_scope="primary")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(any("build_v4_3_deepseek_bank.py" in c[0] or "compile_v4_3_side_kv.py" in c[0] for c in calls))
+            audits = [c for c in calls if c[0].endswith("audit_v4_3_unified_memory.py")]
+            self.assertEqual(len(audits), 2)
+            self.assertTrue(all(c[c.index("--bank-scope") + 1] == "primary" for c in audits))
 
     def test_construct_mode_does_not_require_gpu_or_source_cache(self):
         with tempfile.TemporaryDirectory() as tmp:

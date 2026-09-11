@@ -119,7 +119,8 @@ class V43ArtifactIntegrationTests(unittest.TestCase):
                     tensors, manifest = compiler.compile(outputs[f"{tier}_bank_records.jsonl"], outputs[f"{tier}_bank_manifest.json"])
                     save_compiled(side_dir, tensors, manifest)
             args = SimpleNamespace(bank_dir=bank_dir, side_kv_dir=side_dir, semantic_packets=packets_path,
-                                   cache_manifest=cache_path, token_risk_artifact=risk_path, mode="smoke", all_bank_sweep=False)
+                                   cache_manifest=cache_path, token_risk_artifact=risk_path, mode="smoke", all_bank_sweep=False,
+                                   bank_scope="all")
             prepared = prepare(args)
             self.assertEqual(len(prepared[3]), 17)
             self.assertEqual(len(prepared[4]), 17)
@@ -131,6 +132,24 @@ class V43ArtifactIntegrationTests(unittest.TestCase):
             full = prepare(args)
             self.assertEqual(full[-2]["case_count"], 464)
             self.assertEqual(prepared[-1]["experiment_identity_sha256"], full[-1]["experiment_identity_sha256"])
+            # Primary scope reuses the very same compiled files, without a
+            # conditional manifest/tensor dependency or conditional controls.
+            for path in side_dir.glob("*conditional*"):
+                path.unlink()
+            args.bank_scope = "primary"
+            primary = prepare(args)
+            self.assertEqual(len(primary[3]), 11)
+            self.assertEqual(len(primary[4]), 11)
+            self.assertEqual(primary[-2]["source_sample_count"], 76)
+            self.assertEqual(primary[-2]["case_count"], 304)
+            self.assertNotEqual(primary[-1]["experiment_identity_sha256"], full[-1]["experiment_identity_sha256"])
+            self.assertTrue(all(c["quality_tier"] == "primary" for c in primary[-2]["cases"]))
+            from scripts.audit_v4_3_prefix_equivalence import prepare_experiment
+            args.atol, args.rtol, args.device = .05, .02, "cpu"
+            _, eq_cases, eq_profile = prepare_experiment(args)
+            self.assertEqual(len(eq_cases), 76)
+            self.assertEqual(eq_profile["configuration"]["bank_count"], 11)
+            self.assertTrue(all(c["audit_layer"] == "visible_content" for c in eq_cases))
             risk_path.write_bytes(b"different fixture")
             with self.assertRaisesRegex(ValueError, "lineage/file identity"):
                 prepare(args)

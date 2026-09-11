@@ -1,5 +1,25 @@
 # V4.3 Unified Heuristic Memory：实现与运行合同
 
+## 当前实验范围：仅 primary
+
+后续默认仅使用 11 个 primary Bank（76 条 evidence）。`./test.sh` 和 audit CLI
+默认选择 primary；匹配记忆、近邻/远端错误 Bank 对照池以及可选 sweep 都不消费
+conditional。记忆注入与关闭策略保持冻结。旧 17/116 construction 和 source cache
+保留用于完整来源认证，40 个 conditional 样本记为范围外，不计作构造失败或伤害。
+
+默认入口复用已经生成的卡片和已编译 primary side-KV，不调用 DeepSeek、不重新编译。
+缺少工件时明确报错；`construct` 在此范围仅认证既有 construction。
+新输出默认位于 `v4_3_deepseek_prompt_v3_primary_audit/{smoke,full}`，需新的 smoke；
+旧审计结果不能作为新对照池的续跑数据。原始构造/两类编译工作流仍可用
+`MEMGEN_V43_BANK_SCOPE=all` 显式运行，audit CLI 对应 `--bank-scope all`。
+修改审计实现后，历史结果的严格代码身份校验需使用原提交。
+
+这次范围调整是在观察实验结果后做出的研究决策，不是新的 held-out 验证。
+primary 为来源筛选标签，不保证每张卡有效。已有 primary 结果中，可见文本正确数
+43/76 → 52/76，prompt-end side-KV 为 43/76 → 43/76，失败 gate 为 9/69 → 9/69。
+未来 primary-only 错误对照会重新选取，不能把旧 primary 分组的 wrong-Bank 数值
+当作已运行的新 primary-only 对照结果。
+
 本轮续接 V4.3 unified positive heuristic 路线。V4.2 文档、target/reference
 工件和旧 oracle 保留为历史来源；不继续 selector calibration。根据用户新授权，
 仅记忆卡构造改为调用 DeepSeek，复用既有 evidence，不生成新题目轨迹。

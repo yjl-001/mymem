@@ -93,6 +93,40 @@ class V43AuditTests(unittest.TestCase):
         for layer in LAYERS:
             self.assertEqual(len({c["sample_id"] for c in plan["cases"] if c["audit_layer"] == layer}), 116)
 
+    def test_primary_scope_filters_cases_controls_and_report_denominators(self):
+        from scripts.audit_v4_3_unified_memory import smoke_integrity
+        candidates = self.outputs["candidate_bank_records.jsonl"]
+        records = [r for r in candidates if r["quality_tier"] == "primary"]
+        ids = {r["bank_id"] for r in records}
+        controls = build_wrong_controls(records, {bid: 100 for bid in ids})
+        for mode in ("smoke", "full"):
+            plan = build_plan(candidates=candidates, events=self.events, controls=controls,
+                              binding=self.binding, mode=mode, bank_scope="primary", all_bank_sweep=True)
+            self.assertEqual(plan["source_sample_count"], 76)
+            self.assertEqual(plan["source_cache_sample_count"], 116)
+            self.assertEqual(plan["out_of_scope_sample_count"], 40)
+            self.assertEqual(plan["excluded_samples"], [])
+            self.assertTrue(all(c["quality_tier"] == "primary" and
+                                set(c["memories"].values()) - {None} <= ids for c in plan["cases"]))
+            rows = [result_for(c) for c in plan["cases"]]
+            report = aggregate(plan, rows, "profile")
+            self.assertEqual(report["source_sample_count"], 76)
+            self.assertEqual(report["bank_scope"], "primary")
+            self.assertTrue(report["complete"])
+            if mode == "smoke":
+                self.assertTrue(smoke_integrity(plan, rows))
+        with self.assertRaisesRegex(ValueError, "selected Bank scope"):
+            self.plan(bank_scope="primary")  # A two-tier wrong pool cannot leak in.
+
+    def test_audit_cli_defaults_to_primary(self):
+        from unittest.mock import patch
+        from scripts.audit_v4_3_unified_memory import parse_args
+        argv = ["audit"]
+        for flag in ("bank-dir", "side-kv-dir", "semantic-packets", "cache-manifest", "token-risk-artifact", "output-dir"):
+            argv.extend(["--" + flag, "/tmp/fixture"])
+        with patch("sys.argv", argv):
+            self.assertEqual(parse_args().bank_scope, "primary")
+
     def test_unreachable_failure_not_in_gate_denominator(self):
         events = deepcopy(self.events)
         sid = events[0]["sample_id"]

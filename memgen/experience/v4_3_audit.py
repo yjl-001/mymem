@@ -133,21 +133,33 @@ def bind_source_state(*, cache: Any, bank: Mapping[str, Any], evidence: Mapping[
 
 def build_plan(*, candidates: Sequence[Mapping[str, Any]], events: Sequence[Mapping[str, Any]],
                controls: Mapping[str, Any], binding: Mapping[str, Any], mode: str,
-               all_bank_sweep: bool = False) -> dict[str, Any]:
+               all_bank_sweep: bool = False, bank_scope: str = "all") -> dict[str, Any]:
     if mode not in {"smoke", "full"}:
         raise ValueError("Unknown V4.3 audit mode")
+    if bank_scope not in {"primary", "all"}:
+        raise ValueError("Unknown V4.3 Bank scope")
+    tiers = ("primary",) if bank_scope == "primary" else ("primary", "conditional")
     authenticate(controls, "controls_sha256", "wrong-bank controls")
     authenticate(binding, "binding_sha256", "source binding")
     by_old = {r["source_v42_bank_id"]: r for r in candidates}
     prompts = sorted((e for e in events if e["event_kind"] == "prompt_semantic"), key=lambda e: e["sample_id"])
     if len(prompts) != 116:
         raise ValueError("Plan requires full source cache coverage")
+    source_cache_sample_count = len(prompts)
+    scoped_candidates = [r for r in candidates if r["quality_tier"] in tiers]
+    eligible_ids = {r["bank_id"] for r in scoped_candidates if r["qualification"]["construction_qualified"]}
+    if set(controls["controls"]) != eligible_ids:
+        raise ValueError("Wrong-bank controls must use exactly the selected Bank scope")
+    for control in controls["controls"].values():
+        if control.get("qualified") and any(control[name] not in eligible_ids for name in BRANCHES[1:]):
+            raise ValueError("Wrong-bank memory outside selected Bank scope")
+    prompts = [p for p in prompts if by_old[p["bank_id"]]["quality_tier"] in tiers]
     excluded, unreachable, cases = [], [], []
     selected_banks = set()
     if mode == "smoke":
-        # Require both tiers and actual failure/success gates. Keep this sample
+        # Require selected tiers and actual failure/success gates. Keep this sample
         # rule fixed and independent of generated answers or repair outcomes.
-        for tier in ("primary", "conditional"):
+        for tier in tiers:
             available = []
             for r in candidates:
                 if r["quality_tier"] != tier or not controls["controls"].get(r["bank_id"], {}).get("qualified"):
@@ -194,13 +206,13 @@ def build_plan(*, candidates: Sequence[Mapping[str, Any]], events: Sequence[Mapp
                 cases.append(seal(payload, "case_sha256"))
     if mode == "smoke":
         retained = []
-        for tier in ("primary", "conditional"):
+        for tier in tiers:
             for layer in LAYERS:
                 subset = [c for c in cases if c["quality_tier"] == tier and c["audit_layer"] == layer]
                 retained.extend(subset[:2])
         cases = retained
-        if any(not any(c["quality_tier"] == t and c["audit_layer"] == l for c in cases) for t in ("primary", "conditional") for l in LAYERS):
-            raise ValueError("Smoke does not cover both tiers and all four layers")
+        if any(not any(c["quality_tier"] == t and c["audit_layer"] == l for c in cases) for t in tiers for l in LAYERS):
+            raise ValueError("Smoke does not cover selected tiers and all four layers")
     if all_bank_sweep:
         primaries = sorted(r["bank_id"] for r in candidates if r["quality_tier"] == "primary" and r["qualification"]["construction_qualified"])
         for base in list(cases):
@@ -217,8 +229,11 @@ def build_plan(*, candidates: Sequence[Mapping[str, Any]], events: Sequence[Mapp
         "configuration": CONFIGURATION, "binding_sha256": binding["binding_sha256"],
         "controls_sha256": controls["controls_sha256"], "cases": cases, "case_count": len(cases),
         "case_order_sha256": canonical_hash([c["case_id"] for c in cases]),
-        "source_sample_count": 116, "excluded_samples": excluded,
-        "bank_categories": {r["bank_id"]: r["semantic_category"] for r in candidates},
+        "bank_scope": bank_scope, "selected_quality_tiers": list(tiers),
+        "source_sample_count": len(prompts), "source_cache_sample_count": source_cache_sample_count,
+        "out_of_scope_sample_count": source_cache_sample_count - len(prompts),
+        "excluded_samples": excluded,
+        "bank_categories": {r["bank_id"]: r["semantic_category"] for r in scoped_candidates},
         "gate_unreachable_failures": unreachable, "gate_unreachable_counted_as_memory_ineffective": False,
         "all_bank_sweep": all_bank_sweep, "offline_only": True, "qualified_for_online_use": False,
         "held_out_generalization_claim": False, "selector_artifact": None,
@@ -401,7 +416,11 @@ def aggregate(plan: Mapping[str, Any], rows: Sequence[Mapping[str, Any]], profil
         "plan_sha256": plan["plan_sha256"], "mode": plan["mode"], "configuration": CONFIGURATION,
         "complete": len(rows) == len(cases), "expected_case_count": len(cases), "completed_case_count": len(rows),
         "status": "completed_mechanism_diagnostic" if len(rows) == len(cases) else "in_progress",
-        "by_audit_layer": layers, "source_sample_count": 116, "excluded_samples": plan["excluded_samples"],
+        "by_audit_layer": layers, "source_sample_count": plan["source_sample_count"],
+        "bank_scope": plan.get("bank_scope", "all"),
+        "source_cache_sample_count": plan.get("source_cache_sample_count", 116),
+        "out_of_scope_sample_count": plan.get("out_of_scope_sample_count", 0),
+        "excluded_samples": plan["excluded_samples"],
         "gate_unreachable_failure_count": len(plan["gate_unreachable_failures"]),
         "gate_unreachable_counted_as_memory_ineffective": False,
         "offline_only": True, "qualified_for_online_use": False, "held_out_generalization_claim": False,
