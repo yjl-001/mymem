@@ -3,6 +3,10 @@
 set -Eeuo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 unset GLM_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY || true
+if [[ "${1:-}" == "similarity-study" ]]; then
+  shift
+  exec bash "$REPO_ROOT/scripts/experiments/gsm8k/run_v4_3_similarity_study.sh" "$@"
+fi
 if [[ "${1:-}" == "final-test" ]]; then
   shift
   exec bash "$REPO_ROOT/scripts/experiments/gsm8k/run_v4_3_final_test.sh" "$@"
