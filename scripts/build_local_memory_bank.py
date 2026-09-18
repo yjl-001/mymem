@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -23,10 +24,20 @@ def main(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--stage", choices=("all", *STAGES), default="all")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--rollout-batch-size", type=int, help="Override simultaneous reasoner trajectories (default 32)")
+    parser.add_argument("--teacher-concurrency", type=int, help="Override simultaneous vLLM teacher requests (default 16)")
+    parser.add_argument("--reuse-rollouts-from", type=Path,
+                        help="Import completed rollouts from a stopped compatible older run into a new directory")
     parser.add_argument("--plan-only", action="store_true", help="Validate config without downloads or inference")
     parser.add_argument("--validate-only", action="store_true", help="Audit a completed run without model inference")
     args = parser.parse_args(argv)
+    if args.reuse_rollouts_from and (args.stage not in {"all", "rollouts"} or args.validate_only):
+        parser.error("--reuse-rollouts-from requires --stage all or rollouts")
     config = ConstructionConfig.load(args.config)
+    overrides = {name: getattr(args, name) for name in ("rollout_batch_size", "teacher_concurrency")
+                 if getattr(args, name) is not None}
+    if overrides:
+        config = replace(config, **overrides)
     if args.plan_only:
         print(json.dumps({"configuration": config.to_dict(), "stages": STAGES,
             "note": "all includes a valid-only baseline and every primary-bank utility branch; no test generation"}, indent=2))
@@ -45,7 +56,7 @@ def main(argv=None):
             from memgen.experience.bank_construction.audit import audit_complete
             print(json.dumps(audit_complete(store, config), indent=2))
         else:
-            run(store, config, profile, stage=args.stage)
+            run(store, config, profile, stage=args.stage, reuse_from=args.reuse_rollouts_from)
 
 
 if __name__ == "__main__":

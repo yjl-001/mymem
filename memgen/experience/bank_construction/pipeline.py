@@ -15,23 +15,35 @@ from .teacher import Teacher
 STAGES = ("split", "rollouts", "review", "evidence", "groups", "cards", "compile", "evaluate")
 
 
-def run(store, config, profile, *, stage="all", reasoner_factory=None, teacher_factory=None):
+def run(store, config, profile, *, stage="all", reasoner_factory=None, teacher_factory=None, reuse_from=None):
     if stage not in (*STAGES, "all"):
         raise ValueError("Unknown stage")
     if reasoner_factory is None or teacher_factory is None:
         from memgen.model.local_bank import LocalModel
         reasoner_factory = reasoner_factory or (lambda: LocalModel(profile["reasoner"], config.reasoner, reasoner=True))
-        teacher_factory = teacher_factory or (lambda: LocalModel(profile["teacher"], config.teacher))
+        if teacher_factory is None:
+            if config.teacher_backend == "vllm":
+                from .vllm_teacher import VLLMTeacher
+                teacher_factory = lambda: VLLMTeacher(store, config, profile["teacher"])
+            else:
+                teacher_factory = lambda: LocalModel(profile["teacher"], config.teacher)
     teacher = Teacher(store, config, teacher_factory)
     selected = STAGES if stage == "all" else (stage,)
     try:
+        if config.teacher_backend == "vllm" and stage == "all" and any(
+                store.get("stages/" + name) is None for name in ("review", "evidence", "groups", "cards")):
+            print("[local-bank] checking local vLLM teacher identity and version", flush=True)
+            teacher.prepare()  # Fail before expensive rollout collection if the service is misconfigured.
         for name in selected:
             print(f"[local-bank] stage={name}", flush=True)
             if name in {"compile", "evaluate"}:
-                teacher.close()  # Never keep the 32B teacher resident beside the reasoner.
+                teacher.close()  # Release an in-process teacher; vLLM remains operator-owned.
             if name == "split":
                 run_split(store, config, profile)
             elif name == "rollouts":
+                if reuse_from is not None:
+                    from .reuse import reuse_rollouts
+                    reuse_rollouts(store, config, profile, reuse_from)
                 run_rollouts(store, config, reasoner_factory)
             elif name == "review":
                 run_review(store, teacher)
@@ -53,6 +65,7 @@ def run(store, config, profile, *, stage="all", reasoner_factory=None, teacher_f
             "status": "complete" if compiled["bank_count"] else "complete_without_primary_banks",
             "split_counts": store.require("split")["counts"],
             "rollouts": {k: v for k, v in store.require("stages/rollouts").items() if k != "keys"},
+            "reused_rollout_count": (store.get("imports/rollouts") or {}).get("rollout_count", 0),
             "review_outcomes": store.require("stages/review")["outcomes"],
             "evidence_counts": store.require("stages/evidence")["counts"],
             "candidate_bank_count": cards["candidate_count"], "tier_counts": cards["tier_counts"],

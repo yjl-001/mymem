@@ -25,5 +25,10 @@
   "teacher_max_new_tokens": 8192,
   "group_batch_size": 12,
   "candidate_batch_size": 16,
-  "retrieval_key": "problem_structure"
+  "retrieval_key": "problem_structure",
+  "rollout_batch_size": 32,
+  "teacher_backend": "vllm",
+  "teacher_base_url": "http://127.0.0.1:8000/v1",
+  "teacher_concurrency": 16,
+  "teacher_timeout_seconds": 600
 }

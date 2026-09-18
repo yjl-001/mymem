@@ -14,7 +14,7 @@ def audit_complete(store, config, *, check_summary=True):
         store.require("split" if name == "split" else "stages/" + name)
     # Check every receipt, including rejected outputs, not only accepted stage manifests.
     checked = 0
-    for folder in ("stages", "rollouts", "reviews", "evidence", "teacher", "cards", "retrieval", "valid_choices", "valid_results"):
+    for folder in ("stages", "rollouts", "reviews", "evidence", "teacher", "cards", "retrieval", "valid_choices", "valid_results", "imports"):
         for path in sorted((store.root / folder).rglob("*.json")):
             store.require(str(path.relative_to(store.root))[:-5])
             checked += 1

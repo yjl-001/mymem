@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import Counter
 from .artifacts import digest
 from .schemas import validate_review
+from .parallel import ordered_map, teacher_workers
 
 
 def classify(generation, verifier, review):
@@ -42,7 +43,7 @@ def run_review(store, teacher):
     samples = {r["sample_id"]: r for r in split["splits"]["train"]}
     index = store.require("stages/rollouts")
     keys, counts = [], Counter()
-    for i, rollout_key in enumerate(index["keys"]):
+    def process(rollout_key):
         rollout = store.require(rollout_key)
         row = samples[rollout["sample_id"]]
         inputs = {"rollout": rollout, "sample": row}
@@ -56,6 +57,9 @@ def run_review(store, teacher):
                     "answer_verifier": rollout["verifier"]}, validate_review)
             result = store.put(key, {"rollout_key": rollout_key, "sample_id": row["sample_id"],
                 **classify(rollout["generation"], rollout["verifier"], audit), "teacher_review": audit}, inputs)
+        return key, result
+
+    for i, (key, result) in enumerate(ordered_map(process, index["keys"], teacher_workers(teacher))):
         keys.append(key)
         counts[result["outcome"]] += 1
         print(f"[local-bank] review={i + 1}/{len(index['keys'])} outcome={result['outcome']}", flush=True)

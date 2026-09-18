@@ -111,3 +111,83 @@ class LocalModel:
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def generate_batch(self, requests, *, max_new_tokens, temperature=.8, top_p=.95, top_k=0,
+                       stop_on_box=True):
+        """Left-padded HF batch with independent RNG and per-row natural stops.
+
+        Each request contains prompt, seed and sampling. Seeds survive resume/reordering;
+        floating-point differences across batch shapes can still change trajectories.
+        Sampling is performed in a logits processor, then HF selects its unique winner.
+        This permits greedy and stochastic rows in one cached forward pass.
+        """
+        import torch
+        from transformers import (GenerationConfig, LogitsProcessor, LogitsProcessorList,
+                                  StoppingCriteria, StoppingCriteriaList)
+        from memgen.model.v4_oracle import _complete_boxed_answer_seen
+        if not requests:
+            return []
+        encoded = [self.tokenizer.encode(r["prompt"], add_special_tokens=False) for r in requests]
+        width = max(map(len, encoded))
+        if any(not ids for ids in encoded) or width + max_new_tokens > self.context_limit:
+            raise ValueError(f"Context overflow ({width} + {max_new_tokens} > {self.context_limit}); no truncation allowed")
+        pad, eos = self.tokenizer.pad_token_id, self.tokenizer.eos_token_id
+        x = torch.tensor([[pad] * (width - len(ids)) + ids for ids in encoded], device=self.device)
+        mask = torch.tensor([[0] * (width - len(ids)) + [1] * len(ids) for ids in encoded], device=self.device)
+        generators = [torch.Generator(device=self.device).manual_seed(r["seed"]) for r in requests]
+        lengths, reasons = [None] * len(requests), [None] * len(requests)
+        tokenizer = self.tokenizer
+
+        class PerRowSampling(LogitsProcessor):
+            def __call__(self, input_ids, scores):
+                winners = scores.argmax(dim=-1)
+                stochastic = [i for i, r in enumerate(requests) if r["sampling"] and lengths[i] is None]
+                if stochastic:
+                    logits = scores[stochastic].float() / temperature
+                    if top_k > 0:
+                        cutoff = logits.topk(min(top_k, logits.shape[-1]), dim=-1).values[:, -1:]
+                        logits.masked_fill_(logits < cutoff, -torch.inf)
+                    if top_p < 1.:
+                        sorted_logits, indices = logits.sort(descending=True, dim=-1)
+                        remove = sorted_logits.softmax(-1).cumsum(-1) > top_p
+                        remove[:, 1:] = remove[:, :-1].clone()
+                        remove[:, 0] = False
+                        logits.masked_fill_(torch.zeros_like(remove).scatter(1, indices, remove), -torch.inf)
+                    probabilities = logits.softmax(-1)
+                    for j, i in enumerate(stochastic):
+                        winners[i] = torch.multinomial(probabilities[j], 1, generator=generators[i])[0]
+                forced = torch.full_like(scores, -torch.inf)
+                return forced.scatter(1, winners[:, None], 0.)
+
+        class PerRowStop(StoppingCriteria):
+            def __call__(self, input_ids, scores, **kwargs):
+                tokens = input_ids[:, width:].tolist()
+                for i, row in enumerate(tokens):
+                    if lengths[i] is not None:
+                        continue
+                    if row[-1] == eos:
+                        reasons[i] = "eos"
+                    elif stop_on_box and _complete_boxed_answer_seen(tokenizer.decode(row, skip_special_tokens=True)):
+                        reasons[i] = "completed_boxed_answer"
+                    elif len(row) == max_new_tokens:
+                        reasons[i] = "length"
+                    if reasons[i] is not None:
+                        lengths[i] = len(row)
+                return torch.tensor([n is not None for n in lengths], device=input_ids.device)
+
+        generation = GenerationConfig(do_sample=False, max_new_tokens=max_new_tokens,
+            num_beams=1, repetition_penalty=1., use_cache=True, eos_token_id=eos, pad_token_id=pad)
+        with torch.inference_mode():
+            out = self.model.generate(input_ids=x, attention_mask=mask, generation_config=generation,
+                logits_processor=LogitsProcessorList([PerRowSampling()]),
+                stopping_criteria=StoppingCriteriaList([PerRowStop()]))
+        results = []
+        for i, request in enumerate(requests):
+            if lengths[i] is None:
+                raise RuntimeError("Unaccounted batch termination")
+            tokens = out[i, width:width + lengths[i]].tolist()
+            results.append({"text": tokenizer.decode(tokens, skip_special_tokens=True).strip(),
+                "token_ids": tokens, "token_count": len(tokens), "prompt_token_count": len(encoded[i]),
+                "stop_reason": reasons[i], "truncated": reasons[i] == "length", "seed": request["seed"],
+                "generation_backend": "transformers_per_row_rng_batch_v1"})
+        return results

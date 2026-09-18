@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import defaultdict, Counter
 from .artifacts import digest
 from .schemas import validate_evidence
+from .parallel import ordered_map, teacher_workers
 
 
 def choose_pair(reviews, store):
@@ -23,12 +24,11 @@ def run_experiences(store, teacher):
         value = store.require(key)
         grouped[value["sample_id"]].append(value)
     accepted, deferred, counts = [], [], Counter()
-    for i, (sid, items) in enumerate(sorted(grouped.items())):
+    def process(item):
+        sid, items = item
         pair = choose_pair(items, store)
         if pair is None:
-            counts["no_reviewed_contrast"] += 1
-            deferred.append({"sample_id": sid, "reason": "no_reviewed_success_failure_pair"})
-            continue
+            return sid, None, None
         success, failure = pair
         good, bad = (store.require(r["rollout_key"]) for r in pair)
         sample = samples[sid]
@@ -44,6 +44,13 @@ def run_experiences(store, teacher):
                 "source_split": "train", "success_rollout": success["rollout_key"],
                 "failure_rollout": failure["rollout_key"], "failure_types": failure["failure_types"],
                 "signature": result}, payload)
+        return sid, key, record
+
+    for i, (sid, key, record) in enumerate(ordered_map(process, sorted(grouped.items()), teacher_workers(teacher))):
+        if record is None:
+            counts["no_reviewed_contrast"] += 1
+            deferred.append({"sample_id": sid, "reason": "no_reviewed_success_failure_pair"})
+            continue
         if record["signature"]["transferable"]:
             accepted.append(key)
             counts["accepted"] += 1

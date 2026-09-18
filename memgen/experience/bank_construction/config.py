@@ -30,6 +30,11 @@ class ConstructionConfig:
     top_p: float = 0.95
     top_k: int = 0
     max_new_tokens: int = 1024
+    rollout_batch_size: int = 32
+    teacher_backend: str = "transformers"
+    teacher_base_url: str = "http://127.0.0.1:8000/v1"
+    teacher_concurrency: int = 16
+    teacher_timeout_seconds: int = 600
     teacher_max_new_tokens: int = 8192
     teacher_temperature: float = 0.7
     teacher_top_p: float = 0.8
@@ -51,9 +56,17 @@ class ConstructionConfig:
         for name in ("split_seed", "sampling_seed", "teacher_retries", "train_limit", "valid_limit"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
-        for name in ("teacher_max_new_tokens", "group_batch_size", "candidate_batch_size"):
+        for name in ("teacher_max_new_tokens", "group_batch_size", "candidate_batch_size",
+                     "rollout_batch_size", "teacher_concurrency", "teacher_timeout_seconds"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.teacher_backend not in {"transformers", "vllm"}:
+            raise ValueError("teacher_backend must be transformers or vllm")
+        from urllib.parse import urlsplit
+        url = urlsplit(self.teacher_base_url)
+        if (url.scheme != "http" or url.hostname not in {"localhost", "127.0.0.1", "::1"}
+                or url.path.rstrip("/") != "/v1" or url.username or url.password or url.query or url.fragment):
+            raise ValueError("Teacher endpoint must be a local HTTP /v1 endpoint (use an SSH tunnel for a remote server)")
         if not 0 < self.teacher_temperature <= 2 or not 0 < self.teacher_top_p <= 1 or self.teacher_top_k < 0:
             raise ValueError("Invalid teacher generation settings")
         for model in (self.reasoner, self.teacher):

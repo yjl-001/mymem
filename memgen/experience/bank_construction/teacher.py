@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 from .artifacts import digest
 from .prompts import VERSION, messages
@@ -31,8 +32,21 @@ class Teacher:
     def __init__(self, store, config, model_factory):
         self.store, self.config, self.model_factory = store, config, model_factory
         self.model = None
+        self._model_lock = threading.Lock()
+        self._request_locks = [threading.Lock() for _ in range(256)]
+
+    def prepare(self):
+        with self._model_lock:
+            if self.model is None:
+                self.model = self.model_factory()
 
     def ask(self, task, payload, validate):
+        # Identical trajectories can lead to identical teacher requests. Serialize
+        # their immutable receipts, while independent requests run concurrently.
+        with self._request_locks[int(digest([task, payload])[:8], 16) % 256]:
+            return self._ask(task, payload, validate)
+
+    def _ask(self, task, payload, validate):
         request = {"prompt_version": VERSION, "task": task, "messages": messages(task, payload)}
         key = "teacher/" + task + "/" + digest(request)
         self.store.put(key + "-request", request, request)
@@ -53,14 +67,17 @@ class Teacher:
             if generated is None:
                 if new_attempts >= self.config.teacher_retries + 1:
                     break
-                if self.model is None:
-                    self.model = self.model_factory()
-                prompt = self.model.tokenizer.apply_chat_template(conversation, tokenize=False,
-                                add_generation_prompt=True, enable_thinking=False)
-                generated = self.model.generate(prompt, seed=int(digest(inputs)[:8], 16),
-                    max_new_tokens=self.config.teacher_max_new_tokens, sampling=True,
-                    temperature=self.config.teacher_temperature, top_p=self.config.teacher_top_p,
-                    top_k=self.config.teacher_top_k)
+                self.prepare()
+                seed = int(digest(inputs)[:8], 16)
+                if self.config.teacher_backend == "vllm":
+                    generated = self.model.chat(conversation, seed=seed)
+                else:
+                    prompt = self.model.tokenizer.apply_chat_template(conversation, tokenize=False,
+                                    add_generation_prompt=True, enable_thinking=False)
+                    generated = self.model.generate(prompt, seed=seed,
+                        max_new_tokens=self.config.teacher_max_new_tokens, sampling=True,
+                        temperature=self.config.teacher_temperature, top_p=self.config.teacher_top_p,
+                        top_k=self.config.teacher_top_k)
                 self.store.put(raw_key, generated, inputs)
                 new_attempts += 1
             try:
