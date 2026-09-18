@@ -1,0 +1,5 @@
+# Install inside the existing CUDA PyTorch environment. Do not replace its torch wheel.
+transformers==4.57.6
+datasets==4.0.0
+accelerate==1.10.1
+safetensors==0.7.0

@@ -46,8 +46,10 @@ dataset:
   mode: sft  # options: ["sft", "grpo"], should manually keep align with the training method in `run` configs
   sft:
     val_ratio: 0.1
+    split_seed: 42
   grpo: 
     val_ratio: 0.1
+    split_seed: 42
 
 # training/evaluation configs
 run: 

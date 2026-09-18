@@ -4,6 +4,7 @@ from typing import Dict
 from data.base_builder import BaseBuilder
 from data.gsm8k.env import GSM8KEnv
 from data.gsm8k.prompt import GSM8K_PROMPT_CONTRACT
+from data.gsm8k.splits import split_gsm8k
 
 class GSM8KBuilder(BaseBuilder):   # Env
     
@@ -14,10 +15,10 @@ class GSM8KBuilder(BaseBuilder):   # Env
 
         # download data
         raw_dataset = load_dataset("gsm8k", "main")
-        raw_train_dataset, raw_test_dataset = raw_dataset['train'], raw_dataset['test']
-        val_size = int(len(raw_train_dataset) * self.config.get("val_ratio"))
-        split = raw_train_dataset.train_test_split(test_size=val_size, shuffle=True)
-        raw_train_dataset, raw_valid_dataset = split["train"], split["test"]
+        split = split_gsm8k(raw_dataset, val_ratio=self.config.get("val_ratio"),
+                           seed=self.config.get("split_seed", 42))
+        raw_train_dataset, raw_valid_dataset, raw_test_dataset = (
+            split["train"], split["valid"], split["test"])
         
         # preprocess
         num_workers = 32

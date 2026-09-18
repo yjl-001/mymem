@@ -1,0 +1,29 @@
+{
+  "reasoner": {
+    "source": "Qwen/Qwen2.5-1.5B-Instruct",
+    "revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+    "device": "cuda:0",
+    "dtype": "bfloat16",
+    "attention_backend": "sdpa"
+  },
+  "teacher": {
+    "source": "Qwen/Qwen3-32B",
+    "revision": "main",
+    "device": "auto",
+    "dtype": "bfloat16",
+    "attention_backend": "sdpa"
+  },
+  "val_ratio": 0.1,
+  "split_seed": 42,
+  "sampling_seed": 42,
+  "greedy_rollouts": 1,
+  "sampled_rollouts": 7,
+  "temperature": 0.8,
+  "top_p": 0.95,
+  "top_k": 0,
+  "max_new_tokens": 1024,
+  "teacher_max_new_tokens": 8192,
+  "group_batch_size": 12,
+  "candidate_batch_size": 16,
+  "retrieval_key": "problem_structure"
+}
