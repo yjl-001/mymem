@@ -99,6 +99,23 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/experiments/gsm8k/run_local_memory_bank.sh \
 这是节约采样成本的显式复用，不宣称生成算法逐 token 等价。需要统一后端全量重采时不传此参数。
 新 run 中断后使用原批量参数加 `--resume`；导入完成后不再需要 `--reuse-rollouts-from`。
 
+### 恢复 partition 的长 ID 复制失败
+
+早期生产 run 可能在 `groups` 阶段反复报告 `Evidence coverage must be exact`。这表示教师没有精确复制
+当前批次的完整 evidence 哈希，并不表示 evidence 内容损坏。保持同一个 vLLM 服务和原代码 checkout，运行：
+
+```bash
+python scripts/repair_local_bank_partitions.py \
+  --output-dir output/experiments/banks/gsm8k-local-qwen32b-batched-r1
+```
+
+工具扫描所有尚未接受的 partition 请求，将批内 ID 临时映射为 `E00...E11`，让教师重新执行相同的语义分组，
+校验短别名恰好覆盖一次后机械映射回完整 ID。它会保存替代提示、别名映射、原始响应和接受方式，随后自动
+继续 grouping；若后续发现新的坏请求，会修复并从缓存重建分组。它不修改旧 evidence、已有教师回执、
+`profile.json` 或核心实现指纹。完成后用正常构造命令加 `--resume` 继续 cards、compile 和 evaluate。
+如果短别名在有界重试后仍无法满足覆盖合同，工具会为该批次保存可审计的单例分组；这不会丢失、重复或
+错误合并 evidence，后续正常的跨批次 match、merge 和全成员核验仍可将语义兼容的单例重新归并。
+
 ## 模块与数据合同
 
 | 模块 | 职责 |
