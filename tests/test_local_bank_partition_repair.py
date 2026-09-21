@@ -11,8 +11,9 @@ from memgen.experience.bank_construction.prompts import VERSION, messages
 from memgen.experience.bank_construction.schemas import validate_partition
 from memgen.experience.bank_construction.teacher import Teacher
 from scripts.repair_local_bank_partitions import (
-    alias_request, coverage_error, mapped_answer, repair_one, unresolved_requests,
+    alias_request, coverage_error, mapped_answer, repair_one, run_scalable_grouping, unresolved_requests,
 )
+from tests.test_local_bank_construction import FixtureTeacher, signature
 
 
 class Adapter:
@@ -86,6 +87,30 @@ class PartitionRepairTests(unittest.TestCase):
                          [[value] for value in self.ids])
         fallback = self.store.require(accepted["raw_key"])
         self.assertEqual(fallback["failed_attempt_count"], 1)
+
+    def test_scalable_grouping_uses_candidates_but_teacher_decides_merge(self):
+        config = replace(ConstructionConfig(), group_batch_size=2, candidate_batch_size=1)
+        keys = []
+        for index in range(4):
+            key = f"evidence/e{index}"
+            self.store.put(key, {"evidence_id": f"e{index}", "sample_id": f"s{index}",
+                "signature": signature()}, {"index": index})
+            keys.append(key)
+        self.store.put("stages/evidence", {"keys": keys, "counts": {"accepted": 4}}, {"fixture": True})
+        teacher = FixtureTeacher()
+        result = run_scalable_grouping(self.store, teacher, config, lambda text: [1., 0.],
+                                       {"source": "fixture", "revision": "fixed"},
+                                       candidate_top_k=2, consolidation_rounds=2)
+        self.assertEqual(result["evidence_count"], 4)
+        self.assertEqual(len(result["groups"]), 1)
+        self.assertEqual(set(result["groups"][0]["members"]), set(keys_value.split("/")[-1] for keys_value in keys))
+        self.assertFalse(result["grouping_strategy"]["candidate_generation_is_final_decision"])
+        self.assertTrue(any(task == "match" for task, _ in teacher.calls))
+        self.assertTrue(any(task == "membership" for task, _ in teacher.calls))
+        cached = run_scalable_grouping(self.store, self.fail, config, self.fail,
+                                       {"source": "fixture", "revision": "fixed"},
+                                       candidate_top_k=2, consolidation_rounds=2)
+        self.assertEqual(cached, result)
 
 
 if __name__ == "__main__":

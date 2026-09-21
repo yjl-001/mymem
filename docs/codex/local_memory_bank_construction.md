@@ -109,10 +109,16 @@ python scripts/repair_local_bank_partitions.py \
   --output-dir output/experiments/banks/gsm8k-local-qwen32b-batched-r1
 ```
 
-工具扫描所有尚未接受的 partition 请求，将批内 ID 临时映射为 `E00...E11`，让教师重新执行相同的语义分组，
-校验短别名恰好覆盖一次后机械映射回完整 ID。它会保存替代提示、别名映射、原始响应和接受方式，随后自动
-继续 grouping；若后续发现新的坏请求，会修复并从缓存重建分组。它不修改旧 evidence、已有教师回执、
-`profile.json` 或核心实现指纹。完成后用正常构造命令加 `--resume` 继续 cards、compile 和 evaluate。
+工具扫描已有失败回执，并用新的可扩展分组器从完整 evidence stage 继续。所有需要教师返回 ID 的请求均使用
+`E00...E11` 或 `C00...C15` 短别名；校验别名后再机械映射回完整 ID。初始 partition 并发执行并逐批保存。
+旧流程已经接受或由上一版修复工具接受的合法 partition 会直接复用，不重复调用教师。
+局部组不再扫描全池：冻结 reasoner 只生成候选向量，每个 incoming group 默认召回最相似的 64 个候选；
+候选分窗口交给 Qwen3 做 match，实际合并仍必须通过 Qwen3 merge 和全部原始 evidence 的 membership 核验。
+向量相似度不直接形成 Bank。每个增量步骤单独落盘，恢复时不会从头重新调用教师。
+
+可通过 `--candidate-top-k 64 --consolidation-rounds 3` 显式设置召回宽度和归并轮数。增加 top-k 提高召回覆盖，
+也会增加教师请求。工具不修改旧 evidence、已有教师回执、`profile.json` 或核心实现指纹。完成后用正常构造
+命令加 `--resume` 继续 cards、compile 和 evaluate。
 如果短别名在有界重试后仍无法满足覆盖合同，工具会为该批次保存可审计的单例分组；这不会丢失、重复或
 错误合并 evidence，后续正常的跨批次 match、merge 和全成员核验仍可将语义兼容的单例重新归并。
 
