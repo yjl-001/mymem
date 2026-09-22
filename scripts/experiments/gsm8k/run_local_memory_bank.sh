@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One complete run, with an explicit config and immutable resumable output.
+# Two-phase local Bank entry point; pass --phase rollouts or --phase bank.
 set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"

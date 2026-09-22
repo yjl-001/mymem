@@ -10,7 +10,7 @@ class CacheMigrationTests(unittest.TestCase):
                                                  if value is not None}}
         current = {"unchanged.py": "same", **TARGET}
         result = verify_implementation_migration(recorded, current)
-        self.assertEqual(result["mode"], "transformers-v5-cache-api-compatibility")
+        self.assertEqual(result["mode"], "pre-two-phase-production-compatibility")
         self.assertEqual(set(result["changes"]), set(BASELINE))
 
     def test_rejects_unrelated_or_unknown_baseline_drift(self):

@@ -16,7 +16,7 @@ from memgen.experience.system import ExperienceMemorySystemProfile
 from data.gsm8k.prompt import GSM8K_PROMPT_CONTRACT
 from memgen.chat_templates import CONVERSATION_TEMPLATE
 
-from test_e1_experience import assignment, memory_choice
+from tests.test_e1_experience import assignment, memory_choice
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

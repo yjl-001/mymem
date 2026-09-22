@@ -6,8 +6,11 @@ from dataclasses import replace
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from memgen.experience.bank_construction.artifacts import Store, digest, atomic_json, read_json, run_lock
 from memgen.experience.bank_construction.config import ConstructionConfig
@@ -20,7 +23,9 @@ from memgen.experience.bank_construction.cards import run_cards
 from memgen.experience.bank_construction.teacher import Teacher, parse_object
 from memgen.experience.bank_construction.schemas import validate_review, validate_partition
 from memgen.experience.bank_construction.compilation import select_bank
-from memgen.experience.bank_construction.evaluation import metrics
+from memgen.experience.bank_construction.evaluation import metrics, run_evaluate
+from memgen.experience.bank_construction.pipeline import PHASES, run
+from memgen.experience.bank_construction.audit import audit_rollouts
 
 
 class Rows(list):
@@ -193,6 +198,22 @@ class ConstructionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "changed"):
             make_profile(self.config, profile)
 
+    def test_rollout_profile_never_resolves_teacher_and_has_narrow_code_scope(self):
+        from memgen.experience.bank_construction.sources import make_profile
+        config = replace(self.config, dataset_revision="d" * 40)
+        calls = []
+        def resolve(settings):
+            calls.append(settings.source)
+            return {"source": settings.source, "revision": "a" * 40}
+        with patch("memgen.experience.bank_construction.sources.resolve_model", side_effect=resolve):
+            profile = make_profile(config, scope="rollouts")
+        self.assertEqual(calls, [config.reasoner.source])
+        self.assertIsNone(profile["teacher"])
+        self.assertEqual(profile["implementation_scope"], "rollouts")
+        self.assertNotIn("memgen/experience/bank_construction/cards.py", profile["implementation"])
+        with self.assertRaisesRegex(ValueError, "separate output directory"):
+            make_profile(config, profile, scope="bank")
+
     def test_partition_rejects_duplicate_and_fabricated_members(self):
         group = {"members": ["a", "a"], "method": "x", "applies_when": "y", "exclusions": [], "rationale": "z"}
         with self.assertRaises(ValueError):
@@ -208,7 +229,8 @@ class ConstructionTests(unittest.TestCase):
             index = run_rollouts(self.store, self.config, lambda: model)
             run_review(self.store, teacher)
             evidence = run_experiences(self.store, teacher)
-            groups = run_grouping(self.store, teacher, self.config)
+            groups = run_grouping(self.store, teacher, self.config, lambda text: [1., 0.],
+                                  {"source": "fixture", "revision": "fixed"})
             cards = run_cards(self.store, teacher, self.config)
         self.assertEqual(index["rollout_count"], 32)
         self.assertEqual(sum(not c["sampling"] for c in model.calls), 4)
@@ -219,13 +241,18 @@ class ConstructionTests(unittest.TestCase):
         self.assertEqual(groups["groups"][0]["distinct_sample_count"], 4)
         self.assertEqual(cards["tier_counts"], {"primary": 1})
         self.assertTrue(any(task == "match" for task, _ in teacher.calls))
+        for task, payload in teacher.calls:
+            if task in {"partition", "membership", "card", "card_review"}:
+                self.assertTrue(all(value["evidence_id"].startswith("E")
+                                    for value in payload["evidence"]))
         def unexpected():
             raise AssertionError("Resume must not load a model")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(index, run_rollouts(self.store, self.config, unexpected))
             run_review(self.store, teacher)
             run_experiences(self.store, teacher)
-            run_grouping(self.store, teacher, self.config)
+            run_grouping(self.store, teacher, self.config, lambda text: [1., 0.],
+                         {"source": "fixture", "revision": "fixed"})
             run_cards(self.store, teacher, self.config)
         forbidden = [r["question"] for name in ("valid", "test") for r in self.split["splits"][name]]
         for question in forbidden:
@@ -294,7 +321,8 @@ class ConstructionTests(unittest.TestCase):
                         return result
                     return super().ask(task, payload, validate)
             teacher = RefuseTeacher()
-            groups = run_grouping(self.store, teacher, self.config)
+            groups = run_grouping(self.store, teacher, self.config, lambda text: [1., 0.],
+                                  {"source": "fixture", "revision": "fixed"})
         self.assertEqual(len(groups["groups"]), 4)
         self.assertTrue(any(task == "membership" for task, _ in teacher.calls))
 
@@ -320,6 +348,77 @@ class ConstructionTests(unittest.TestCase):
         self.assertEqual(result["generated_tokens"]["total"], 5)
         self.assertEqual(select_bank([1., 0.], [{"bank_id": "b", "key_vector": [1., 0.]},
                                                {"bank_id": "a", "key_vector": [1., 0.]}]), ("a", 1.))
+
+    def test_selector_only_evaluation_generates_only_chosen_bank(self):
+        self.store.put("stages/compile", {"fixture": True}, {})
+        records = [{"bank_id": "bank-a", "descriptor": "A"},
+                   {"bank_id": "bank-b", "descriptor": "B"}]
+        bundle = {"entries": [{"bank_id": "bank-a", "key_vector": [1., 0.]},
+                              {"bank_id": "bank-b", "key_vector": [0., 1.]}]}
+        class Tokenizer:
+            def decode(self, token_ids, **kwargs):
+                return "\\boxed{2}"
+        model = SimpleNamespace(runtime=SimpleNamespace(tokenizer=Tokenizer()), close=lambda: None)
+        selector = SimpleNamespace(
+            encode_text=lambda runtime, text: [1., 0.],
+            generate=lambda runtime, question, descriptor, memory: (
+                None, {"continuation_token_ids": [1, 2], "stop_reason": "eos"}))
+        prefix = SimpleNamespace(prefix_bank=lambda *args, **kwargs: "memory")
+        with patch("memgen.experience.bank_construction.evaluation.validate_compiled", return_value=bundle), \
+             patch("memgen.experience.bank_construction.evaluation.primary_records", return_value=records), \
+             patch.dict(sys.modules, {"memgen.model.v4_3_question_selector": selector,
+                                      "memgen.model.v4_3_prefix_equivalence": prefix}), \
+             redirect_stdout(io.StringIO()):
+            report = run_evaluate(self.store, self.config, lambda: model)
+        self.assertEqual(report["evaluation_mode"], "selector_only")
+        self.assertEqual(report["generation_count"], 4)
+        self.assertFalse(report["per_bank_complete"])
+        self.assertEqual(report["per_bank"], {})
+        self.assertEqual(len(list((self.store.root / "valid_results").rglob("*.json"))), 4)
+        self.assertFalse(any("bank-b" in path.name for path in (self.store.root / "valid_results").rglob("*.json")))
+
+    def test_rollout_phase_never_constructs_or_connects_teacher(self):
+        self.assertEqual(PHASES["rollouts"], ("split", "rollouts"))
+        model = FixtureReasoner()
+        with patch("memgen.experience.bank_construction.pipeline.run_split"), redirect_stdout(io.StringIO()):
+            run(self.store, self.config,
+                {"implementation_scope": "rollouts", "reasoner": {}, "teacher": None}, phase="rollouts",
+                reasoner_factory=lambda: model,
+                teacher_factory=lambda: self.fail("Rollout phase must not construct a teacher"))
+        self.assertEqual(self.store.require("stages/rollouts")["rollout_count"], 32)
+        summary = read_json(self.store.root / "rollout_summary.json")
+        self.assertTrue(summary["complete"])
+        self.assertFalse(summary["teacher_inference_used"])
+        self.assertIsNone(self.store.get("stages/review"))
+        self.assertEqual(audit_rollouts(self.store, self.config)["rollout_count"], 32)
+
+    def test_bank_phase_starts_from_completed_rollouts_and_closes_teacher_before_finalize(self):
+        with redirect_stdout(io.StringIO()):
+            run_rollouts(self.store, self.config, FixtureReasoner)
+        teacher = FixtureTeacher()
+        teacher.closed = False
+        teacher.close = lambda: setattr(teacher, "closed", True)
+        class EncoderModel:
+            runtime = object()
+            closed = False
+            def close(self):
+                self.closed = True
+        encoder = EncoderModel()
+        profile = {"reasoner": {"source": "fixture", "revision": "fixed"}, "teacher": {}}
+        selector = SimpleNamespace(encode_text=lambda runtime, text: [1., 0.])
+        with patch("memgen.experience.bank_construction.teacher.Teacher", return_value=teacher), \
+             patch.dict(sys.modules, {"memgen.model.v4_3_question_selector": selector}), \
+             patch("memgen.experience.bank_construction.pipeline.run_split"), \
+             patch("memgen.experience.bank_construction.pipeline.run_compile"), \
+             patch("memgen.experience.bank_construction.pipeline.run_evaluate"), \
+             patch("memgen.experience.bank_construction.pipeline.write_complete_summary"), \
+             redirect_stdout(io.StringIO()):
+            run(self.store, self.config, profile, phase="bank",
+                reasoner_factory=lambda: encoder, teacher_factory=lambda: self.fail("wrapped teacher factory unused"))
+        self.assertTrue(teacher.closed)
+        self.assertTrue(encoder.closed)
+        self.assertIsNotNone(self.store.get("stages/cards"))
+        self.assertTrue(any(task == "review" for task, _ in teacher.calls))
 
 
 if __name__ == "__main__":

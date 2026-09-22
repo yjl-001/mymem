@@ -1,10 +1,9 @@
 """Explicit, provenance-preserving migration of completed rollout checkpoints only."""
 from pathlib import Path
 
-from data.utils.math_utils import diagnose_gsm8k_completion
 from .artifacts import Store, digest, read_json, run_lock
 from .dataset import selected_rows
-from .rollouts import rollout_plan
+from .rollouts import rollout_plan, validate_rollout_record
 
 CONTRACT_FIELDS = ("dataset", "val_ratio", "split_seed", "sampling_seed", "greedy_rollouts",
                    "sampled_rollouts", "temperature", "top_p", "top_k", "max_new_tokens")
@@ -32,29 +31,28 @@ def reuse_rollouts(store, config, profile, source_dir):
         split = store.require("split")
         if source.require("split") != split:
             raise ValueError("Cannot reuse rollouts: actual dataset split differs")
+        planned = [(row, plan, "rollouts/" + plan["rollout_id"])
+                   for row in selected_rows(split, "train", config)
+                   for plan in rollout_plan(row, config)]
+        source_index = source.require("stages/rollouts")
+        expected_keys = [key for _, _, key in planned]
+        if (source_index.get("keys") != expected_keys
+                or source_index.get("rollout_count") != len(expected_keys)):
+            raise ValueError("Cannot reuse rollouts: source phase is incomplete")
+        # Authenticate every source record before writing anything into the new run.
+        for row, plan, key in planned:
+            value = source.get(key, {"sample": row, "plan": plan})
+            if value is None:
+                raise ValueError("Cannot reuse rollouts: source phase is incomplete")
+            validate_rollout_record(value, row, plan, config)
         manifest = []
-        for row in selected_rows(split, "train", config):
-            for plan in rollout_plan(row, config):
-                key = "rollouts/" + plan["rollout_id"]
-                inputs = {"sample": row, "plan": plan}
-                value = source.get(key, inputs)
-                if value is None:
-                    continue
-                if any(value.get(k) != v for k, v in plan.items()):
-                    raise ValueError("Reused rollout plan mismatch")
-                generation = value["generation"]
-                if (generation["seed"] != plan["seed"] or generation["token_count"] != len(generation["token_ids"])
-                        or not 0 < generation["token_count"] <= config.max_new_tokens
-                        or generation["stop_reason"] not in {"length", "eos", "completed_boxed_answer"}
-                        or generation["truncated"] != (generation["stop_reason"] == "length")
-                        or (generation["truncated"] and generation["token_count"] != config.max_new_tokens)):
-                    raise ValueError("Reused rollout generation contract mismatch")
-                if value["verifier"] != diagnose_gsm8k_completion(generation["text"], row["scoring_solution"]):
-                    raise ValueError("Reused rollout verifier mismatch")
-                provenance = {"source_profile_sha256": source.profile_hash, "source_key": key,
-                              "source_payload_sha256": digest(value)}
-                store.put(key, {**value, "reused_from": provenance}, inputs)
-                manifest.append(provenance)
+        for row, plan, key in planned:
+            inputs = {"sample": row, "plan": plan}
+            value = source.require(key)
+            provenance = {"source_profile_sha256": source.profile_hash, "source_key": key,
+                          "source_payload_sha256": digest(value)}
+            store.put(key, {**value, "reused_from": provenance}, inputs)
+            manifest.append(provenance)
         store.put("imports/source_profile", source_profile, {"source_profile_sha256": source.profile_hash})
         store.put("imports/rollouts", {"source_dir": str(source_dir), "rollout_count": len(manifest),
             "records": manifest, "mixed_generation_backends": True}, {"source_profile_sha256": source.profile_hash})

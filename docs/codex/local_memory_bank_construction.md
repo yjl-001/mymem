@@ -6,6 +6,38 @@ rollout 仍由冻结的 Qwen2.5-1.5B reasoner 采集，现为批量推理，默�
 教师服务与 reasoner 职责分开；不会把 32B 教师的解题轨迹当作小模型的经验。
 不调用第三方推理 API。首次运行仍可能从 Hugging Face 下载公开数据、tokenizer 和权重。
 
+## 两阶段边界
+
+正常构造只使用两个公开阶段，并使用两个独立输出目录：
+
+1. `rollouts`：固定数据划分，在 train 的每道题上采集 1 条 greedy 与 7 条随机轨迹。该阶段不解析教师
+   revision、不启动教师客户端、不探测 vLLM 服务，也不产生任何教师请求。产物是可复用的完整 rollout 数据集。
+2. `bank`：认证并导入已完成的 rollout，依次执行过程审核、对照 evidence 提取、语义分组、Bank card 汇总与
+   复核、native prefix KV 编译，以及 valid 上的 selector Top-1 开发评估。教师只在审核、evidence、分组和
+   card 四个步骤存活；进入编译前会被释放。
+
+`split`、`review`、`evidence`、`groups`、`cards`、`compile`、`evaluate` 仍是内部检查点名称，可以用
+`--stage` 做故障恢复，但不是日常运行接口。两个阶段使用不同的 profile 和实现指纹，因此之后只改 Bank 构造、
+分组或提示词时，可以反复创建新的 Bank run 并复用同一份 rollout，而不重新跑基础模型。
+
+完整数据流如下：
+
+```text
+官方 GSM8K train ──固定划分──> construction train + valid
+                              │
+                              └─ rollouts: 每题 1 greedy + 7 sampled
+                                   │
+                                   └─ bank: 轨迹验证与教师过程审核
+                                        └─ 同题 success/failure 对照 evidence
+                                             └─ Qwen3 初分组 + embedding Top-K 候选
+                                                  └─ Qwen3 match/merge/membership
+                                                       └─ Qwen3 card + card review
+                                                            └─ primary card
+                                                                 ├─ selector key vector
+                                                                 └─ native prefix KV value
+                                                                      └─ valid: baseline + Top-1
+```
+
 ## 运行
 
 教师服务建议使用独立虚拟环境，让 vLLM 安装与其匹配的 torch/CUDA 依赖，不覆盖运行 native prefix KV 的原实验环境。
@@ -13,7 +45,21 @@ rollout 仍由冻结的 Qwen2.5-1.5B reasoner 采集，现为批量推理，默�
 多卡使用 [tensor parallelism](https://docs.vllm.ai/en/stable/serving/parallelism_scaling/)。
 实际 vLLM 版本会写入 `teacher/service.json`；后续同一 run 的新请求要求服务版本一致。
 
-终端 A，首次准备教师服务环境并启动（Linux CUDA 服务器）：
+第一阶段不需要启动教师。先在原 reasoner 实验环境中采集 rollout：
+
+```bash
+python -m pip install -r requirements-bank-construction.txt
+CUDA_VISIBLE_DEVICES=0 bash scripts/experiments/gsm8k/run_local_memory_bank.sh \
+  --phase rollouts \
+  --config configs/experiments/gsm8k/local_bank.json \
+  --output-dir output/experiments/banks/gsm8k-rollouts-r1 \
+  --rollout-batch-size 32
+```
+
+完成标志是 `rollout_summary.json` 中 `complete=true`、`question_count=6726`、
+`rollout_count=53808`、`teacher_inference_used=false`。中断后使用完全相同的命令加 `--resume`。
+
+第二阶段才准备教师服务。终端 A 首次创建独立服务环境并启动（Linux CUDA 服务器）：
 
 ```bash
 python3 -m venv .venv-vllm
@@ -34,14 +80,14 @@ PATH="$PWD/.venv-vllm/bin:$PATH" .venv-vllm/bin/python scripts/serve_local_bank_
 `--max-model-len` 默认 32768；请求超出上下文预算会报错，不自动裁切输入。
 `--print-only` 可打印实际部署命令而不启动服务（仍需解析 Hub revision）。
 
-终端 B，在原 reasoner 实验环境中运行：
+终端 B，在原 reasoner 实验环境中运行 Bank 阶段：
 
 ```bash
-python -m pip install -r requirements-bank-construction.txt
 CUDA_VISIBLE_DEVICES=0 bash scripts/experiments/gsm8k/run_local_memory_bank.sh \
+  --phase bank \
   --config configs/experiments/gsm8k/local_bank.json \
-  --output-dir output/experiments/banks/gsm8k-local-qwen32b-batched-r1 \
-  --rollout-batch-size 32 \
+  --output-dir output/experiments/banks/gsm8k-bank-qwen32b-r1 \
+  --rollout-source output/experiments/banks/gsm8k-rollouts-r1 \
   --teacher-concurrency 16
 ```
 
@@ -57,50 +103,57 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/experiments/gsm8k/run_local_memory_bank.sh \
 默认并发加速独立的过程审核与单题提取；依赖前一步输出的 Bank 归并与卡片迭代保持顺序。
 将配置 `teacher_backend` 设为 `transformers` 可使用原来的进程内教师路径，该路径保持串行。
 
-`all` 是默认模式：split → rollouts → review → evidence → groups → cards → compile → evaluate。
-最后一步只在 builder valid 上运行 baseline 和每个 primary Bank 的完整答案，不运行 test。
-运行规模是 train 的 8 条轨迹/题，加上 valid 的 `1 + primary Bank 数` 个解题分支/题；教师调用另计。
+`all` 仅为旧命令兼容保留，会在同一目录连续运行两个阶段。新的正式实验应使用上述两个目录，这样
+Bank 构造实现和教师提示词可以独立迭代。第二阶段会重新构造相同的 split 并逐项验证 rollout 来源；缺失任何
+轨迹时会终止，绝不会静默混入新生成的轨迹。
+
+最后一步只在 builder valid 上运行，不运行 test。默认 `selector_only` 先冻结每题 question-only Top-1，
+再运行一条 baseline 和被选中的一个 Bank，因此最多是 valid 的 2 倍解题分支。`--evaluation-mode exhaustive`
+保留完整的每题 × 每个 primary Bank 扫描，只用于昂贵的诊断实验。
 
 原命令加 `--resume` 可继续同一配置和代码的运行。每条轨迹、审核、教师请求、响应和 Bank 独立原子落盘。
 模型、提示词、配置或软件环境变更需要新输出目录；禁止把不同构造版本的数据静默混合。
-`--stage split|rollouts|review|evidence|groups|cards|compile|evaluate` 是运维恢复入口，不需要逐阶段手工运行。
+`--stage split|rollouts|review|evidence|groups|cards|compile|evaluate` 是高级运维恢复入口，不需要逐阶段手工运行。
 
 ```bash
 # 不下载、不加载模型的计划检查
-python scripts/build_local_memory_bank.py --output-dir /tmp/bank-plan --plan-only
+python scripts/build_local_memory_bank.py --output-dir /tmp/bank-plan --phase rollouts --plan-only
 # 已完成工件的完整性检查，不运行推理
 python scripts/build_local_memory_bank.py \
-  --output-dir output/experiments/banks/gsm8k-local-qwen32b-batched-r1 --validate-only
+  --output-dir output/experiments/banks/gsm8k-bank-qwen32b-r1 --validate-only
 ```
 
 配置中的模型 `source` 可以是完整的本地 safetensors 模型目录。远程 `main` 首次解析为精确 commit，续跑
 复用该 commit；本地模型按配置/tokenizer/权重文件 SHA 绑定。vLLM 启动器与客户端必须使用同一模型配置，
-`all` 在采集 rollout 前检查服务身份和版本，身份不匹配会提前拒绝。
+`bank` 在第一个教师任务前检查服务身份和版本，身份不匹配会提前拒绝。
 首次启动时保存输出的精确 revision；重启服务应保持这一 revision。
 已有 run 的原配置不要编辑，若需切换 revision 应创建新 run。
 不会自动量化或修改模型。
 
-## 已经采集的旧 rollout
+## 已经采集的 rollout
 
 旧版 run 的代码/config 指纹不同，不能直接对旧目录加 `--resume`。先停止旧采集任务（写锁会拒绝复制仍在写入的 run），
 使用新目录显式导入已经完整落盘的轨迹：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash scripts/experiments/gsm8k/run_local_memory_bank.sh \
+  --phase bank \
   --config configs/experiments/gsm8k/local_bank.json \
-  --output-dir output/experiments/banks/gsm8k-local-qwen32b-batched-r1 \
-  --reuse-rollouts-from output/experiments/banks/gsm8k-local-qwen32b-r1 \
-  --rollout-batch-size 32 --teacher-concurrency 16
+  --output-dir output/experiments/banks/gsm8k-bank-qwen32b-r2 \
+  --rollout-source output/experiments/banks/gsm8k-rollouts-r1 \
+  --teacher-concurrency 16
 ```
 
 路径中的旧目录应替换为实际采集目录。导入会校验 reasoner 身份/配置、原始数据版本、实际划分、prompt/verifier、
 1+7 采样合同、单条工件哈希和输入关联；只导入 train 轨迹，教师审核/经验/卡片重新构造。
 `imports/` 保存旧 profile 及逐条来源，最终简报包含 `reused_rollout_count`。旧单序列与新批量后端被明确标识，
 这是节约采样成本的显式复用，不宣称生成算法逐 token 等价。需要统一后端全量重采时不传此参数。
-新 run 中断后使用原批量参数加 `--resume`；导入完成后不再需要 `--reuse-rollouts-from`。
+新 Bank run 中断后使用原命令加 `--resume`；为使恢复命令自解释，建议仍保留 `--rollout-source`，导入检查点
+会直接复用而不会重复复制。旧参数名 `--reuse-rollouts-from` 仍作为兼容别名接受。
 
 ### 恢复 partition 的长 ID 复制失败
 
+当前主流程已原生使用短 ID 并内置保守降级，不再需要修复脚本。以下入口只服务于升级前已经中断的历史 run。
 早期生产 run 可能在 `groups` 阶段反复报告 `Evidence coverage must be exact`。这表示教师没有精确复制
 当前批次的完整 evidence 哈希，并不表示 evidence 内容损坏。保持同一个 vLLM 服务和原代码 checkout，运行：
 
@@ -124,7 +177,8 @@ python scripts/repair_local_bank_partitions.py \
 
 ### 恢复 card/card_review 的长 ID 复制失败
 
-若 `groups` 已完成，但 `cards` 阶段在若干张卡后以同一个 `Evidence coverage must be exact` 终止，运行：
+当前主流程的 card 与 card review 也已原生使用短 ID，并将单组协议失败降为 reject/conditional 后继续其余组。
+若升级前的 run 已完成 `groups`，但在若干张卡后以同一个错误终止，运行：
 
 ```bash
 python scripts/repair_local_bank_cards.py \
@@ -207,8 +261,10 @@ python scripts/resume_local_bank_cache_compat.py \
 
 教师执行：过程审核 → 单题结构化经验 → 分批初始分组 → 跨批次候选匹配 → 两组归并提案 →
 原始成员分批核验 → 卡片逐批汇总 → 最终卡片回查全部成员批次。
-跨批次候选窗口会检查所有现存组；没有 embedding 阈值或主题规则决定归并。模型可以保留单例、拒绝
-归并；初始分组允许拆分。大组不一次塞入全部 evidence，而是逐批复核，避免只信任摘要。
+跨批次先用冻结 reasoner 的组摘要向量召回最多 64 个候选，控制 5842 条 evidence 下的请求规模；向量只产生
+候选，不决定归并。候选必须经过 Qwen3 match，随后通过 Qwen3 merge，并对合并后的全部原始 evidence 分批
+执行 membership 核验。模型可以保留单例、拒绝归并；初始分组允许拆分。大组不一次塞入全部 evidence，
+而是逐批复核，避免只信任摘要。
 批次大小只限制上下文计算，不设置 Bank 的语义大小阈值。prompt 超出上下文时明确报错，不静默截断；
 异常长的单条经验可在新配置/目录中调整教师预算或批次大小。
 
@@ -224,9 +280,10 @@ primary/conditional/reject 来自同一个教师的第二次语义审阅，所�
 和包装 token，原生位置，从题目开始使用至结束；没有 entropy gate、延迟注入、32 步卸载或 side-attention。
 检索默认使用卡片 problem_structure，经冻结 reasoner 最后一层均值池化和 L2 归一化；完整卡片仍是 KV value。
 
-valid 先保存所有 question-only top-1 选择，再生成 baseline/逐 Bank 结果表。当前 top-1 是无拒用阈值的
-参考策略，不自动宣称为最优 selector；Qwen3-Reranker 不参与本构造流程。报告每个 Bank 以及该参考 selector
-的准确率、gain/harm、生成 token 总量/均值/中位数/p90/上限命中数。记忆输入和 KV 存储成本不计入生成 token。
+valid 先保存所有 question-only top-1 选择，再生成 baseline 和每题被选中的 Bank。当前 top-1 是无拒用阈值的
+参考策略，不自动宣称为最优 selector；Qwen3-Reranker 不参与本构造流程。默认报告 baseline 与参考 selector
+的准确率、gain/harm、生成 token 总量/均值/中位数/p90/上限命中数；显式 `exhaustive` 模式才额外报告每个
+Bank 的完整 valid 指标。记忆输入和 KV 存储成本不计入生成 token。
 valid 是开发数据，不自动用该结果把卡片宣传为测试集有效，也不自动调阈值或升级经验质量标签。
 若没有 primary，仍完整输出 baseline 与 `complete_without_primary_banks`，绝不宣称得到了可用记忆。
 
@@ -243,7 +300,9 @@ python scripts/use_local_memory_bank.py \
 
 ## 产物
 
-`profile.json`、`split.json` 保存版本与数据清单；`rollouts/`、`reviews/`、`evidence/`、`teacher/`、`cards/`
+rollout 目录中的 `profile.json` 使用窄化的 rollout 实现指纹且不绑定 teacher，`rollout_summary.json` 是阶段完成
+证明。Bank 目录中的 `profile.json` 绑定完整构造实现、teacher 与 reasoner，并在 `imports/` 保存 rollout 来源。
+`split.json` 保存数据清单；`rollouts/`、`reviews/`、`evidence/`、`teacher/`、`cards/`
 保存逐条工件；`prefix_kv/` 保存 safetensors 和 manifest；`retrieval/` 保存 key 与向量；`valid_choices/`、
 `valid_results/` 保存选择与答案；`stages/` 是完成索引；`brief_summary.json` 是最终简报。
 不要编辑 sealed 工件来绕过检查，修改构造策略应创建新的 run。

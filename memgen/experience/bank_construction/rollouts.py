@@ -11,7 +11,25 @@ from .dataset import selected_rows
 def rollout_plan(row, config):
     return [{"rollout_id": f"{row['sample_id']}-{i}", "sample_id": row["sample_id"],
              "index": i, "sampling": i > 0,
-             "seed": int(digest([config.sampling_seed, row["sample_id"], i])[:8], 16)} for i in range(8)]
+             "seed": int(digest([config.sampling_seed, row["sample_id"], i])[:8], 16)}
+            for i in range(config.greedy_rollouts + config.sampled_rollouts)]
+
+
+def validate_rollout_record(value, row, plan, config):
+    if any(value.get(name) != item for name, item in plan.items()):
+        raise ValueError("Rollout plan mismatch")
+    generation = value["generation"]
+    if (generation["seed"] != plan["seed"]
+            or generation["token_count"] != len(generation["token_ids"])
+            or not 0 < generation["token_count"] <= config.max_new_tokens
+            or generation["stop_reason"] not in {"length", "eos", "completed_boxed_answer"}
+            or generation["truncated"] != (generation["stop_reason"] == "length")
+            or (generation["truncated"] and generation["token_count"] != config.max_new_tokens)):
+        raise ValueError("Rollout generation contract mismatch")
+    expected = diagnose_gsm8k_completion(generation["text"], row["scoring_solution"])
+    if value["verifier"] != expected:
+        raise ValueError("Rollout verifier mismatch")
+    return value
 
 
 def run_rollouts(store, config, model_factory):

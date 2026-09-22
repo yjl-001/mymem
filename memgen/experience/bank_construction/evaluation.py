@@ -34,7 +34,8 @@ def run_evaluate(store, config, model_factory):
     split = store.require("split")
     bundle = validate_compiled(store, store.require("stages/compile"))
     rows = selected_rows(split, "valid", config)
-    inputs = {"split": digest(split), "bundle": digest(bundle), "samples": [r["sample_id"] for r in rows]}
+    inputs = {"split": digest(split), "bundle": digest(bundle), "samples": [r["sample_id"] for r in rows],
+              "evaluation_mode": config.evaluation_mode}
     cached = store.get("stages/evaluate", inputs)
     if cached is not None:
         return cached
@@ -47,6 +48,7 @@ def run_evaluate(store, config, model_factory):
         if model is None:
             model = model_factory()
         return model
+    records_by_id = {record["bank_id"]: record for record in records}
     results = {}
     try:
         # Freeze all question-only choices before creating any answer outcomes.
@@ -58,11 +60,12 @@ def run_evaluate(store, config, model_factory):
                 vector = encode_text(get_model().runtime, row["question"])
                 bid, score = select_bank(vector, bundle["entries"])
                 store.put(key, {"bank_id": bid or "no_memory", "cosine": score, "query_vector": vector}, binding)
-        for record in [None, *records]:
+        def run_action(record, indices):
             action = "no_memory" if record is None else record["bank_id"]
             memory = None
-            branch = []
-            for i, row in enumerate(rows):
+            branch = {}
+            for completed, i in enumerate(indices, start=1):
+                row = rows[i]
                 key = "valid_results/" + row["sample_id"] + "/" + action
                 binding = {"sample": row, "record": record, "bundle": digest(bundle)}
                 result = store.get(key, binding)
@@ -77,19 +80,48 @@ def run_evaluate(store, config, model_factory):
                         "text": text, "token_ids": generated["continuation_token_ids"],
                         "generated_token_count": len(generated["continuation_token_ids"]),
                         "stop_reason": generated["stop_reason"], "reward": verifier["reward"], "verifier": verifier}, binding)
-                branch.append(result)
-                print(f"[local-bank] valid action={action} question={i + 1}/{len(rows)}", flush=True)
-            results[action] = branch
+                branch[i] = result
+                print(f"[local-bank] valid action={action} question={completed}/{len(indices)}", flush=True)
+            return branch
+
+        baseline_by_index = run_action(None, range(len(rows)))
+        results["no_memory"] = [baseline_by_index[i] for i in range(len(rows))]
+        choices = [store.require("valid_choices/" + row["sample_id"])["bank_id"] for row in rows]
+        if config.evaluation_mode == "exhaustive":
+            for record in records:
+                branch = run_action(record, range(len(rows)))
+                results[record["bank_id"]] = [branch[i] for i in range(len(rows))]
+            chosen = [results[action][i] if action != "no_memory" else results["no_memory"][i]
+                      for i, action in enumerate(choices)]
+        else:
+            chosen = [None] * len(rows)
+            by_action = {}
+            for index, action in enumerate(choices):
+                if action == "no_memory":
+                    chosen[index] = results["no_memory"][index]
+                else:
+                    by_action.setdefault(action, []).append(index)
+            for action in sorted(by_action):
+                if action not in records_by_id:
+                    raise ValueError("Selector chose an unavailable Bank")
+                chosen_by_index = run_action(records_by_id[action], by_action[action])
+                for index, result in chosen_by_index.items():
+                    chosen[index] = result
+            if any(result is None for result in chosen):
+                raise RuntimeError("Selector-only evaluation left a sample unresolved")
     finally:
         if model is not None:
             model.close()
     base = results["no_memory"]
-    choices = [store.require("valid_choices/" + r["sample_id"])["bank_id"] for r in rows]
-    chosen = [results[action][i] for i, action in enumerate(choices)]
     report = {"evaluation_role": "builder_valid_development_not_final_test", "sample_count": len(rows),
         "bank_count": len(records), "official_test_used": False, "construction_samples_used": False,
+        "evaluation_mode": config.evaluation_mode,
         "baseline": metrics(base, base), "semantic_top1": {**metrics(chosen, base), "selection_counts": dict(Counter(choices))},
-        "per_bank": {r["bank_id"]: metrics(results[r["bank_id"]], base) for r in records},
+        "per_bank": ({record["bank_id"]: metrics(results[record["bank_id"]], base) for record in records}
+                     if config.evaluation_mode == "exhaustive" else {}),
+        "per_bank_complete": config.evaluation_mode == "exhaustive",
+        "generation_count": len(rows) * (len(records) + 1) if config.evaluation_mode == "exhaustive"
+                            else len(rows) + sum(choice != "no_memory" for choice in choices),
         "generated_token_policy": "completion_including_emitted_eos_excluding_question_and_memory",
         "memory_cost_excluded_from_completion_tokens": True, "automatic_empirical_promotion": False}
     return store.put("stages/evaluate", report, inputs)

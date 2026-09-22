@@ -184,17 +184,22 @@ class ThroughputTests(unittest.TestCase):
             split = fixture_split(cfg)
             source.put("split", split, {})
             index = run_rollouts(source, cfg, FixtureReasoner)
-            (source.root / (index["keys"][-1] + ".json")).unlink()  # partial old run
+            missing = source.root / (index["keys"][-1] + ".json")
+            missing_bytes = missing.read_bytes()
+            missing.unlink()  # An index claiming completion must not be partially imported.
             newcfg = replace(cfg, rollout_batch_size=64, teacher_backend="vllm")
             newprofile = {**profile, "configuration": newcfg.to_dict()}
             target = Store(Path(tmp) / "new", newprofile)
             target.put("split", split, {})
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                reuse_rollouts(target, newcfg, newprofile, source.root)
+            self.assertIsNone(target.get("imports/rollouts"))
+            self.assertFalse((target.root / (index["keys"][0] + ".json")).exists())
+            missing.write_bytes(missing_bytes)
             reuse_rollouts(target, newcfg, newprofile, source.root)
-            self.assertEqual(target.require("imports/rollouts")["rollout_count"], 31)
+            self.assertEqual(target.require("imports/rollouts")["rollout_count"], 32)
             self.assertEqual(target.require(index["keys"][0])["generation"], source.require(index["keys"][0])["generation"])
-            m = FixtureReasoner()
-            run_rollouts(target, newcfg, lambda: m)
-            self.assertEqual(len(m.calls), 1)
+            run_rollouts(target, newcfg, lambda: self.fail("Complete import must not generate new trajectories"))
             reuse_rollouts(target, newcfg, newprofile, source.root)  # idempotent
             with self.assertRaisesRegex(ValueError, "contract differs"):
                 reuse_rollouts(target, replace(newcfg, sampling_seed=9), newprofile, source.root)

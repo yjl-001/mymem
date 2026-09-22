@@ -128,7 +128,8 @@ class RuntimeTests(unittest.TestCase):
             teacher = FixtureTeacher()
             run_review(store, teacher)
             run_experiences(store, teacher)
-            run_grouping(store, teacher, config)
+            run_grouping(store, teacher, config, lambda text: [1., 0.],
+                         {"source": "fixture", "revision": "fixed"})
             run_cards(store, teacher, config)
             compiled = run_compile(store, config, self.local_model)
             self.assertEqual(compiled["bank_count"], 1)
