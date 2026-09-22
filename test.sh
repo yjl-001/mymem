@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# V4.3 is the default complete experiment; legacy recovery is explicit.
+# V4.3 remains the default complete experiment; V5 and legacy recovery are explicit.
 set -Eeuo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 unset GLM_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY || true
+if [[ "${1:-}" == "v5" ]]; then
+  shift
+  exec bash "$REPO_ROOT/scripts/experiments/gsm8k/run_v5_memory.sh" "$@"
+fi
 if [[ "${1:-}" == "local-rerank" ]]; then
   shift
   exec bash "$REPO_ROOT/scripts/experiments/gsm8k/run_v4_3_local_rerank.sh" "$@"
