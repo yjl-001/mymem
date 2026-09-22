@@ -30,6 +30,7 @@ def implementation_hashes():
         root / name for name in (
             "data/gsm8k/splits.py", "data/gsm8k/prompt.py", "data/utils/math_utils.py",
             "memgen/chat_templates.py", "memgen/model/local_bank.py",
+            "memgen/model/transformers_cache_compat.py",
             "memgen/model/v4_3_prefix_equivalence.py", "memgen/model/v4_3_question_selector.py",
             "memgen/model/v4_3_runtime.py", "memgen/model/v4_oracle.py", "memgen/model/e1_runtime.py",
             "scripts/build_local_memory_bank.py")]

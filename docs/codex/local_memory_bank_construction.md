@@ -140,6 +140,21 @@ python scripts/repair_local_bank_cards.py \
 只接收 primary 卡片的运行时 Bank，但也不会使其余组停止。工具完成后，`stages/cards` 与正常流水线格式
 完全相同。随后执行原构造命令并加 `--resume`，即可继续 compile 与 evaluate。
 
+### 恢复 Transformers 5 的 DynamicCache 编译中断
+
+如果已有 run 在 `compile` 阶段报告 `DynamicCache` 缺少 `to_legacy_cache` 或 `from_legacy_cache`，说明该 run
+记录的是 Transformers 5 环境。不要为此降级依赖，因为环境版本已经写入 profile。更新代码后运行：
+
+```bash
+python scripts/resume_local_bank_cache_compat.py \
+  --output-dir output/experiments/banks/gsm8k-local-qwen32b-batched-r1
+```
+
+兼容层在 Transformers 4 中使用 legacy conversion API，在 Transformers 5 中直接读取
+`cache.layers[i].keys/values`，并通过 `DynamicCache(ddp_cache_data=...)` 恢复缓存。恢复入口只允许已认证旧实现
+迁移到这一组精确文件哈希；任何无关代码漂移都会被拒绝。迁移回执写入同一 Store，原 profile、卡片与已完成
+阶段保持不变。命令可重复运行：已生成的 prefix KV、检索向量和验证结果会从不可变检查点继续。
+
 ## 模块与数据合同
 
 | 模块 | 职责 |

@@ -13,6 +13,7 @@ from transformers import DynamicCache
 from memgen.experience.v4_3_artifacts import atomic_json, read_json
 from memgen.experience.v4_3_bank import authenticate, canonical_hash, file_hash, seal
 from memgen.model.e1_runtime import clone_cache, logits_kl
+from memgen.model.transformers_cache_compat import cache_pairs, dynamic_cache_from_pairs
 from memgen.model.v4_3_runtime import V43UnifiedRuntime
 
 
@@ -30,9 +31,8 @@ def split_prefix(runtime, question, descriptor, memory_ids):
 
 
 def cache_tensors(cache):
-    legacy = cache.to_legacy_cache()
     return {f"{i}.{kind}": tensor.detach().cpu().contiguous()
-            for i, pair in enumerate(legacy) for kind, tensor in zip(("k", "v"), pair)}
+            for i, pair in enumerate(cache_pairs(cache)) for kind, tensor in zip(("k", "v"), pair)}
 
 
 def restore_cache(tensors, device):
@@ -42,8 +42,9 @@ def restore_cache(tensors, device):
     if set(tensors) != {f"{i}.{kind}" for i in range(layers) for kind in ("k", "v")}:
         raise ValueError("Noncontiguous cache layer namespace")
     # Clone even on CPU: consuming a Bank must never mutate its stored prefix.
-    return DynamicCache.from_legacy_cache(tuple(tuple(tensors[f"{i}.{kind}"].to(device).clone()
-                                                for kind in ("k", "v")) for i in range(layers)))
+    pairs = tuple(tuple(tensors[f"{i}.{kind}"].to(device).clone() for kind in ("k", "v"))
+                  for i in range(layers))
+    return dynamic_cache_from_pairs(DynamicCache, pairs)
 
 
 def validate_tensors(tensors, token_count, model):
