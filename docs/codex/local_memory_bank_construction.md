@@ -122,6 +122,24 @@ python scripts/repair_local_bank_partitions.py \
 如果短别名在有界重试后仍无法满足覆盖合同，工具会为该批次保存可审计的单例分组；这不会丢失、重复或
 错误合并 evidence，后续正常的跨批次 match、merge 和全成员核验仍可将语义兼容的单例重新归并。
 
+### 恢复 card/card_review 的长 ID 复制失败
+
+若 `groups` 已完成，但 `cards` 阶段在若干张卡后以同一个 `Evidence coverage must be exact` 终止，运行：
+
+```bash
+python scripts/repair_local_bank_cards.py \
+  --output-dir output/experiments/banks/gsm8k-local-qwen32b-batched-r1
+```
+
+该入口复用 `cards/` 中已构造的卡片，只处理缺失组。每个 member 批次在 `card` 与 `card_review` 请求中均把
+完整 evidence 哈希替换为 `E00...E11`，先对短 ID 做精确覆盖校验，再机械映射回真实 ID，并把别名答案、
+映射表和最终答案写入同一认证 Store。跨批次的 `previous_proposal` 与 review proposal 不携带旧批次 ID，
+避免教师把上一批 support ID 混入当前批次。
+
+短 ID 经有界重试仍失败时，构造失败的组落为 `reject`；复核失败的组落为 `conditional`。二者都不会进入
+只接收 primary 卡片的运行时 Bank，但也不会使其余组停止。工具完成后，`stages/cards` 与正常流水线格式
+完全相同。随后执行原构造命令并加 `--resume`，即可继续 compile 与 evaluate。
+
 ## 模块与数据合同
 
 | 模块 | 职责 |
