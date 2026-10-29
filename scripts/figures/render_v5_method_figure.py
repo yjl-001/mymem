@@ -44,10 +44,11 @@ def configure_matplotlib() -> None:
     mpl.rcParams.update(
         {
             "font.family": "sans-serif",
-            "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+            "font.sans-serif": ["Heiti SC", "STHeiti", "Arial Unicode MS", "DejaVu Sans"],
             "font.size": 8.2,
             "text.color": INK,
             "axes.edgecolor": LINE,
+            "axes.unicode_minus": False,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
             "svg.fonttype": "none",
@@ -199,10 +200,10 @@ def panel(ax, x, y, width, height, label, title, split, tint, accent):
 
 def draw_legend(ax):
     items = [
-        (BLUE_FILL, BLUE_EDGE, "Frozen model"),
-        (AMBER_FILL, AMBER_EDGE, "Teacher-assisted"),
-        (GREEN_FILL, GREEN_EDGE, "Persistent artifact"),
-        (PURPLE_FILL, PURPLE_EDGE, "Calibrated policy"),
+        (BLUE_FILL, BLUE_EDGE, "冻结模型"),
+        (AMBER_FILL, AMBER_EDGE, "教师辅助"),
+        (GREEN_FILL, GREEN_EDGE, "持久化产物"),
+        (PURPLE_FILL, PURPLE_EDGE, "校准策略"),
     ]
     x = 4.50
     y = 5.98
@@ -219,7 +220,7 @@ def draw_legend(ax):
             )
         )
         ax.text(x + 0.21, y, label, ha="left", va="center", fontsize=7.0, color=MUTED)
-        x += 1.80 if label != "Persistent artifact" else 2.05
+        x += 1.80 if label != "持久化产物" else 2.05
 
 
 def draw_figure():
@@ -233,21 +234,21 @@ def draw_figure():
 
     draw_legend(ax)
 
-    panel(ax, 0.20, 0.52, 5.15, 5.20, "(a)", "Memory bank construction", "Train only", "#F8FBFE", BLUE_EDGE)
-    panel(ax, 5.65, 0.52, 4.25, 5.20, "(b)", "Selector calibration", "Valid only", "#FCFAFE", PURPLE_EDGE)
-    panel(ax, 10.20, 0.52, 4.80, 5.20, "(c)", "Online memory use", "Test / Deploy", "#F8FCF9", GREEN_EDGE)
+    panel(ax, 0.20, 0.52, 5.15, 5.20, "(a)", "记忆库构造", "仅训练集", "#F8FBFE", BLUE_EDGE)
+    panel(ax, 5.65, 0.52, 4.25, 5.20, "(b)", "选择器校准", "仅验证集", "#FCFAFE", PURPLE_EDGE)
+    panel(ax, 10.20, 0.52, 4.80, 5.20, "(c)", "在线记忆使用", "测试 / 部署", "#F8FCF9", GREEN_EDGE)
 
     # Stage I: offline memory construction.
     a_x, a_w, a_h = 0.62, 4.30, 0.48
     a_y = [4.76, 4.10, 3.44, 2.78, 2.12, 1.46, 0.80]
     a_nodes = [
-        rounded_box(ax, a_x, a_y[0], a_w, a_h, "Training inputs", facecolor=WHITE),
-        rounded_box(ax, a_x, a_y[1], a_w, a_h, "Frozen reasoner: 1 greedy + 7 samples", facecolor=BLUE_FILL, edgecolor=BLUE_EDGE),
-        rounded_box(ax, a_x, a_y[2], a_w, a_h, "Trajectory review and paired contrasts", facecolor=AMBER_FILL, edgecolor=AMBER_EDGE),
-        rounded_box(ax, a_x, a_y[3], a_w, a_h, "Experience atom induction", facecolor=AMBER_FILL, edgecolor=AMBER_EDGE),
-        rounded_box(ax, a_x, a_y[4], a_w, a_h, "Method-centric semantic grouping", facecolor=AMBER_FILL, edgecolor=AMBER_EDGE),
-        rounded_box(ax, a_x, a_y[5], a_w, a_h, "Memory card synthesis and qualification", facecolor=AMBER_FILL, edgecolor=AMBER_EDGE),
-        rounded_box(ax, a_x, a_y[6], a_w, a_h, "Primary bank: selector metadata + native prefix KV", facecolor=GREEN_FILL, edgecolor=GREEN_EDGE, weight="bold"),
+        rounded_box(ax, a_x, a_y[0], a_w, a_h, "训练输入", facecolor=WHITE),
+        rounded_box(ax, a_x, a_y[1], a_w, a_h, "冻结推理模型：1 条贪心 + 7 条采样", facecolor=BLUE_FILL, edgecolor=BLUE_EDGE),
+        rounded_box(ax, a_x, a_y[2], a_w, a_h, "轨迹审查与同题成功—失败对照", facecolor=AMBER_FILL, edgecolor=AMBER_EDGE),
+        rounded_box(ax, a_x, a_y[3], a_w, a_h, "经验原子提取", facecolor=AMBER_FILL, edgecolor=AMBER_EDGE),
+        rounded_box(ax, a_x, a_y[4], a_w, a_h, "基于共同方法的语义分组", facecolor=AMBER_FILL, edgecolor=AMBER_EDGE),
+        rounded_box(ax, a_x, a_y[5], a_w, a_h, "记忆卡构造与资格审查", facecolor=AMBER_FILL, edgecolor=AMBER_EDGE),
+        rounded_box(ax, a_x, a_y[6], a_w, a_h, "主级（Primary）记忆库：选择元数据 + 原生前缀 KV", facecolor=GREEN_FILL, edgecolor=GREEN_EDGE, weight="bold"),
     ]
     for upper, lower in zip(a_nodes, a_nodes[1:]):
         arrow(ax, upper["bottom"], lower["top"])
@@ -256,11 +257,11 @@ def draw_figure():
     b_x, b_w, b_h = 6.03, 3.48, 0.58
     b_y = [4.62, 3.70, 2.78, 1.86, 0.86]
     b_nodes = [
-        rounded_box(ax, b_x, b_y[0], b_w, b_h, "Validation inputs", facecolor=WHITE),
-        rounded_box(ax, b_x, b_y[1], b_w, b_h, "Semantic Top-K and exclusion-aware reranking", facecolor=PURPLE_FILL, edgecolor=PURPLE_EDGE),
-        rounded_box(ax, b_x, b_y[2], b_w, b_h, "Baseline and candidate KV execution", facecolor=BLUE_FILL, edgecolor=BLUE_EDGE),
-        rounded_box(ax, b_x, b_y[3], b_w, b_h, "Paired utility labels: gain, harm, neutral", facecolor=WHITE),
-        rounded_box(ax, b_x, b_y[4], b_w, b_h, "Ridge utility model + abstention threshold", facecolor=PURPLE_FILL, edgecolor=PURPLE_EDGE, weight="bold"),
+        rounded_box(ax, b_x, b_y[0], b_w, b_h, "验证输入", facecolor=WHITE),
+        rounded_box(ax, b_x, b_y[1], b_w, b_h, "语义 Top-K + 排除条件感知重排", facecolor=PURPLE_FILL, edgecolor=PURPLE_EDGE),
+        rounded_box(ax, b_x, b_y[2], b_w, b_h, "无记忆基线与候选 KV 配对执行", facecolor=BLUE_FILL, edgecolor=BLUE_EDGE),
+        rounded_box(ax, b_x, b_y[3], b_w, b_h, "配对效用标签：增益、伤害、中性", facecolor=WHITE),
+        rounded_box(ax, b_x, b_y[4], b_w, b_h, "岭回归效用模型 + 弃权阈值", facecolor=PURPLE_FILL, edgecolor=PURPLE_EDGE, weight="bold"),
     ]
     for upper, lower in zip(b_nodes, b_nodes[1:]):
         arrow(ax, upper["bottom"], lower["top"])
@@ -269,9 +270,9 @@ def draw_figure():
     c_x, c_w, c_h = 10.67, 3.86, 0.54
     c_y = [4.66, 3.82, 2.98]
     c_nodes = [
-        rounded_box(ax, c_x, c_y[0], c_w, c_h, "New input", facecolor=WHITE),
-        rounded_box(ax, c_x, c_y[1], c_w, c_h, "Frozen semantic retriever + applicability reranker", facecolor=PURPLE_FILL, edgecolor=PURPLE_EDGE),
-        rounded_box(ax, c_x, c_y[2], c_w, c_h, "Expected utility scoring", facecolor=PURPLE_FILL, edgecolor=PURPLE_EDGE),
+        rounded_box(ax, c_x, c_y[0], c_w, c_h, "新输入", facecolor=WHITE),
+        rounded_box(ax, c_x, c_y[1], c_w, c_h, "冻结语义检索器 + 适用性重排器", facecolor=PURPLE_FILL, edgecolor=PURPLE_EDGE),
+        rounded_box(ax, c_x, c_y[2], c_w, c_h, "期望效用评分", facecolor=PURPLE_FILL, edgecolor=PURPLE_EDGE),
     ]
     for upper, lower in zip(c_nodes, c_nodes[1:]):
         arrow(ax, upper["bottom"], lower["top"])
@@ -292,18 +293,18 @@ def draw_figure():
         zorder=3,
     )
     ax.add_patch(diamond)
-    ax.text(*diamond_center, "max utility > threshold?", ha="center", va="center", fontsize=7.6, fontweight="bold", zorder=4)
+    ax.text(*diamond_center, "最高效用 > 阈值？", ha="center", va="center", fontsize=7.6, fontweight="bold", zorder=4)
     arrow(ax, c_nodes[-1]["bottom"], (diamond_center[0], diamond_center[1] + diamond_h / 2))
 
-    prefix = rounded_box(ax, 10.48, 1.18, 2.08, 0.52, "Selected native-prefix KV", facecolor=GREEN_FILL, edgecolor=GREEN_EDGE, weight="bold", fontsize=7.1)
-    no_memory = rounded_box(ax, 13.12, 1.18, 1.32, 0.52, "no_memory", facecolor=GRAY_FILL, edgecolor=LINE, fontsize=7.6)
-    reasoner = rounded_box(ax, 10.72, 0.58, 2.68, 0.46, "Frozen reasoner", facecolor=BLUE_FILL, edgecolor=BLUE_EDGE, weight="bold")
-    output = rounded_box(ax, 13.72, 0.58, 1.02, 0.46, "Output", facecolor=WHITE, fontsize=7.7)
+    prefix = rounded_box(ax, 10.48, 1.18, 2.08, 0.52, "选中的原生前缀 KV", facecolor=GREEN_FILL, edgecolor=GREEN_EDGE, weight="bold", fontsize=7.1)
+    no_memory = rounded_box(ax, 13.12, 1.18, 1.32, 0.52, "不使用记忆", facecolor=GRAY_FILL, edgecolor=LINE, fontsize=7.4)
+    reasoner = rounded_box(ax, 10.72, 0.58, 2.68, 0.46, "冻结推理模型", facecolor=BLUE_FILL, edgecolor=BLUE_EDGE, weight="bold")
+    output = rounded_box(ax, 13.72, 0.58, 1.02, 0.46, "模型输出", facecolor=WHITE, fontsize=7.5)
 
     arrow(ax, (diamond_center[0] - 0.58, diamond_center[1] - 0.19), prefix["top"], color=GREEN_EDGE, connectionstyle="arc3,rad=0.06")
-    ax.text(11.55, 1.90, "yes", ha="center", va="center", fontsize=6.8, color=GREEN_EDGE, fontweight="bold")
+    ax.text(11.55, 1.90, "是", ha="center", va="center", fontsize=6.8, color=GREEN_EDGE, fontweight="bold")
     arrow(ax, (diamond_center[0] + 0.58, diamond_center[1] - 0.19), no_memory["top"], color=LINE, connectionstyle="arc3,rad=-0.06")
-    ax.text(13.66, 1.90, "no", ha="center", va="center", fontsize=6.8, color=MUTED, fontweight="bold")
+    ax.text(13.66, 1.90, "否", ha="center", va="center", fontsize=6.8, color=MUTED, fontweight="bold")
     arrow(ax, prefix["bottom"], (11.42, reasoner["top"][1]), color=GREEN_EDGE)
     arrow(ax, no_memory["bottom"], (12.88, reasoner["top"][1]), color=LINE, connectionstyle="arc3,rad=-0.04")
     arrow(ax, reasoner["right"], output["left"], color=BLUE_EDGE)
@@ -314,14 +315,14 @@ def draw_figure():
         [a_nodes[-1]["right"], (5.50, a_nodes[-1]["right"][1]), (5.50, b_nodes[1]["left"][1]), b_nodes[1]["left"]],
         color=GREEN_EDGE,
     )
-    ax.text(5.50, 2.44, "BANK", rotation=90, ha="center", va="center", fontsize=6.3, color=GREEN_EDGE, fontweight="bold")
+    ax.text(5.50, 2.44, "记忆库", rotation=90, ha="center", va="center", fontsize=6.3, color=GREEN_EDGE, fontweight="bold")
 
     orthogonal_arrow(
         ax,
         [b_nodes[-1]["right"], (10.05, b_nodes[-1]["right"][1]), (10.05, c_nodes[1]["left"][1]), c_nodes[1]["left"]],
         color=PURPLE_EDGE,
     )
-    ax.text(10.05, 2.37, "POLICY", rotation=90, ha="center", va="center", fontsize=6.3, color=PURPLE_EDGE, fontweight="bold")
+    ax.text(10.05, 2.37, "策略", rotation=90, ha="center", va="center", fontsize=6.3, color=PURPLE_EDGE, fontweight="bold")
 
     # The selected online KV is loaded from the frozen Primary Bank.
     orthogonal_arrow(
@@ -329,7 +330,7 @@ def draw_figure():
         [a_nodes[-1]["bottom"], (a_nodes[-1]["bottom"][0], 0.24), (prefix["bottom"][0], 0.24), prefix["bottom"]],
         color=GREEN_EDGE,
     )
-    ax.text(7.67, 0.15, "Frozen Primary Bank", ha="center", va="center", fontsize=6.6, color=GREEN_EDGE, fontweight="bold")
+    ax.text(7.67, 0.15, "冻结的主级记忆库", ha="center", va="center", fontsize=6.6, color=GREEN_EDGE, fontweight="bold")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     fig.savefig(STEM.with_suffix(".svg"), bbox_inches="tight", facecolor=WHITE)
